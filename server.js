@@ -6,18 +6,36 @@
 
 const express = require('express');
 const cors = require('cors');
-const { Resend } = require('resend');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ---------- Configurazione (da variabili d'ambiente / file .env su Glitch) ----------
+// ---------- Configurazione (da variabili d'ambiente su Render) ----------
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 const ORDER_EMAIL = process.env.ORDER_EMAIL || "Marconanfarodj@gmail.com";
 const FROM_EMAIL = process.env.FROM_EMAIL || "onboarding@resend.dev"; // dominio di test di Resend, funziona subito
 
-const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
+async function sendOrderEmail(subject, text) {
+  if (!RESEND_API_KEY) return;
+  try {
+    await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        from: FROM_EMAIL,
+        to: ORDER_EMAIL,
+        subject,
+        text
+      })
+    });
+  } catch (err) {
+    console.error('Errore invio email:', err);
+  }
+}
 
 // ---------- Elenco dei "client" del pannello di stampa in ascolto (SSE) ----------
 let printClients = [];
@@ -46,14 +64,7 @@ app.post('/api/orders', async (req, res) => {
   broadcastOrder(order);
 
   // 2) manda l'email alla pizzeria (non blocca la risposta se fallisce)
-  if (resend) {
-    resend.emails.send({
-      from: FROM_EMAIL,
-      to: ORDER_EMAIL,
-      subject: order.oggettoEmail || 'Nuovo ordine — La Casa di Carta',
-      text: order.testoStampa
-    }).catch(err => console.error('Errore invio email:', err));
-  }
+  sendOrderEmail(order.oggettoEmail || 'Nuovo ordine — La Casa di Carta', order.testoStampa);
 
   res.json({ ok: true });
 });
