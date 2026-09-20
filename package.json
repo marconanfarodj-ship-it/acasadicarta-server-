@@ -1,0 +1,17 @@
+{
+  "name": "lacasadicarta-order-server",
+  "version": "1.0.0",
+  "description": "Server ordini La Casa di Carta",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "resend": "^3.4.0"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
