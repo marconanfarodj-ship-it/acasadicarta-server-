@@ -14,7 +14,7 @@ app.use(express.json());
 // ---------- Configurazione (da variabili d'ambiente su Render) ----------
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 const ORDER_EMAIL = process.env.ORDER_EMAIL || "Marconanfarodj@gmail.com";
-const FROM_EMAIL = process.env.FROM_EMAIL || "onboarding@resend.dev"; // dominio di test di Resend, funziona subito
+const FROM_EMAIL = process.env.FROM_EMAIL || "onboarding@resend.dev";
 
 async function sendEmail(to, subject, text) {
   if (!RESEND_API_KEY) return;
@@ -25,16 +25,10 @@ async function sendEmail(to, subject, text) {
         'Authorization': `Bearer ${RESEND_API_KEY}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({
-        from: FROM_EMAIL,
-        to,
-        subject,
-        text
-      })
+      body: JSON.stringify({ from: FROM_EMAIL, to, subject, text })
     });
     if (!res.ok) {
-      const errText = await res.text();
-      console.error(`Errore invio email a ${to}:`, res.status, errText);
+      console.error(`Errore invio email a ${to}:`, res.status, await res.text());
     } else {
       console.log(`Email inviata correttamente a ${to}`);
     }
@@ -47,7 +41,6 @@ function buildCustomerConfirmationText(order) {
   return `Ciao ${order.name || ''},\n\nAbbiamo ricevuto il tuo ordine da La Casa di Carta! Ecco il riepilogo:\n\n${order.testoStampa}\n\nGrazie e a presto!\nLa Casa di Carta`;
 }
 
-// ---------- Elenco dei "client" del pannello di stampa in ascolto (SSE) ----------
 let printClients = [];
 
 function broadcastOrder(order) {
@@ -55,30 +48,27 @@ function broadcastOrder(order) {
   printClients.forEach(res => res.write(payload));
 }
 
-// ---------- Storico ordini in memoria (si azzera se il server si riavvia) ----------
 let orderHistory = [];
 const MAX_HISTORY = 100;
+let orderCounter = 1000;
 
-// ---------- Endpoint: il sito manda qui i nuovi ordini ----------
 app.post('/api/orders', async (req, res) => {
   const order = req.body;
   if (!order || !order.testoStampa) {
     return res.status(400).json({ ok: false, error: 'Ordine non valido' });
   }
 
+  order.numeroOrdine = ++orderCounter;
   order.ricevutoAlle = new Date().toISOString();
   orderHistory.unshift(order);
   if (orderHistory.length > MAX_HISTORY) orderHistory.pop();
 
   console.log('Nuovo ordine ricevuto. Email cliente:', order.email || '(nessuna)');
 
-  // 1) gira l'ordine subito al pannello di stampa
   broadcastOrder(order);
 
-  // 2) manda l'email alla pizzeria (non blocca la risposta se fallisce)
   sendEmail(ORDER_EMAIL, order.oggettoEmail || 'Nuovo ordine — La Casa di Carta', order.testoStampa);
 
-  // 3) manda l'email di conferma al cliente, se ha lasciato un indirizzo valido
   if (order.email) {
     sendEmail(order.email, 'Conferma ordine — La Casa di Carta', buildCustomerConfirmationText(order));
   }
@@ -86,7 +76,6 @@ app.post('/api/orders', async (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- Endpoint: il pannello di stampa si mette in ascolto qui ----------
 app.get('/api/orders/stream', (req, res) => {
   res.set({
     'Content-Type': 'text/event-stream',
@@ -103,12 +92,10 @@ app.get('/api/orders/stream', (req, res) => {
   });
 });
 
-// ---------- Endpoint: storico ordini (utile per controlli/debug) ----------
 app.get('/api/orders', (req, res) => {
   res.json(orderHistory);
 });
 
-// ---------- Pagina di controllo semplice ----------
 app.get('/', (req, res) => {
   res.send(`
     <h2>Server ordini La Casa di Carta — attivo ✅</h2>
