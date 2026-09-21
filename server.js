@@ -1,7 +1,7 @@
 // ============================================
 // SERVER ORDINI — La Casa di Carta
 // Riceve gli ordini dal sito, li gira in tempo reale
-// al pannello di stampa, e manda l'email alla pizzeria.
+// al pannello di stampa, e manda l'email alla pizzeria e al cliente.
 // ============================================
 
 const express = require('express');
@@ -16,10 +16,10 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 const ORDER_EMAIL = process.env.ORDER_EMAIL || "Marconanfarodj@gmail.com";
 const FROM_EMAIL = process.env.FROM_EMAIL || "onboarding@resend.dev"; // dominio di test di Resend, funziona subito
 
-async function sendOrderEmail(subject, text) {
+async function sendEmail(to, subject, text) {
   if (!RESEND_API_KEY) return;
   try {
-    await fetch('https://api.resend.com/emails', {
+    const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${RESEND_API_KEY}`,
@@ -27,14 +27,24 @@ async function sendOrderEmail(subject, text) {
       },
       body: JSON.stringify({
         from: FROM_EMAIL,
-        to: ORDER_EMAIL,
+        to,
         subject,
         text
       })
     });
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error(`Errore invio email a ${to}:`, res.status, errText);
+    } else {
+      console.log(`Email inviata correttamente a ${to}`);
+    }
   } catch (err) {
     console.error('Errore invio email:', err);
   }
+}
+
+function buildCustomerConfirmationText(order) {
+  return `Ciao ${order.name || ''},\n\nAbbiamo ricevuto il tuo ordine da La Casa di Carta! Ecco il riepilogo:\n\n${order.testoStampa}\n\nGrazie e a presto!\nLa Casa di Carta`;
 }
 
 // ---------- Elenco dei "client" del pannello di stampa in ascolto (SSE) ----------
@@ -60,11 +70,18 @@ app.post('/api/orders', async (req, res) => {
   orderHistory.unshift(order);
   if (orderHistory.length > MAX_HISTORY) orderHistory.pop();
 
+  console.log('Nuovo ordine ricevuto. Email cliente:', order.email || '(nessuna)');
+
   // 1) gira l'ordine subito al pannello di stampa
   broadcastOrder(order);
 
   // 2) manda l'email alla pizzeria (non blocca la risposta se fallisce)
-  sendOrderEmail(order.oggettoEmail || 'Nuovo ordine — La Casa di Carta', order.testoStampa);
+  sendEmail(ORDER_EMAIL, order.oggettoEmail || 'Nuovo ordine — La Casa di Carta', order.testoStampa);
+
+  // 3) manda l'email di conferma al cliente, se ha lasciato un indirizzo valido
+  if (order.email) {
+    sendEmail(order.email, 'Conferma ordine — La Casa di Carta', buildCustomerConfirmationText(order));
+  }
 
   res.json({ ok: true });
 });
