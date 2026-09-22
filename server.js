@@ -6,6 +6,9 @@
 
 const express = require('express');
 const cors = require('cors');
+const { MongoClient } = require('mongodb');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 app.use(cors());
@@ -15,6 +18,46 @@ app.use(express.json());
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 const ORDER_EMAIL = process.env.ORDER_EMAIL || "Marconanfarodj@gmail.com";
 const FROM_EMAIL = process.env.FROM_EMAIL || "onboarding@resend.dev";
+const MONGODB_URI = process.env.MONGODB_URI || "";
+const JWT_SECRET = process.env.JWT_SECRET || "cambia-questa-chiave-segreta";
+
+// ---------- Connessione al database (account clienti) ----------
+let db = null;
+let customersCollection = null;
+
+async function connectDB(){
+  if(!MONGODB_URI){
+    console.log('MONGODB_URI non impostata: gli account cliente non funzioneranno.');
+    return;
+  }
+  try{
+    const client = new MongoClient(MONGODB_URI);
+    await client.connect();
+    db = client.db('lacasadicarta');
+    customersCollection = db.collection('customers');
+    await customersCollection.createIndex({ email: 1 }, { unique: true });
+    console.log('Connesso a MongoDB Atlas.');
+  }catch(err){
+    console.error('Errore connessione MongoDB:', err);
+  }
+}
+connectDB();
+
+function generateToken(customer){
+  return jwt.sign({ id: customer._id.toString(), email: customer.email }, JWT_SECRET, { expiresIn: '180d' });
+}
+
+function authMiddleware(req, res, next){
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if(!token) return res.status(401).json({ ok: false, error: 'Non autenticato' });
+  try{
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  }catch(e){
+    return res.status(401).json({ ok: false, error: 'Sessione scaduta, accedi di nuovo' });
+  }
+}
 
 async function sendEmail(to, subject, text) {
   if (!RESEND_API_KEY) return;
@@ -25,7 +68,12 @@ async function sendEmail(to, subject, text) {
         'Authorization': `Bearer ${RESEND_API_KEY}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ from: FROM_EMAIL, to, subject, text })
+      body: JSON.stringify({
+        from: FROM_EMAIL,
+        to,
+        subject,
+        text
+      })
     });
   } catch (err) {
     console.error('Errore invio email:', err);
@@ -42,10 +90,11 @@ const MAX_PER_SLOT = 3;
 const OPEN_FROM_HOUR = 19;
 const OPEN_TO_HOUR = 23;
 
+// conteggio in memoria: { "2026-09-22|19:15": 2, ... } — si azzera se il server si riavvia
 let slotCounts = {};
 
 function dateKey(d){
-  return d.toISOString().slice(0,10);
+  return d.toISOString().slice(0,10); // YYYY-MM-DD (UTC, va bene per un conteggio interno)
 }
 
 function slotLabel(d){
@@ -64,6 +113,8 @@ function allSlotsForDay(){
   return slots;
 }
 
+// dato un orario "richiesto" (Date), trova il primo slot da quel momento in poi
+// che non sia ancora pieno, nello stesso giorno. Torna null se la giornata è piena.
 function findAvailableSlot(fromDate){
   const key = dateKey(fromDate);
   const slots = allSlotsForDay();
@@ -83,6 +134,7 @@ function reserveSlot(dateStr, slot){
   slotCounts[key] = (slotCounts[key] || 0) + 1;
 }
 
+// ---------- Elenco dei "client" del pannello di stampa in ascolto (SSE) ----------
 let printClients = [];
 
 function broadcastOrder(order) {
@@ -90,10 +142,12 @@ function broadcastOrder(order) {
   printClients.forEach(res => res.write(payload));
 }
 
+// ---------- Storico ordini in memoria (si azzera se il server si riavvia) ----------
 let orderHistory = [];
 const MAX_HISTORY = 100;
 let orderCounter = 1000;
 
+// ---------- Endpoint: disponibilità slot di consegna per una data ----------
 app.get('/api/delivery-slots', (req, res) => {
   const dateStr = req.query.date || dateKey(new Date());
   const slots = allSlotsForDay();
@@ -105,12 +159,97 @@ app.get('/api/delivery-slots', (req, res) => {
   res.json({ date: dateStr, slots: result });
 });
 
+// ---------- Endpoint: registrazione nuovo account cliente ----------
+app.post('/api/auth/register', async (req, res) => {
+  if(!customersCollection) return res.status(503).json({ ok: false, error: 'Database non disponibile' });
+  const { nome, cognome, email, telefono, password, indirizzo } = req.body || {};
+  if(!nome || !email || !telefono || !password){
+    return res.status(400).json({ ok: false, error: 'Compila tutti i campi obbligatori.' });
+  }
+  if(password.length < 6){
+    return res.status(400).json({ ok: false, error: 'La password deve avere almeno 6 caratteri.' });
+  }
+  try{
+    const existing = await customersCollection.findOne({ email: email.toLowerCase() });
+    if(existing){
+      return res.status(409).json({ ok: false, error: 'Esiste già un account con questa email.' });
+    }
+    const passwordHash = await bcrypt.hash(password, 10);
+    const customer = {
+      nome, cognome: cognome || '', email: email.toLowerCase(), telefono, indirizzo: indirizzo || '',
+      passwordHash, creatoIl: new Date().toISOString()
+    };
+    const result = await customersCollection.insertOne(customer);
+    customer._id = result.insertedId;
+    const token = generateToken(customer);
+    res.json({ ok: true, token, profilo: { nome, cognome, email: customer.email, telefono, indirizzo: customer.indirizzo } });
+  }catch(err){
+    console.error('Errore registrazione:', err);
+    res.status(500).json({ ok: false, error: 'Errore del server, riprova.' });
+  }
+});
+
+// ---------- Endpoint: login ----------
+app.post('/api/auth/login', async (req, res) => {
+  if(!customersCollection) return res.status(503).json({ ok: false, error: 'Database non disponibile' });
+  const { email, password } = req.body || {};
+  if(!email || !password){
+    return res.status(400).json({ ok: false, error: 'Inserisci email e password.' });
+  }
+  try{
+    const customer = await customersCollection.findOne({ email: email.toLowerCase() });
+    if(!customer){
+      return res.status(401).json({ ok: false, error: 'Email o password errati.' });
+    }
+    const valid = await bcrypt.compare(password, customer.passwordHash);
+    if(!valid){
+      return res.status(401).json({ ok: false, error: 'Email o password errati.' });
+    }
+    const token = generateToken(customer);
+    res.json({ ok: true, token, profilo: { nome: customer.nome, cognome: customer.cognome, email: customer.email, telefono: customer.telefono, indirizzo: customer.indirizzo } });
+  }catch(err){
+    console.error('Errore login:', err);
+    res.status(500).json({ ok: false, error: 'Errore del server, riprova.' });
+  }
+});
+
+// ---------- Endpoint: profilo cliente autenticato ----------
+app.get('/api/auth/me', authMiddleware, async (req, res) => {
+  if(!customersCollection) return res.status(503).json({ ok: false, error: 'Database non disponibile' });
+  try{
+    const { ObjectId } = require('mongodb');
+    const customer = await customersCollection.findOne({ _id: new ObjectId(req.user.id) });
+    if(!customer) return res.status(404).json({ ok: false, error: 'Account non trovato' });
+    res.json({ ok: true, profilo: { nome: customer.nome, cognome: customer.cognome, email: customer.email, telefono: customer.telefono, indirizzo: customer.indirizzo } });
+  }catch(err){
+    res.status(500).json({ ok: false, error: 'Errore del server' });
+  }
+});
+
+// ---------- Endpoint: aggiorna indirizzo/telefono salvato ----------
+app.put('/api/auth/me', authMiddleware, async (req, res) => {
+  if(!customersCollection) return res.status(503).json({ ok: false, error: 'Database non disponibile' });
+  const { nome, cognome, telefono, indirizzo } = req.body || {};
+  try{
+    const { ObjectId } = require('mongodb');
+    await customersCollection.updateOne(
+      { _id: new ObjectId(req.user.id) },
+      { $set: { nome, cognome, telefono, indirizzo } }
+    );
+    res.json({ ok: true });
+  }catch(err){
+    res.status(500).json({ ok: false, error: 'Errore del server' });
+  }
+});
+
+// ---------- Endpoint: il sito manda qui i nuovi ordini ----------
 app.post('/api/orders', async (req, res) => {
   const order = req.body;
   if (!order || !order.testoStampa) {
     return res.status(400).json({ ok: false, error: 'Ordine non valido' });
   }
 
+  // gestione slot: si applica solo alle consegne a domicilio
   if (order.modalita === 'consegna') {
     const now = new Date();
     let requestedDate = now;
@@ -121,6 +260,7 @@ app.post('/api/orders', async (req, res) => {
     } else if (order.timing === '30min') {
       requestedDate = new Date(now.getTime() + 30 * 60000);
     }
+    // "prima" (il prima possibile) usa direttamente l'orario attuale
 
     const dKey = dateKey(requestedDate);
     const slot = findAvailableSlot(requestedDate);
@@ -136,10 +276,13 @@ app.post('/api/orders', async (req, res) => {
   orderHistory.unshift(order);
   if (orderHistory.length > MAX_HISTORY) orderHistory.pop();
 
+  // 1) gira l'ordine subito al pannello di stampa
   broadcastOrder(order);
 
+  // 2) manda l'email alla pizzeria (non blocca la risposta se fallisce)
   sendEmail(ORDER_EMAIL, order.oggettoEmail || 'Nuovo ordine — La Casa di Carta', order.testoStampa);
 
+  // 3) manda l'email di conferma al cliente, se ha lasciato un indirizzo valido
   if (order.email) {
     sendEmail(order.email, 'Conferma ordine — La Casa di Carta', buildCustomerConfirmationText(order));
   }
@@ -147,6 +290,7 @@ app.post('/api/orders', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- Endpoint: il pannello di stampa si mette in ascolto qui ----------
 app.get('/api/orders/stream', (req, res) => {
   res.set({
     'Content-Type': 'text/event-stream',
@@ -163,10 +307,12 @@ app.get('/api/orders/stream', (req, res) => {
   });
 });
 
+// ---------- Endpoint: storico ordini (utile per controlli/debug) ----------
 app.get('/api/orders', (req, res) => {
   res.json(orderHistory);
 });
 
+// ---------- Pagina di controllo semplice ----------
 app.get('/', (req, res) => {
   res.send(`
     <h2>Server ordini La Casa di Carta — attivo ✅</h2>
