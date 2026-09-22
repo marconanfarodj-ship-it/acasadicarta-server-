@@ -52,15 +52,15 @@ const SITE_URL = process.env.SITE_URL || "https://ordini.pizzerialacasadicarta.i
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
 // ordini creati dal cliente ma in attesa dell'esito del pagamento online,
-// indicizzati per id di sessione Stripe. Si azzerano se il server si riavvia:
-// un pagamento completato durante un riavvio andrebbe verificato manualmente
-// dalla dashboard di Stripe (evento raro).
-let pendingOnlineOrders = {};
+// salvati su MongoDB (con scadenza automatica dopo 24 ore) così sopravvivono
+// anche se il server si riavvia mentre il cliente sta pagando su Stripe.
+let pendingOnlineOrders = {}; // riserva in memoria, usata solo se il database non è disponibile
 
 // ---------- Connessione al database (account clienti) ----------
 let db = null;
 let customersCollection = null;
 let ordersCollection = null;
+let pendingOrdersCollection = null;
 
 async function connectDB(){
   if(!MONGODB_URI){
@@ -73,8 +73,10 @@ async function connectDB(){
     db = client.db('lacasadicarta');
     customersCollection = db.collection('customers');
     ordersCollection = db.collection('orders');
+    pendingOrdersCollection = db.collection('pendingOnlineOrders');
     await customersCollection.createIndex({ email: 1 }, { unique: true });
     await ordersCollection.createIndex({ customerId: 1, ricevutoAlle: -1 });
+    await pendingOrdersCollection.createIndex({ createdAt: 1 }, { expireAfterSeconds: 60 * 60 * 24 });
     console.log('Connesso a MongoDB Atlas.');
   }catch(err){
     console.error('Errore connessione MongoDB:', err);
@@ -439,7 +441,14 @@ app.post('/api/checkout/create-session', async (req, res) => {
     order.pagamento = 'carta_online';
     order.pagatoOnline = true;
     const user = tryGetUserFromToken(req);
-    pendingOnlineOrders[session.id] = { order, customerId: user ? user.id : null };
+    const pendingData = { order, customerId: user ? user.id : null };
+
+    if (pendingOrdersCollection) {
+      await pendingOrdersCollection.insertOne({ _id: session.id, ...pendingData, createdAt: new Date() });
+    } else {
+      pendingOnlineOrders[session.id] = pendingData; // riserva se il database non è raggiungibile
+    }
+    console.log('Sessione di pagamento creata:', session.id);
 
     res.json({ ok: true, url: session.url });
   } catch (err) {
@@ -450,6 +459,7 @@ app.post('/api/checkout/create-session', async (req, res) => {
 
 // ---------- Endpoint: Stripe avvisa qui quando un pagamento va a buon fine ----------
 app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  console.log('Webhook Stripe ricevuto');
   if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.status(503).send('Webhook non configurato');
   let event;
   try {
@@ -460,9 +470,16 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
+  console.log('Evento Stripe valido:', event.type);
+
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
-    const pending = pendingOnlineOrders[session.id];
+    let pending = null;
+    if (pendingOrdersCollection) {
+      pending = await pendingOrdersCollection.findOne({ _id: session.id });
+    } else {
+      pending = pendingOnlineOrders[session.id];
+    }
     if (pending) {
       const { order, customerId } = pending;
       const slotResult = await assignDeliverySlotIfNeeded(order);
@@ -470,7 +487,12 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
         console.error('Slot pieno al momento della conferma pagamento — ordine comunque accettato:', slotResult.message);
       }
       await finalizeOrder(order, customerId);
-      delete pendingOnlineOrders[session.id];
+      console.log('Ordine finalizzato dopo pagamento online, numero:', order.numeroOrdine);
+      if (pendingOrdersCollection) {
+        await pendingOrdersCollection.deleteOne({ _id: session.id });
+      } else {
+        delete pendingOnlineOrders[session.id];
+      }
     } else {
       console.error('Ricevuta conferma di pagamento per una sessione sconosciuta:', session.id);
     }
