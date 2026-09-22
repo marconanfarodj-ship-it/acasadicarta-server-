@@ -132,21 +132,18 @@ function tryGetUserFromToken(req){
   }
 }
 
-async function sendEmail(to, subject, text) {
+async function sendEmail(to, subject, text, html) {
   if (!RESEND_API_KEY) return;
   try {
+    const payload = { from: FROM_EMAIL, to, subject, text };
+    if (html) payload.html = html;
     await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${RESEND_API_KEY}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({
-        from: FROM_EMAIL,
-        to,
-        subject,
-        text
-      })
+      body: JSON.stringify(payload)
     });
   } catch (err) {
     console.error('Errore invio email:', err);
@@ -155,6 +152,87 @@ async function sendEmail(to, subject, text) {
 
 function buildCustomerConfirmationText(order) {
   return `Ciao ${order.name || ''},\n\nAbbiamo ricevuto il tuo ordine da La Casa di Carta! Ecco il riepilogo:\n\n${order.testoStampa}\n\nGrazie e a presto!\nLa Casa di Carta`;
+}
+
+function esc(s){
+  return String(s || '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+}
+function money(n){ return '€' + (Number(n) || 0).toFixed(2).replace('.', ','); }
+
+function buildCustomerConfirmationHtml(order) {
+  const logoUrl = `${SITE_URL}/icon-512.png`;
+
+  const righeArticoli = (order.articoli || []).map(a => {
+    const dettagli = (a.dettagli || []).map(d => `<div style="font-size:12px;color:#8a8a8a;margin-top:2px;">${esc(d)}</div>`).join('');
+    return `
+      <tr>
+        <td style="padding:10px 0;border-bottom:1px solid #eee;vertical-align:top;">
+          <div style="font-weight:600;color:#222;">${a.qty}× ${esc(a.nome)}</div>
+          ${dettagli}
+        </td>
+        <td style="padding:10px 0;border-bottom:1px solid #eee;text-align:right;white-space:nowrap;color:#222;vertical-align:top;">${money(a.prezzo)}</td>
+      </tr>`;
+  }).join('');
+
+  const modalitaLabel = order.modalita === 'consegna' ? 'Consegna a domicilio' : 'Ritiro in sede';
+  const rigaIndirizzo = order.modalita === 'consegna' && order.address
+    ? `<tr><td style="padding:4px 0;color:#8a8a8a;">Indirizzo</td><td style="padding:4px 0;text-align:right;color:#222;">${esc(order.address)}</td></tr>`
+    : '';
+  const rigaConsegna = order.speseConsegna
+    ? `<tr><td style="padding:8px 0 0;color:#8a8a8a;">Spese di consegna</td><td style="padding:8px 0 0;text-align:right;color:#222;">${money(order.speseConsegna)}</td></tr>`
+    : '';
+
+  return `
+<!DOCTYPE html>
+<html lang="it">
+<body style="margin:0;padding:0;background:#f4f1ee;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f1ee;padding:24px 0;">
+    <tr><td align="center">
+      <table width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 4px 18px rgba(0,0,0,0.08);">
+
+        <tr><td style="background:linear-gradient(135deg,#c1382b,#7a1f16);padding:28px 24px;text-align:center;">
+          <img src="${logoUrl}" alt="La Casa di Carta" width="72" height="72" style="border-radius:20px;display:block;margin:0 auto 12px;">
+          <div style="color:#ffffff;font-size:20px;font-weight:700;letter-spacing:0.02em;">La Casa di Carta</div>
+          <div style="color:rgba(255,255,255,0.85);font-size:13px;margin-top:2px;">Pizzeria · Panineria · Griglieria — Niscemi</div>
+        </td></tr>
+
+        <tr><td style="padding:26px 24px 6px;">
+          <div style="font-size:17px;font-weight:700;color:#222;">Ciao ${esc(order.name || '')}! 🍕</div>
+          <div style="font-size:14px;color:#555;margin-top:6px;line-height:1.5;">Abbiamo ricevuto il tuo ordine numero <strong>#${order.numeroOrdine || ''}</strong>. Ecco il riepilogo:</div>
+        </td></tr>
+
+        <tr><td style="padding:10px 24px 0;">
+          <table width="100%" cellpadding="0" cellspacing="0">
+            ${righeArticoli}
+          </table>
+        </td></tr>
+
+        <tr><td style="padding:14px 24px 0;">
+          <table width="100%" cellpadding="0" cellspacing="0" style="font-size:14px;">
+            <tr><td style="padding:4px 0;color:#8a8a8a;">Subtotale</td><td style="padding:4px 0;text-align:right;color:#222;">${money(order.subtotale)}</td></tr>
+            ${rigaConsegna}
+            <tr><td style="padding:10px 0 0;font-weight:700;color:#222;border-top:1px solid #eee;">Totale</td><td style="padding:10px 0 0;text-align:right;font-weight:700;color:#c1382b;border-top:1px solid #eee;">${money(order.grandTotal)}</td></tr>
+          </table>
+        </td></tr>
+
+        <tr><td style="padding:20px 24px 0;">
+          <table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;background:#f8f5f2;border-radius:12px;padding:14px;">
+            <tr><td colspan="2" style="padding:0 0 8px;font-weight:700;color:#222;">${modalitaLabel}</td></tr>
+            <tr><td style="padding:2px 0;color:#8a8a8a;">Orario</td><td style="padding:2px 0;text-align:right;color:#222;">${esc(order.orarioLabel || '')}</td></tr>
+            ${rigaIndirizzo}
+          </table>
+        </td></tr>
+
+        <tr><td style="padding:22px 24px 28px;text-align:center;">
+          <div style="font-size:13px;color:#8a8a8a;">Grazie per il tuo ordine — a presto! 🔥</div>
+          <div style="font-size:12px;color:#b5b5b5;margin-top:14px;">La Casa di Carta · Via XX Settembre 192, Niscemi CL · +39 327 101 8160</div>
+        </td></tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
 }
 
 // ---------- Slot di consegna: max 3 ordini ogni 15 minuti ----------
@@ -373,9 +451,51 @@ async function finalizeOrder(order, customerId){
   broadcastOrder(order);
   sendEmail(ORDER_EMAIL, order.oggettoEmail || 'Nuovo ordine — La Casa di Carta', order.testoStampa);
   if (order.email) {
-    sendEmail(order.email, 'Conferma ordine — La Casa di Carta', buildCustomerConfirmationText(order));
+    sendEmail(order.email, 'Conferma ordine — La Casa di Carta', buildCustomerConfirmationText(order), buildCustomerConfirmationHtml(order));
   }
 }
+
+// ---------- Endpoint: richieste di prenotazione tavolo ----------
+let reservationCounter = 0;
+
+app.post('/api/reservations', async (req, res) => {
+  const { nome, telefono, data, ora, persone, note } = req.body || {};
+  if (!nome || !telefono || !data || !ora || !persone) {
+    return res.status(400).json({ ok: false, error: 'Compila tutti i campi obbligatori.' });
+  }
+
+  reservationCounter++;
+  const ricevutoAlle = new Date().toISOString();
+  const dataLeggibile = new Date(data + 'T00:00:00').toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric', month: 'long' });
+
+  const sep = '------------------------------';
+  let testoStampa = `PRENOTAZIONE TAVOLO — LA CASA DI CARTA\n`;
+  testoStampa += `Richiesta #${reservationCounter}\n${sep}\n\n`;
+  testoStampa += `Nome: ${nome}\n`;
+  testoStampa += `Telefono: ${telefono}\n`;
+  testoStampa += `Data: ${dataLeggibile}\n`;
+  testoStampa += `Ora: ${ora}\n`;
+  testoStampa += `Persone: ${persone}\n`;
+  if (note) testoStampa += `Note: ${note}\n`;
+  testoStampa += `\n${sep}\nRicevuta il ${new Date(ricevutoAlle).toLocaleString('it-IT')}\n`;
+
+  const reservation = {
+    tipo: 'prenotazione',
+    numeroPrenotazione: reservationCounter,
+    nome, telefono, data, ora, persone, note,
+    testoStampa,
+    ricevutoAlle
+  };
+
+  broadcastOrder(reservation);
+  sendEmail(
+    ORDER_EMAIL,
+    `Nuova prenotazione tavolo — ${nome} (${persone} persone, ${dataLeggibile} ore ${ora})`,
+    testoStampa
+  );
+
+  res.json({ ok: true });
+});
 
 app.post('/api/orders', async (req, res) => {
   const order = req.body;
