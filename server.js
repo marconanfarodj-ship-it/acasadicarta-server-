@@ -24,6 +24,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "cambia-questa-chiave-segreta";
 // ---------- Connessione al database (account clienti) ----------
 let db = null;
 let customersCollection = null;
+let ordersCollection = null;
 
 async function connectDB(){
   if(!MONGODB_URI){
@@ -35,7 +36,9 @@ async function connectDB(){
     await client.connect();
     db = client.db('lacasadicarta');
     customersCollection = db.collection('customers');
+    ordersCollection = db.collection('orders');
     await customersCollection.createIndex({ email: 1 }, { unique: true });
+    await ordersCollection.createIndex({ customerId: 1, ricevutoAlle: -1 });
     console.log('Connesso a MongoDB Atlas.');
   }catch(err){
     console.error('Errore connessione MongoDB:', err);
@@ -56,6 +59,19 @@ function authMiddleware(req, res, next){
     next();
   }catch(e){
     return res.status(401).json({ ok: false, error: 'Sessione scaduta, accedi di nuovo' });
+  }
+}
+
+// come authMiddleware, ma non blocca la richiesta se manca/è invalido il token
+// (usata per gli ordini, che si possono fare anche senza account)
+function tryGetUserFromToken(req){
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if(!token) return null;
+  try{
+    return jwt.verify(token, JWT_SECRET);
+  }catch(e){
+    return null;
   }
 }
 
@@ -276,6 +292,16 @@ app.post('/api/orders', async (req, res) => {
   orderHistory.unshift(order);
   if (orderHistory.length > MAX_HISTORY) orderHistory.pop();
 
+  // se il cliente ha effettuato il login, colleghiamo l'ordine al suo account
+  // per lo storico permanente (visibile solo a lui)
+  const user = tryGetUserFromToken(req);
+  if (user && ordersCollection) {
+    const { customerId, ...orderToSave } = order;
+    ordersCollection.insertOne({ ...orderToSave, customerId: user.id }).catch(err => {
+      console.error('Errore salvataggio storico ordine:', err);
+    });
+  }
+
   // 1) gira l'ordine subito al pannello di stampa
   broadcastOrder(order);
 
@@ -288,6 +314,21 @@ app.post('/api/orders', async (req, res) => {
   }
 
   res.json({ ok: true });
+});
+
+// ---------- Endpoint: storico ordini personale del cliente collegato ----------
+app.get('/api/orders/mine', authMiddleware, async (req, res) => {
+  if(!ordersCollection) return res.status(503).json({ ok: false, error: 'Database non disponibile' });
+  try{
+    const orders = await ordersCollection
+      .find({ customerId: req.user.id })
+      .sort({ ricevutoAlle: -1 })
+      .limit(50)
+      .toArray();
+    res.json({ ok: true, ordini: orders });
+  }catch(err){
+    res.status(500).json({ ok: false, error: 'Errore del server' });
+  }
 });
 
 // ---------- Endpoint: il pannello di stampa si mette in ascolto qui ----------
