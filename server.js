@@ -150,6 +150,10 @@ function reserveSlot(dateStr, slot){
   slotCounts[key] = (slotCounts[key] || 0) + 1;
 }
 
+function isSlotAvailable(dateStr, slot){
+  return (slotCounts[`${dateStr}|${slot}`] || 0) < MAX_PER_SLOT;
+}
+
 // ---------- Elenco dei "client" del pannello di stampa in ascolto (SSE) ----------
 let printClients = [];
 
@@ -279,12 +283,19 @@ app.post('/api/orders', async (req, res) => {
     // "prima" (il prima possibile) usa direttamente l'orario attuale
 
     const dKey = dateKey(requestedDate);
-    const slot = findAvailableSlot(requestedDate);
-    if (!slot) {
-      return res.status(409).json({ ok: false, error: 'slot_pieno_giornata', message: 'Tutto pieno per oggi, riprova domani.' });
+    const slot = slotLabel(requestedDate);
+    if (!isSlotAvailable(dKey, slot)) {
+      return res.status(409).json({
+        ok: false,
+        error: 'slot_pieno',
+        message: `L'orario delle ${slot} è al completo per le consegne. Scegli un altro orario tra quelli disponibili.`
+      });
     }
     reserveSlot(dKey, slot);
     order.slotAssegnato = slot;
+    // l'orario mostrato in comanda/email riflette lo slot vero assegnato
+    order.orarioLabel = `Alle ${slot}`;
+    order.testoStampa = (order.testoStampa || '').replace(/Orario richiesto:.*$/m, `Orario richiesto: Alle ${slot}`);
   }
 
   order.numeroOrdine = ++orderCounter;
