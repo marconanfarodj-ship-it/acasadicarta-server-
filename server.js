@@ -6,13 +6,32 @@
 
 const express = require('express');
 const cors = require('cors');
+const cookieParser = require('cookie-parser');
 const { MongoClient } = require('mongodb');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
 const app = express();
-app.use(cors());
+
+// Origini autorizzate a fare richieste con i cookie (il sito ordini, sul dominio vero
+// e, per compatibilità durante il passaggio, anche il vecchio indirizzo netlify.app)
+const ALLOWED_ORIGINS = [
+  'https://ordini.pizzerialacasadicarta.it',
+  'https://cheerful-melomakarona-cc557e.netlify.app'
+];
+app.use(cors({
+  origin: function(origin, callback){
+    if(!origin || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    callback(null, true); // per ora permissivo anche verso altre origini (es. claude.ai in fase di test)
+  },
+  credentials: true
+}));
+app.use(cookieParser());
 app.use(express.json());
+
+// dominio su cui il cookie di sessione è condiviso (sito e server sono su sottodomini diversi
+// dello stesso dominio vero, quindi il cookie può essere condiviso tra i due)
+const COOKIE_DOMAIN = process.env.COOKIE_DOMAIN || '.pizzerialacasadicarta.it';
 
 // ---------- Configurazione (da variabili d'ambiente su Render) ----------
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
@@ -50,9 +69,29 @@ function generateToken(customer){
   return jwt.sign({ id: customer._id.toString(), email: customer.email }, JWT_SECRET, { expiresIn: '180d' });
 }
 
-function authMiddleware(req, res, next){
+function setAuthCookie(res, token){
+  res.cookie('lcdc_session', token, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'lax',
+    domain: COOKIE_DOMAIN,
+    maxAge: 180 * 24 * 60 * 60 * 1000, // 180 giorni
+    path: '/'
+  });
+}
+
+function clearAuthCookie(res){
+  res.clearCookie('lcdc_session', { domain: COOKIE_DOMAIN, path: '/' });
+}
+
+function extractToken(req){
+  if(req.cookies && req.cookies.lcdc_session) return req.cookies.lcdc_session;
   const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  return header.startsWith('Bearer ') ? header.slice(7) : null; // retrocompatibilità
+}
+
+function authMiddleware(req, res, next){
+  const token = extractToken(req);
   if(!token) return res.status(401).json({ ok: false, error: 'Non autenticato' });
   try{
     req.user = jwt.verify(token, JWT_SECRET);
@@ -65,8 +104,7 @@ function authMiddleware(req, res, next){
 // come authMiddleware, ma non blocca la richiesta se manca/è invalido il token
 // (usata per gli ordini, che si possono fare anche senza account)
 function tryGetUserFromToken(req){
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  const token = extractToken(req);
   if(!token) return null;
   try{
     return jwt.verify(token, JWT_SECRET);
@@ -202,7 +240,8 @@ app.post('/api/auth/register', async (req, res) => {
     const result = await customersCollection.insertOne(customer);
     customer._id = result.insertedId;
     const token = generateToken(customer);
-    res.json({ ok: true, token, profilo: { nome, cognome, email: customer.email, telefono, indirizzo: customer.indirizzo } });
+    setAuthCookie(res, token);
+    res.json({ ok: true, profilo: { nome, cognome, email: customer.email, telefono, indirizzo: customer.indirizzo } });
   }catch(err){
     console.error('Errore registrazione:', err);
     res.status(500).json({ ok: false, error: 'Errore del server, riprova.' });
@@ -226,7 +265,8 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ ok: false, error: 'Email o password errati.' });
     }
     const token = generateToken(customer);
-    res.json({ ok: true, token, profilo: { nome: customer.nome, cognome: customer.cognome, email: customer.email, telefono: customer.telefono, indirizzo: customer.indirizzo } });
+    setAuthCookie(res, token);
+    res.json({ ok: true, profilo: { nome: customer.nome, cognome: customer.cognome, email: customer.email, telefono: customer.telefono, indirizzo: customer.indirizzo } });
   }catch(err){
     console.error('Errore login:', err);
     res.status(500).json({ ok: false, error: 'Errore del server, riprova.' });
@@ -260,6 +300,12 @@ app.put('/api/auth/me', authMiddleware, async (req, res) => {
   }catch(err){
     res.status(500).json({ ok: false, error: 'Errore del server' });
   }
+});
+
+// ---------- Endpoint: logout ----------
+app.post('/api/auth/logout', (req, res) => {
+  clearAuthCookie(res);
+  res.json({ ok: true });
 });
 
 // ---------- Endpoint: il sito manda qui i nuovi ordini ----------
