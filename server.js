@@ -10,6 +10,7 @@ const cookieParser = require('cookie-parser');
 const { MongoClient } = require('mongodb');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const Stripe = require('stripe');
 
 const app = express();
 
@@ -27,7 +28,13 @@ app.use(cors({
   credentials: true
 }));
 app.use(cookieParser());
-app.use(express.json());
+app.use((req, res, next) => {
+  if (req.originalUrl === '/api/stripe-webhook') {
+    next(); // qui serve il corpo "grezzo", non json già interpretato
+  } else {
+    express.json()(req, res, next);
+  }
+});
 
 // dominio su cui il cookie di sessione è condiviso (sito e server sono su sottodomini diversi
 // dello stesso dominio vero, quindi il cookie può essere condiviso tra i due)
@@ -39,6 +46,16 @@ const ORDER_EMAIL = process.env.ORDER_EMAIL || "Marconanfarodj@gmail.com";
 const FROM_EMAIL = process.env.FROM_EMAIL || "onboarding@resend.dev";
 const MONGODB_URI = process.env.MONGODB_URI || "";
 const JWT_SECRET = process.env.JWT_SECRET || "cambia-questa-chiave-segreta";
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
+const SITE_URL = process.env.SITE_URL || "https://ordini.pizzerialacasadicarta.it";
+const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
+
+// ordini creati dal cliente ma in attesa dell'esito del pagamento online,
+// indicizzati per id di sessione Stripe. Si azzerano se il server si riavvia:
+// un pagamento completato durante un riavvio andrebbe verificato manualmente
+// dalla dashboard di Stripe (evento raro).
+let pendingOnlineOrders = {};
 
 // ---------- Connessione al database (account clienti) ----------
 let db = null;
@@ -308,69 +325,158 @@ app.post('/api/auth/logout', (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- Endpoint: il sito manda qui i nuovi ordini ----------
+// ---------- Endpoint: il sito manda qui i nuovi ordini (pagamento a consegna) ----------
+async function assignDeliverySlotIfNeeded(order){
+  if (order.modalita !== 'consegna') return { ok: true };
+  const now = new Date();
+  let requestedDate = now;
+  if (order.timing === 'orario' && order.orarioRichiesto) {
+    const [h, m] = order.orarioRichiesto.split(':').map(Number);
+    requestedDate = new Date(now);
+    requestedDate.setHours(h, m, 0, 0);
+  } else if (order.timing === '30min') {
+    requestedDate = new Date(now.getTime() + 30 * 60000);
+  }
+  const dKey = dateKey(requestedDate);
+  const slot = slotLabel(requestedDate);
+  if (!isSlotAvailable(dKey, slot)) {
+    return {
+      ok: false,
+      error: 'slot_pieno',
+      message: `L'orario delle ${slot} è al completo per le consegne. Scegli un altro orario tra quelli disponibili.`
+    };
+  }
+  reserveSlot(dKey, slot);
+  order.slotAssegnato = slot;
+  order.orarioLabel = `Alle ${slot}`;
+  order.testoStampa = (order.testoStampa || '').replace(/Orario richiesto:.*$/m, `Orario richiesto: Alle ${slot}`);
+  return { ok: true };
+}
+
+// Prende un ordine già "pronto" (slot assegnato se serve) e lo finalizza:
+// numero ordine, storico, stampa in cucina, email. Usata sia dal checkout
+// diretto (pagamento a consegna) sia dal webhook Stripe (pagamento online).
+async function finalizeOrder(order, customerId){
+  order.numeroOrdine = ++orderCounter;
+  order.ricevutoAlle = new Date().toISOString();
+  orderHistory.unshift(order);
+  if (orderHistory.length > MAX_HISTORY) orderHistory.pop();
+
+  if (customerId && ordersCollection) {
+    ordersCollection.insertOne({ ...order, customerId }).catch(err => {
+      console.error('Errore salvataggio storico ordine:', err);
+    });
+  }
+
+  broadcastOrder(order);
+  sendEmail(ORDER_EMAIL, order.oggettoEmail || 'Nuovo ordine — La Casa di Carta', order.testoStampa);
+  if (order.email) {
+    sendEmail(order.email, 'Conferma ordine — La Casa di Carta', buildCustomerConfirmationText(order));
+  }
+}
+
 app.post('/api/orders', async (req, res) => {
   const order = req.body;
   if (!order || !order.testoStampa) {
     return res.status(400).json({ ok: false, error: 'Ordine non valido' });
   }
 
-  // gestione slot: si applica solo alle consegne a domicilio
-  if (order.modalita === 'consegna') {
-    const now = new Date();
-    let requestedDate = now;
-    if (order.timing === 'orario' && order.orarioRichiesto) {
-      const [h, m] = order.orarioRichiesto.split(':').map(Number);
-      requestedDate = new Date(now);
-      requestedDate.setHours(h, m, 0, 0);
-    } else if (order.timing === '30min') {
-      requestedDate = new Date(now.getTime() + 30 * 60000);
-    }
-    // "prima" (il prima possibile) usa direttamente l'orario attuale
-
-    const dKey = dateKey(requestedDate);
-    const slot = slotLabel(requestedDate);
-    if (!isSlotAvailable(dKey, slot)) {
-      return res.status(409).json({
-        ok: false,
-        error: 'slot_pieno',
-        message: `L'orario delle ${slot} è al completo per le consegne. Scegli un altro orario tra quelli disponibili.`
-      });
-    }
-    reserveSlot(dKey, slot);
-    order.slotAssegnato = slot;
-    // l'orario mostrato in comanda/email riflette lo slot vero assegnato
-    order.orarioLabel = `Alle ${slot}`;
-    order.testoStampa = (order.testoStampa || '').replace(/Orario richiesto:.*$/m, `Orario richiesto: Alle ${slot}`);
+  const slotResult = await assignDeliverySlotIfNeeded(order);
+  if (!slotResult.ok) {
+    return res.status(409).json(slotResult);
   }
 
-  order.numeroOrdine = ++orderCounter;
-  order.ricevutoAlle = new Date().toISOString();
-  orderHistory.unshift(order);
-  if (orderHistory.length > MAX_HISTORY) orderHistory.pop();
-
-  // se il cliente ha effettuato il login, colleghiamo l'ordine al suo account
-  // per lo storico permanente (visibile solo a lui)
+  order.pagatoOnline = false; // pagamento a consegna/ritiro
   const user = tryGetUserFromToken(req);
-  if (user && ordersCollection) {
-    const { customerId, ...orderToSave } = order;
-    ordersCollection.insertOne({ ...orderToSave, customerId: user.id }).catch(err => {
-      console.error('Errore salvataggio storico ordine:', err);
+  await finalizeOrder(order, user ? user.id : null);
+
+  res.json({ ok: true });
+});
+
+// ---------- Endpoint: crea una sessione di pagamento online (Stripe) ----------
+app.post('/api/checkout/create-session', async (req, res) => {
+  if (!stripe) return res.status(503).json({ ok: false, error: 'Pagamento online non configurato.' });
+  const order = req.body;
+  if (!order || !order.testoStampa || !order.grandTotal) {
+    return res.status(400).json({ ok: false, error: 'Ordine non valido' });
+  }
+
+  // controllo preventivo: se lo slot è già pieno, non ha senso far pagare il cliente
+  const now = new Date();
+  let requestedDate = now;
+  if (order.timing === 'orario' && order.orarioRichiesto) {
+    const [h, m] = order.orarioRichiesto.split(':').map(Number);
+    requestedDate = new Date(now);
+    requestedDate.setHours(h, m, 0, 0);
+  } else if (order.timing === '30min') {
+    requestedDate = new Date(now.getTime() + 30 * 60000);
+  }
+  if (order.modalita === 'consegna' && !isSlotAvailable(dateKey(requestedDate), slotLabel(requestedDate))) {
+    return res.status(409).json({
+      ok: false,
+      error: 'slot_pieno',
+      message: `L'orario delle ${slotLabel(requestedDate)} è al completo per le consegne. Scegli un altro orario tra quelli disponibili.`
     });
   }
 
-  // 1) gira l'ordine subito al pannello di stampa
-  broadcastOrder(order);
+  try {
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      payment_method_types: ['card'],
+      line_items: [{
+        price_data: {
+          currency: 'eur',
+          product_data: { name: `Ordine La Casa di Carta — ${order.name || 'Cliente'}` },
+          unit_amount: Math.round(order.grandTotal * 100)
+        },
+        quantity: 1
+      }],
+      customer_email: order.email || undefined,
+      success_url: `${SITE_URL}/?pagamento=riuscito`,
+      cancel_url: `${SITE_URL}/?pagamento=annullato`
+    });
 
-  // 2) manda l'email alla pizzeria (non blocca la risposta se fallisce)
-  sendEmail(ORDER_EMAIL, order.oggettoEmail || 'Nuovo ordine — La Casa di Carta', order.testoStampa);
+    order.pagamento = 'carta_online';
+    order.pagatoOnline = true;
+    const user = tryGetUserFromToken(req);
+    pendingOnlineOrders[session.id] = { order, customerId: user ? user.id : null };
 
-  // 3) manda l'email di conferma al cliente, se ha lasciato un indirizzo valido
-  if (order.email) {
-    sendEmail(order.email, 'Conferma ordine — La Casa di Carta', buildCustomerConfirmationText(order));
+    res.json({ ok: true, url: session.url });
+  } catch (err) {
+    console.error('Errore creazione sessione Stripe:', err);
+    res.status(500).json({ ok: false, error: 'Errore nella creazione del pagamento. Riprova.' });
+  }
+});
+
+// ---------- Endpoint: Stripe avvisa qui quando un pagamento va a buon fine ----------
+app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.status(503).send('Webhook non configurato');
+  let event;
+  try {
+    const signature = req.headers['stripe-signature'];
+    event = stripe.webhooks.constructEvent(req.body, signature, STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Firma webhook Stripe non valida:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  res.json({ ok: true });
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const pending = pendingOnlineOrders[session.id];
+    if (pending) {
+      const { order, customerId } = pending;
+      const slotResult = await assignDeliverySlotIfNeeded(order);
+      if (!slotResult.ok) {
+        console.error('Slot pieno al momento della conferma pagamento — ordine comunque accettato:', slotResult.message);
+      }
+      await finalizeOrder(order, customerId);
+      delete pendingOnlineOrders[session.id];
+    } else {
+      console.error('Ricevuta conferma di pagamento per una sessione sconosciuta:', session.id);
+    }
+  }
+
+  res.json({ received: true });
 });
 
 // ---------- Endpoint: storico ordini personale del cliente collegato ----------
