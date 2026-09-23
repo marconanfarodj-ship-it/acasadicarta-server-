@@ -241,6 +241,8 @@ const MAX_PER_SLOT = 3;
 const MIN_DELIVERY_ORDER = 10.00;
 const OPEN_FROM_HOUR = 19;
 const OPEN_TO_HOUR = 23;
+const CLOSED_WEEKDAY = 2; // 0=domenica, 1=lunedì, 2=martedì...
+const MAX_DAYS_AHEAD = 3; // si può ordinare/prenotare da oggi fino a 3 giorni dopo
 
 // conteggio in memoria: { "2026-09-22|19:15": 2, ... } — si azzera se il server si riavvia
 let slotCounts = {};
@@ -290,6 +292,19 @@ function isSlotAvailable(dateStr, slot){
   return (slotCounts[`${dateStr}|${slot}`] || 0) < MAX_PER_SLOT;
 }
 
+// controlla che una data (stringa "YYYY-MM-DD") sia tra oggi e i prossimi
+// MAX_DAYS_AHEAD giorni, e che non cada di martedì (giorno di chiusura)
+function isValidRequestDate(dateStr){
+  if(!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return false;
+  const today = new Date();
+  today.setHours(0,0,0,0);
+  const requested = new Date(dateStr + 'T00:00:00');
+  const diffDays = Math.round((requested - today) / 86400000);
+  if(diffDays < 0 || diffDays > MAX_DAYS_AHEAD) return false;
+  if(requested.getDay() === CLOSED_WEEKDAY) return false;
+  return true;
+}
+
 // ---------- Elenco dei "client" del pannello di stampa in ascolto (SSE) ----------
 let printClients = [];
 
@@ -306,6 +321,9 @@ let orderCounter = 1000;
 // ---------- Endpoint: disponibilità slot di consegna per una data ----------
 app.get('/api/delivery-slots', (req, res) => {
   const dateStr = req.query.date || dateKey(new Date());
+  if (!isValidRequestDate(dateStr)) {
+    return res.json({ date: dateStr, chiuso: true, slots: [] });
+  }
   const slots = allSlotsForDay();
   const result = slots.map(s => ({
     slot: s,
@@ -411,14 +429,26 @@ async function assignDeliverySlotIfNeeded(order){
   if (order.modalita !== 'consegna') return { ok: true };
   const now = new Date();
   let requestedDate = now;
+  let dKey = dateKey(now);
+
   if (order.timing === 'orario' && order.orarioRichiesto) {
+    // se il cliente ha scelto un giorno futuro (fino a MAX_DAYS_AHEAD), lo validiamo
+    if (order.dataRichiesta) {
+      if (!isValidRequestDate(order.dataRichiesta)) {
+        return {
+          ok: false,
+          error: 'data_non_valida',
+          message: 'Il giorno scelto non è disponibile per gli ordini. Scegline un altro tra quelli mostrati.'
+        };
+      }
+      dKey = order.dataRichiesta;
+    }
     const [h, m] = order.orarioRichiesto.split(':').map(Number);
-    requestedDate = new Date(now);
+    requestedDate = new Date(dKey + 'T00:00:00');
     requestedDate.setHours(h, m, 0, 0);
-  } else if (order.timing === '30min') {
-    requestedDate = new Date(now.getTime() + 30 * 60000);
   }
-  const dKey = dateKey(requestedDate);
+  // "prima" (il prima possibile) usa sempre il momento attuale, solo per oggi
+
   const slot = slotLabel(requestedDate);
   if (!isSlotAvailable(dKey, slot)) {
     return {
@@ -429,8 +459,9 @@ async function assignDeliverySlotIfNeeded(order){
   }
   reserveSlot(dKey, slot);
   order.slotAssegnato = slot;
-  order.orarioLabel = `Alle ${slot}`;
-  order.testoStampa = (order.testoStampa || '').replace(/Orario richiesto:.*$/m, `Orario richiesto: Alle ${slot}`);
+  const giornoLabel = dKey !== dateKey(now) ? ` del ${new Date(dKey + 'T00:00:00').toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric', month: 'long' })}` : '';
+  order.orarioLabel = `Alle ${slot}${giornoLabel}`;
+  order.testoStampa = (order.testoStampa || '').replace(/Orario richiesto:.*$/m, `Orario richiesto: Alle ${slot}${giornoLabel}`);
   return { ok: true };
 }
 
@@ -463,6 +494,9 @@ app.post('/api/reservations', async (req, res) => {
   const { nome, telefono, data, ora, persone, note } = req.body || {};
   if (!nome || !telefono || !data || !ora || !persone) {
     return res.status(400).json({ ok: false, error: 'Compila tutti i campi obbligatori.' });
+  }
+  if (!isValidRequestDate(data)) {
+    return res.status(409).json({ ok: false, error: 'Il giorno scelto non è disponibile. Scegline un altro tra quelli mostrati.' });
   }
 
   reservationCounter++;
@@ -540,17 +574,26 @@ app.post('/api/checkout/create-session', async (req, res) => {
     });
   }
 
-  // controllo preventivo: se lo slot è già pieno, non ha senso far pagare il cliente
+  // controllo preventivo: se lo slot è già pieno (o la data non valida), non ha senso far pagare il cliente
   const now = new Date();
+  let dKeyCheck = dateKey(now);
   let requestedDate = now;
   if (order.timing === 'orario' && order.orarioRichiesto) {
+    if (order.dataRichiesta) {
+      if (!isValidRequestDate(order.dataRichiesta)) {
+        return res.status(409).json({
+          ok: false,
+          error: 'data_non_valida',
+          message: 'Il giorno scelto non è disponibile per gli ordini. Scegline un altro tra quelli mostrati.'
+        });
+      }
+      dKeyCheck = order.dataRichiesta;
+    }
     const [h, m] = order.orarioRichiesto.split(':').map(Number);
-    requestedDate = new Date(now);
+    requestedDate = new Date(dKeyCheck + 'T00:00:00');
     requestedDate.setHours(h, m, 0, 0);
-  } else if (order.timing === '30min') {
-    requestedDate = new Date(now.getTime() + 30 * 60000);
   }
-  if (order.modalita === 'consegna' && !isSlotAvailable(dateKey(requestedDate), slotLabel(requestedDate))) {
+  if (order.modalita === 'consegna' && !isSlotAvailable(dKeyCheck, slotLabel(requestedDate))) {
     return res.status(409).json({
       ok: false,
       error: 'slot_pieno',
