@@ -344,6 +344,18 @@ function isSlotAvailable(dateStr, slot){
   return (slotCounts[`${dateStr}|${slot}`] || 0) < MAX_PER_SLOT;
 }
 
+const MIN_LEAD_MINUTES = 15; // non si può scegliere un orario a meno di 15 minuti da adesso
+
+// vero se lo slot (data + orario) è già passato, o troppo vicino ad ora per essere preparato in tempo
+function isSlotInPast(dateStr, slot){
+  const [h, m] = slot.split(':').map(Number);
+  const slotDate = new Date(dateStr + 'T00:00:00');
+  slotDate.setHours(h, m, 0, 0);
+  const now = new Date();
+  const minAllowed = new Date(now.getTime() + MIN_LEAD_MINUTES * 60000);
+  return slotDate < minAllowed;
+}
+
 // controlla che una data (stringa "YYYY-MM-DD") sia tra oggi e i prossimi
 // MAX_DAYS_AHEAD giorni, e che non cada di martedì (giorno di chiusura)
 function isValidRequestDate(dateStr){
@@ -380,7 +392,7 @@ app.get('/api/delivery-slots', (req, res) => {
   const result = slots.map(s => ({
     slot: s,
     prenotati: slotCounts[`${dateStr}|${s}`] || 0,
-    disponibile: (slotCounts[`${dateStr}|${s}`] || 0) < MAX_PER_SLOT
+    disponibile: (slotCounts[`${dateStr}|${s}`] || 0) < MAX_PER_SLOT && !isSlotInPast(dateStr, s)
   }));
   res.json({ date: dateStr, slots: result });
 });
@@ -502,6 +514,13 @@ async function assignDeliverySlotIfNeeded(order){
   // "prima" (il prima possibile) usa sempre il momento attuale, solo per oggi
 
   const slot = slotLabel(requestedDate);
+  if (order.timing === 'orario' && isSlotInPast(dKey, slot)) {
+    return {
+      ok: false,
+      error: 'orario_scaduto',
+      message: `L'orario delle ${slot} è già passato (o troppo vicino). Scegli un altro orario tra quelli disponibili.`
+    };
+  }
   if (!isSlotAvailable(dKey, slot)) {
     return {
       ok: false,
@@ -645,6 +664,13 @@ app.post('/api/checkout/create-session', async (req, res) => {
     const [h, m] = order.orarioRichiesto.split(':').map(Number);
     requestedDate = new Date(dKeyCheck + 'T00:00:00');
     requestedDate.setHours(h, m, 0, 0);
+  }
+  if (order.modalita === 'consegna' && order.timing === 'orario' && isSlotInPast(dKeyCheck, slotLabel(requestedDate))) {
+    return res.status(409).json({
+      ok: false,
+      error: 'orario_scaduto',
+      message: `L'orario delle ${slotLabel(requestedDate)} è già passato (o troppo vicino). Scegli un altro orario tra quelli disponibili.`
+    });
   }
   if (order.modalita === 'consegna' && !isSlotAvailable(dKeyCheck, slotLabel(requestedDate))) {
     return res.status(409).json({
