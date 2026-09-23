@@ -836,6 +836,39 @@ app.post('/api/orders/:numeroOrdine/pronto', (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- Endpoint: elenco ordini pronti da caricare in consegna (per la pagina del fattorino) ----------
+app.get('/api/orders/pronti-consegna', (req, res) => {
+  const ordini = orderHistory
+    .filter(o => o.modalita === 'consegna' && (o.stato === 'pronto' || o.stato === 'in_consegna'))
+    .map(o => ({
+      numeroOrdine: o.numeroOrdine,
+      name: o.name || o.nome || 'Cliente',
+      address: o.address || '',
+      stato: o.stato
+    }));
+  res.json(ordini);
+});
+
+// ---------- Endpoint: il fattorino segna qui un ordine come caricato/in consegna ----------
+app.post('/api/orders/:numeroOrdine/in-consegna', (req, res) => {
+  const numeroOrdine = Number(req.params.numeroOrdine);
+  const order = orderHistory.find(o => o.numeroOrdine === numeroOrdine);
+  if (!order) return res.status(404).json({ ok: false, error: 'Ordine non trovato' });
+
+  order.stato = 'in_consegna';
+  order.inConsegnaAlle = new Date().toISOString();
+
+  if (ordersCollection) {
+    ordersCollection.updateOne({ numeroOrdine }, { $set: { stato: 'in_consegna', inConsegnaAlle: order.inConsegnaAlle } }).catch(err => {
+      console.error('Errore aggiornamento stato ordine nel database:', err);
+    });
+  }
+
+  broadcastOrder({ evento: 'stato_aggiornato', numeroOrdine, stato: 'in_consegna' });
+
+  res.json({ ok: true });
+});
+
 // ---------- Pagina di controllo semplice ----------
 app.get('/', (req, res) => {
   res.send(`
