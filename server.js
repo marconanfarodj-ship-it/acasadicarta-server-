@@ -181,6 +181,10 @@ function buildCustomerConfirmationHtml(order) {
   const rigaConsegna = order.speseConsegna
     ? `<tr><td style="padding:8px 0 0;color:#8a8a8a;">Spese di consegna</td><td style="padding:8px 0 0;text-align:right;color:#222;">${money(order.speseConsegna)}</td></tr>`
     : '';
+  const pagamentoLabel = order.pagatoOnline
+    ? '✅ Pagato online'
+    : (order.pagamento === 'contanti' ? 'Contanti alla consegna/ritiro' : 'Bancomat/Carta alla consegna/ritiro');
+  const rigaPagamento = `<tr><td style="padding:2px 0;color:#8a8a8a;">Pagamento</td><td style="padding:2px 0;text-align:right;color:${order.pagatoOnline ? '#1a9c4a' : '#222'};font-weight:${order.pagatoOnline ? '700' : '400'};">${pagamentoLabel}</td></tr>`;
 
   return `
 <!DOCTYPE html>
@@ -220,6 +224,7 @@ function buildCustomerConfirmationHtml(order) {
             <tr><td colspan="2" style="padding:0 0 8px;font-weight:700;color:#222;">${modalitaLabel}</td></tr>
             <tr><td style="padding:2px 0;color:#8a8a8a;">Orario</td><td style="padding:2px 0;text-align:right;color:#222;">${esc(order.orarioLabel || '')}</td></tr>
             ${rigaIndirizzo}
+            ${rigaPagamento}
           </table>
         </td></tr>
 
