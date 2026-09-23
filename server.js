@@ -300,6 +300,7 @@ const OPEN_FROM_HOUR = 19;
 const OPEN_TO_HOUR = 23;
 const CLOSED_WEEKDAY = 2; // 0=domenica, 1=lunedì, 2=martedì...
 const MAX_DAYS_AHEAD = 3; // si può ordinare/prenotare da oggi fino a 3 giorni dopo
+const ASAP_DISABLED_WEEKDAYS_CONSEGNA = [0, 6]; // 0=domenica, 6=sabato: niente "il prima possibile" per le consegne
 
 // conteggio in memoria: { "2026-09-22|19:15": 2, ... } — si azzera se il server si riavvia
 let slotCounts = {};
@@ -499,6 +500,14 @@ app.post('/api/auth/logout', (req, res) => {
 // ---------- Endpoint: il sito manda qui i nuovi ordini (pagamento a consegna) ----------
 async function assignDeliverySlotIfNeeded(order){
   if (order.modalita !== 'consegna') return { ok: true };
+
+  if (order.timing === 'prima' && ASAP_DISABLED_WEEKDAYS_CONSEGNA.includes(new Date().getDay())) {
+    return {
+      ok: false,
+      error: 'asap_non_disponibile',
+      message: 'Nel weekend le consegne a domicilio sono solo su prenotazione. Scegli un orario specifico.'
+    };
+  }
   const now = new Date();
   let requestedDate = now;
   let dKey = dateKey(now);
@@ -655,6 +664,13 @@ app.post('/api/checkout/create-session', async (req, res) => {
   }
 
   // controllo preventivo: se lo slot è già pieno (o la data non valida), non ha senso far pagare il cliente
+  if (order.modalita === 'consegna' && order.timing === 'prima' && ASAP_DISABLED_WEEKDAYS_CONSEGNA.includes(new Date().getDay())) {
+    return res.status(409).json({
+      ok: false,
+      error: 'asap_non_disponibile',
+      message: 'Nel weekend le consegne a domicilio sono solo su prenotazione. Scegli un orario specifico.'
+    });
+  }
   const now = new Date();
   let dKeyCheck = dateKey(now);
   let requestedDate = now;
