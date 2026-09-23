@@ -4,6 +4,11 @@
 // al pannello di stampa, e manda l'email alla pizzeria.
 // ============================================
 
+// IMPORTANTISSIMO: il server (Render) gira in orario UTC, non italiano.
+// Senza questa riga, tutti i calcoli di orario (slot, apertura/chiusura)
+// sarebbero sfasati di 1-2 ore rispetto all'ora reale in Italia.
+process.env.TZ = 'Europe/Rome';
+
 const express = require('express');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
@@ -300,7 +305,10 @@ const MAX_DAYS_AHEAD = 3; // si può ordinare/prenotare da oggi fino a 3 giorni 
 let slotCounts = {};
 
 function dateKey(d){
-  return d.toISOString().slice(0,10); // YYYY-MM-DD (UTC, va bene per un conteggio interno)
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`; // YYYY-MM-DD, ora in ora italiana grazie a process.env.TZ
 }
 
 function slotLabel(d){
