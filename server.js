@@ -49,6 +49,9 @@ const JWT_SECRET = process.env.JWT_SECRET || "cambia-questa-chiave-segreta";
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
 const SITE_URL = process.env.SITE_URL || "https://ordini.pizzerialacasadicarta.it";
+// cambia ogni volta che il server si riavvia: serve per far capire alle app di posta
+// (soprattutto Mail su iPhone) che il logo è "nuovo" quando lo aggiorniamo
+const ASSET_VERSION = Date.now();
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
 // ordini creati dal cliente ma in attesa dell'esito del pagamento online,
@@ -160,7 +163,7 @@ function esc(s){
 function money(n){ return '€' + (Number(n) || 0).toFixed(2).replace('.', ','); }
 
 function buildCustomerConfirmationHtml(order) {
-  const logoUrl = `${SITE_URL}/icon-512.png`;
+  const logoUrl = `${SITE_URL}/icon-512.png?v=${ASSET_VERSION}`;
 
   const righeArticoli = (order.articoli || []).map(a => {
     const dettagli = (a.dettagli || []).map(d => `<div style="font-size:12px;color:#8a8a8a;margin-top:2px;">${esc(d)}</div>`).join('');
