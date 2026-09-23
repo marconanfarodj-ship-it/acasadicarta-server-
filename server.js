@@ -824,10 +824,12 @@ app.post('/api/orders/:numeroOrdine/pronto', (req, res) => {
 
   broadcastOrder({ evento: 'stato_aggiornato', numeroOrdine, stato: 'pronto' });
 
-  if (order.email) {
+  // per il ritiro in sede l'email va mandata subito (il cliente può già venire a ritirare);
+  // per la consegna aspettiamo che il fattorino carichi davvero l'ordine (endpoint /in-consegna)
+  if (order.email && order.modalita !== 'consegna') {
     sendEmail(
       order.email,
-      order.modalita === 'consegna' ? 'Il tuo ordine è in partenza! — La Casa di Carta' : 'Il tuo ordine è pronto! — La Casa di Carta',
+      'Il tuo ordine è pronto! — La Casa di Carta',
       buildOrderReadyText(order),
       buildOrderReadyHtml(order)
     );
@@ -865,6 +867,15 @@ app.post('/api/orders/:numeroOrdine/in-consegna', (req, res) => {
   }
 
   broadcastOrder({ evento: 'stato_aggiornato', numeroOrdine, stato: 'in_consegna' });
+
+  if (order.email) {
+    sendEmail(
+      order.email,
+      'Il tuo ordine è in partenza! — La Casa di Carta',
+      buildOrderReadyText(order),
+      buildOrderReadyHtml(order)
+    );
+  }
 
   res.json({ ok: true });
 });
