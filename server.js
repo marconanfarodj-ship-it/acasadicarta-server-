@@ -161,7 +161,10 @@ function buildOrderReadyText(order) {
   const azione = order.modalita === 'consegna'
     ? 'Il tuo ordine è pronto ed è in partenza per la consegna! 🛵'
     : 'Il tuo ordine è pronto per il ritiro! 🍕';
-  return `Ciao ${order.name || ''},\n\n${azione}\n\nOrdine #${order.numeroOrdine}\n\nA presto!\nLa Casa di Carta`;
+  const link = order.modalita === 'consegna'
+    ? `\n\nSegui la consegna in tempo reale: ${SITE_URL}/traccia.html?ordine=${order.numeroOrdine}`
+    : '';
+  return `Ciao ${order.name || ''},\n\n${azione}\n\nOrdine #${order.numeroOrdine}${link}\n\nA presto!\nLa Casa di Carta`;
 }
 
 function buildOrderReadyHtml(order) {
@@ -184,6 +187,9 @@ function buildOrderReadyHtml(order) {
           <div style="font-size:19px;font-weight:700;color:#222;margin-bottom:10px;">Ciao ${esc(order.name || '')}!</div>
           <div style="font-size:17px;color:#333;line-height:1.5;">${azione}</div>
           <div style="font-size:14px;color:#8a8a8a;margin-top:16px;">Ordine #${order.numeroOrdine}</div>
+          ${order.modalita === 'consegna' ? `
+          <a href="${SITE_URL}/traccia.html?ordine=${order.numeroOrdine}" style="display:inline-block;margin-top:20px;background:linear-gradient(135deg,#1a9c4a,#127034);color:#fff;text-decoration:none;font-weight:700;font-size:15px;padding:13px 28px;border-radius:999px;">🛵 Segui la consegna in tempo reale</a>
+          ` : ''}
         </td></tr>
         <tr><td style="padding:0 24px 26px;text-align:center;">
           <div style="font-size:13px;color:#8a8a8a;">La Casa di Carta · Via XX Settembre 192, Niscemi CL · +39 327 101 8160</div>
@@ -765,6 +771,42 @@ app.get('/api/orders', (req, res) => {
   res.json(orderHistory);
 });
 
+// ---------- Tracciamento consegna in tempo reale ----------
+// posizione del fattorino: una sola, condivisa (un mezzo alla volta consegna)
+let driverLocation = null; // { lat, lng, aggiornataAlle }
+
+app.post('/api/driver-location', (req, res) => {
+  const { lat, lng } = req.body || {};
+  if (typeof lat !== 'number' || typeof lng !== 'number') {
+    return res.status(400).json({ ok: false, error: 'Coordinate non valide' });
+  }
+  driverLocation = { lat, lng, aggiornataAlle: new Date().toISOString() };
+  res.json({ ok: true });
+});
+
+app.get('/api/driver-location', (req, res) => {
+  if (!driverLocation) return res.json({ disponibile: false });
+  // se la posizione non si aggiorna da più di 5 minuti, consideriamola scaduta
+  const eta = Date.now() - new Date(driverLocation.aggiornataAlle).getTime();
+  if (eta > 5 * 60 * 1000) return res.json({ disponibile: false });
+  res.json({ disponibile: true, ...driverLocation });
+});
+
+// info minime e pubbliche su un ordine, usate dalla pagina di tracciamento del cliente
+// (nessun dato sensibile: solo ciò che serve per mostrare la mappa)
+app.get('/api/orders/:numeroOrdine/pubblico', (req, res) => {
+  const numeroOrdine = Number(req.params.numeroOrdine);
+  const order = orderHistory.find(o => o.numeroOrdine === numeroOrdine);
+  if (!order) return res.status(404).json({ ok: false, error: 'Ordine non trovato' });
+  res.json({
+    ok: true,
+    numeroOrdine: order.numeroOrdine,
+    modalita: order.modalita,
+    address: order.modalita === 'consegna' ? order.address : null,
+    stato: order.stato || 'da_preparare'
+  });
+});
+
 // ---------- Endpoint: il pannello di stampa segna qui un ordine come pronto ----------
 app.post('/api/orders/:numeroOrdine/pronto', (req, res) => {
   const numeroOrdine = Number(req.params.numeroOrdine);
@@ -773,6 +815,12 @@ app.post('/api/orders/:numeroOrdine/pronto', (req, res) => {
 
   order.stato = 'pronto';
   order.prontoAlle = new Date().toISOString();
+
+  if (ordersCollection) {
+    ordersCollection.updateOne({ numeroOrdine }, { $set: { stato: 'pronto', prontoAlle: order.prontoAlle } }).catch(err => {
+      console.error('Errore aggiornamento stato ordine nel database:', err);
+    });
+  }
 
   broadcastOrder({ evento: 'stato_aggiornato', numeroOrdine, stato: 'pronto' });
 
