@@ -157,6 +157,44 @@ function buildCustomerConfirmationText(order) {
   return `Ciao ${order.name || ''},\n\nAbbiamo ricevuto il tuo ordine da La Casa di Carta! Ecco il riepilogo:\n\n${order.testoStampa}\n\nGrazie e a presto!\nLa Casa di Carta`;
 }
 
+function buildOrderReadyText(order) {
+  const azione = order.modalita === 'consegna'
+    ? 'Il tuo ordine è pronto ed è in partenza per la consegna! 🛵'
+    : 'Il tuo ordine è pronto per il ritiro! 🍕';
+  return `Ciao ${order.name || ''},\n\n${azione}\n\nOrdine #${order.numeroOrdine}\n\nA presto!\nLa Casa di Carta`;
+}
+
+function buildOrderReadyHtml(order) {
+  const logoUrl = `${SITE_URL}/icon-512.png?v=${ASSET_VERSION}`;
+  const azione = order.modalita === 'consegna'
+    ? 'Il tuo ordine è pronto ed è in partenza per la consegna! 🛵'
+    : 'Il tuo ordine è pronto per il ritiro! 🍕';
+  return `
+<!DOCTYPE html>
+<html lang="it">
+<body style="margin:0;padding:0;background:#f4f1ee;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f1ee;padding:24px 0;">
+    <tr><td align="center">
+      <table width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 4px 18px rgba(0,0,0,0.08);">
+        <tr><td style="background:linear-gradient(135deg,#1a9c4a,#127034);padding:28px 24px;text-align:center;">
+          <img src="${logoUrl}" alt="La Casa di Carta" width="72" height="72" style="border-radius:20px;display:block;margin:0 auto 12px;">
+          <div style="color:#ffffff;font-size:20px;font-weight:700;letter-spacing:0.02em;">La Casa di Carta</div>
+        </td></tr>
+        <tr><td style="padding:30px 24px;text-align:center;">
+          <div style="font-size:19px;font-weight:700;color:#222;margin-bottom:10px;">Ciao ${esc(order.name || '')}!</div>
+          <div style="font-size:17px;color:#333;line-height:1.5;">${azione}</div>
+          <div style="font-size:14px;color:#8a8a8a;margin-top:16px;">Ordine #${order.numeroOrdine}</div>
+        </td></tr>
+        <tr><td style="padding:0 24px 26px;text-align:center;">
+          <div style="font-size:13px;color:#8a8a8a;">La Casa di Carta · Via XX Settembre 192, Niscemi CL · +39 327 101 8160</div>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+}
+
 function esc(s){
   return String(s || '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
 }
@@ -479,6 +517,7 @@ async function assignDeliverySlotIfNeeded(order){
 async function finalizeOrder(order, customerId){
   order.numeroOrdine = ++orderCounter;
   order.ricevutoAlle = new Date().toISOString();
+  order.stato = 'da_preparare';
   orderHistory.unshift(order);
   if (orderHistory.length > MAX_HISTORY) orderHistory.pop();
 
@@ -724,6 +763,29 @@ app.get('/api/orders/stream', (req, res) => {
 // ---------- Endpoint: storico ordini (utile per controlli/debug) ----------
 app.get('/api/orders', (req, res) => {
   res.json(orderHistory);
+});
+
+// ---------- Endpoint: il pannello di stampa segna qui un ordine come pronto ----------
+app.post('/api/orders/:numeroOrdine/pronto', (req, res) => {
+  const numeroOrdine = Number(req.params.numeroOrdine);
+  const order = orderHistory.find(o => o.numeroOrdine === numeroOrdine);
+  if (!order) return res.status(404).json({ ok: false, error: 'Ordine non trovato' });
+
+  order.stato = 'pronto';
+  order.prontoAlle = new Date().toISOString();
+
+  broadcastOrder({ evento: 'stato_aggiornato', numeroOrdine, stato: 'pronto' });
+
+  if (order.email) {
+    sendEmail(
+      order.email,
+      order.modalita === 'consegna' ? 'Il tuo ordine è in partenza! — La Casa di Carta' : 'Il tuo ordine è pronto! — La Casa di Carta',
+      buildOrderReadyText(order),
+      buildOrderReadyHtml(order)
+    );
+  }
+
+  res.json({ ok: true });
 });
 
 // ---------- Pagina di controllo semplice ----------
