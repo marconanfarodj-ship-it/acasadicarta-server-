@@ -238,6 +238,7 @@ function buildCustomerConfirmationHtml(order) {
 // ---------- Slot di consegna: max 3 ordini ogni 15 minuti ----------
 const SLOT_MINUTES = 15;
 const MAX_PER_SLOT = 3;
+const MIN_DELIVERY_ORDER = 10.00;
 const OPEN_FROM_HOUR = 19;
 const OPEN_TO_HOUR = 23;
 
@@ -503,6 +504,14 @@ app.post('/api/orders', async (req, res) => {
     return res.status(400).json({ ok: false, error: 'Ordine non valido' });
   }
 
+  if (order.modalita === 'consegna' && (order.subtotale || 0) < MIN_DELIVERY_ORDER) {
+    return res.status(400).json({
+      ok: false,
+      error: 'ordine_minimo',
+      message: `L'ordine minimo per la consegna a domicilio è di €${MIN_DELIVERY_ORDER.toFixed(2).replace('.', ',')}.`
+    });
+  }
+
   const slotResult = await assignDeliverySlotIfNeeded(order);
   if (!slotResult.ok) {
     return res.status(409).json(slotResult);
@@ -521,6 +530,14 @@ app.post('/api/checkout/create-session', async (req, res) => {
   const order = req.body;
   if (!order || !order.testoStampa || !order.grandTotal) {
     return res.status(400).json({ ok: false, error: 'Ordine non valido' });
+  }
+
+  if (order.modalita === 'consegna' && (order.subtotale || 0) < MIN_DELIVERY_ORDER) {
+    return res.status(400).json({
+      ok: false,
+      error: 'ordine_minimo',
+      message: `L'ordine minimo per la consegna a domicilio è di €${MIN_DELIVERY_ORDER.toFixed(2).replace('.', ',')}.`
+    });
   }
 
   // controllo preventivo: se lo slot è già pieno, non ha senso far pagare il cliente
