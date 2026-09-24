@@ -910,6 +910,18 @@ app.get('/api/sold-out', (req, res) => {
   res.json([...soldOutCache]);
 });
 
+// ---------- Endpoint: segna tutti i prodotti come disponibili (azzera l'elenco esauriti) ----------
+app.post('/api/sold-out/reset-all', async (req, res) => {
+  soldOutCache = new Set();
+  if (soldOutCollection) {
+    await soldOutCollection.deleteMany({}).catch(err => {
+      console.error('Errore azzeramento esauriti:', err);
+    });
+  }
+  broadcastOrder({ evento: 'esauriti_aggiornati', esauriti: [] });
+  res.json({ ok: true });
+});
+
 // ---------- Endpoint: segna/togli un prodotto come esaurito ----------
 app.post('/api/sold-out/toggle', async (req, res) => {
   const { chiave, esaurito } = req.body || {};
