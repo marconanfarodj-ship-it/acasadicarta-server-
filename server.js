@@ -898,8 +898,11 @@ app.post('/api/orders/:numeroOrdine/pronto', (req, res) => {
 
 // ---------- Endpoint: elenco ordini pronti da caricare in consegna (per la pagina del fattorino) ----------
 // ---------- Endpoint: catalogo prodotti (per la lista da spuntare nel pannello di stampa) ----------
+// tipi di pane per i panini (deve combaciare con BREAD_OPTIONS nel sito)
+const BREAD_TYPES = ["Panino Classico", "Pan Pizza", "Tortilla"];
+
 app.get('/api/menu-catalog', (req, res) => {
-  res.json(MENU_CATALOG);
+  res.json({ categorie: MENU_CATALOG, tipiPane: BREAD_TYPES });
 });
 
 // ---------- Endpoint: elenco prodotti attualmente esauriti ----------
