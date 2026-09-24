@@ -69,6 +69,8 @@ let db = null;
 let customersCollection = null;
 let ordersCollection = null;
 let pendingOrdersCollection = null;
+let soldOutCollection = null;
+let soldOutCache = new Set(); // riserva in memoria, usata se il database non è raggiungibile
 
 async function connectDB(){
   if(!MONGODB_URI){
@@ -82,9 +84,12 @@ async function connectDB(){
     customersCollection = db.collection('customers');
     ordersCollection = db.collection('orders');
     pendingOrdersCollection = db.collection('pendingOnlineOrders');
+    soldOutCollection = db.collection('soldOutItems');
     await customersCollection.createIndex({ email: 1 }, { unique: true });
     await ordersCollection.createIndex({ customerId: 1, ricevutoAlle: -1 });
     await pendingOrdersCollection.createIndex({ createdAt: 1 }, { expireAfterSeconds: 60 * 60 * 24 });
+    const soldOutDocs = await soldOutCollection.find({}).toArray();
+    soldOutCache = new Set(soldOutDocs.map(d => d._id));
     console.log('Connesso a MongoDB Atlas.');
   }catch(err){
     console.error('Errore connessione MongoDB:', err);
@@ -301,6 +306,9 @@ const OPEN_TO_HOUR = 23;
 const CLOSED_WEEKDAY = 2; // 0=domenica, 1=lunedì, 2=martedì...
 const MAX_DAYS_AHEAD = 3; // si può ordinare/prenotare da oggi fino a 3 giorni dopo
 const ASAP_DISABLED_WEEKDAYS_CONSEGNA = [0, 6]; // 0=domenica, 6=sabato: niente "il prima possibile" per le consegne
+
+// catalogo di categorie e nomi articoli (usato dal pannello di stampa per segnare i prodotti esauriti)
+const MENU_CATALOG = [{"cat": "Pizza", "items": ["Faccia Di Vecchia", "Rossa", "Biancaneve", "Marinara", "Margherita", "Patapizza", "Bufala", "Diavola", "Pizza Regina", "Tonno & Cipolla", "Napoli", "Oslo", "Norma", "Berlino", "Tropea", "Helsinki", "Sfiziosa", "Nairobi", "Mosca", "Rio", "Tutti I Gusti", "Ripiegata", "4 Formaggi", "007", "La Casa Di Carta", "Parmigiana", "4 Stagioni", "Bella Ciao", "Marsiglia", "Ai Porcini", "Vegetariana", "Pizza Kebab", "Gustosa", "Tokio", "Bogotà", "Frutti Di Mare", "Cincinnati", "Suprema"]}, {"cat": "Pizza Dolce", "items": ["Nutella", "Kinder Bueno", "Paradiso", "Dubai"]}, {"cat": "Panini", "items": ["Panino Patatine, Wurstel", "Panino con Patatine", "Panino Crocchette di Patate & Patatine", "Panino Patatine, Wurstel in Salsa Rosa", "Panino Pollo al Curry & Patatine", "Panino Pollo ai Funghi & Patatine", "Panino Pollo Impanato & Patatine", "Panino Pollo Messicano & Patatine", "Panino Pollo al Barbecue & Patatine", "Panino Petto di Pollo alla Griglia & Patatine", "Panino Arrosto di Pollo & Patatine", "Panino Petto di Pollo Sfilettato & Patatine", "Panino Porchettata & Patatine", "Panino Salame Piccante e Mozzarella & Patatine", "Panino Salame Piccante e Svizzero & Patatine", "Panino Bella Ciao & Patatine", "Panino 4 Formaggi & Patatine", "Panino Prosciutto Mozzarella & Patatine", "Cocktail Di Tonno & Patatine", "Panino Kebab & Patatine", "Panino Polpette di Cavallo & Patatine", "Panino Cavallo & Patatine", "Panino Salsiccia & Patatine", "Panino in Cocktail di Gamberi in Salsa Rosa & Patatine", "Hamburger di Scottona & Patatine", "Hamburger di Angus & Patatine", "Panino con Fagotto di Pollo e Pancetta & Patatine", "Panino Porchetta Artigianale e Patatine", "Panino con Salsiccia di Cavallo & Patatine"]}, {"cat": "Hamburger", "items": ["Brooklyn", "Bronx", "Spicy", "Manathan", "Queens"]}, {"cat": "Focacce", "items": ["Focaccia Vuota Da Condire", "Casareccia", "Focaccia Prosciutto", "Focaccia Caprese", "Focaccia Del Pirata", "Focaccia Mista", "Deliziosa", "Focaccia 4 Formaggi", "Bella Ciao", "Focaccia Nairobi"]}, {"cat": "Fritture", "items": ["Vaschetta Piccola — Patatine", "Vaschetta Media — Patatine", "Patatine con Buccia", "Vaschetta Piccola — 4 Würstel & Patatine", "Vaschetta — 8 Würstel", "Vaschetta — Crocchette di Patate", "Anelli di Cipolla", "Panzerotti Fritti Mignon Pomodoro e Mozzarella", "Mozzarelline Impanate", "Arancini Mignon al Ragù", "Nuggets 10 Pezzi", "Arancini Mignon ai Funghi"]}, {"cat": "Bevande", "items": ["Gassosa", "Acqua Naturale Piccola", "Acqua Frizzante", "Coca Cola 33", "Coca Cola Zero", "Birra Moretti", "Birra Peroni", "Coca Cola Vetro cl 33", "Estathe Pesca", "Nastro Azzurro", "Ceres", "Coca Cola Bottiglia Grande", "Birra Messina Grande", "Birra Nastro Azzurro Grande", "Icnusa", "Peroni Chill Lemon"]}, {"cat": "Extra", "items": ["Bustina Maionese", "Bustina Ketchup"]}];
 
 // conteggio in memoria: { "2026-09-22|19:15": 2, ... } — si azzera se il server si riavvia
 let slotCounts = {};
@@ -889,6 +897,41 @@ app.post('/api/orders/:numeroOrdine/pronto', (req, res) => {
 });
 
 // ---------- Endpoint: elenco ordini pronti da caricare in consegna (per la pagina del fattorino) ----------
+// ---------- Endpoint: catalogo prodotti (per la lista da spuntare nel pannello di stampa) ----------
+app.get('/api/menu-catalog', (req, res) => {
+  res.json(MENU_CATALOG);
+});
+
+// ---------- Endpoint: elenco prodotti attualmente esauriti ----------
+app.get('/api/sold-out', (req, res) => {
+  res.json([...soldOutCache]);
+});
+
+// ---------- Endpoint: segna/togli un prodotto come esaurito ----------
+app.post('/api/sold-out/toggle', async (req, res) => {
+  const { chiave, esaurito } = req.body || {};
+  if (!chiave) return res.status(400).json({ ok: false, error: 'Manca la chiave del prodotto' });
+
+  if (esaurito) {
+    soldOutCache.add(chiave);
+    if (soldOutCollection) {
+      await soldOutCollection.updateOne({ _id: chiave }, { $set: { _id: chiave } }, { upsert: true }).catch(err => {
+        console.error('Errore salvataggio esaurito:', err);
+      });
+    }
+  } else {
+    soldOutCache.delete(chiave);
+    if (soldOutCollection) {
+      await soldOutCollection.deleteOne({ _id: chiave }).catch(err => {
+        console.error('Errore rimozione esaurito:', err);
+      });
+    }
+  }
+
+  broadcastOrder({ evento: 'esauriti_aggiornati', esauriti: [...soldOutCache] });
+  res.json({ ok: true, esauriti: [...soldOutCache] });
+});
+
 app.get('/api/orders/pronti-consegna', (req, res) => {
   const ordini = orderHistory
     .filter(o => o.modalita === 'consegna' && (o.stato === 'pronto' || o.stato === 'in_consegna'))
