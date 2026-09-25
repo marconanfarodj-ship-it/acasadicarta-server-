@@ -18,6 +18,7 @@ const jwt = require('jsonwebtoken');
 const Stripe = require('stripe');
 
 const app = express();
+app.set('trust proxy', true); // Render fa da proxy: serve per leggere il vero IP del cliente, non quello di Render
 
 // Origini autorizzate a fare richieste con i cookie (il sito ordini, sul dominio vero
 // e, per compatibilità durante il passaggio, anche il vecchio indirizzo netlify.app)
@@ -70,7 +71,9 @@ let customersCollection = null;
 let ordersCollection = null;
 let pendingOrdersCollection = null;
 let soldOutCollection = null;
-let soldOutCache = new Set(); // riserva in memoria, usata se il database non è raggiungibile
+let soldOutCache = new Set();
+let blacklistCollection = null;
+let blockedPhonesCache = new Set(); // riserva in memoria, usata se il database non è raggiungibile
 
 async function connectDB(){
   if(!MONGODB_URI){
@@ -85,11 +88,14 @@ async function connectDB(){
     ordersCollection = db.collection('orders');
     pendingOrdersCollection = db.collection('pendingOnlineOrders');
     soldOutCollection = db.collection('soldOutItems');
+    blacklistCollection = db.collection('blockedPhones');
     await customersCollection.createIndex({ email: 1 }, { unique: true });
     await ordersCollection.createIndex({ customerId: 1, ricevutoAlle: -1 });
     await pendingOrdersCollection.createIndex({ createdAt: 1 }, { expireAfterSeconds: 60 * 60 * 24 });
     const soldOutDocs = await soldOutCollection.find({}).toArray();
     soldOutCache = new Set(soldOutDocs.map(d => d._id));
+    const blockedDocs = await blacklistCollection.find({}).toArray();
+    blockedPhonesCache = new Set(blockedDocs.map(d => d._id));
     console.log('Connesso a MongoDB Atlas.');
   }catch(err){
     console.error('Errore connessione MongoDB:', err);
@@ -312,6 +318,14 @@ const MENU_CATALOG = [{"cat": "Pizza", "items": ["Faccia Di Vecchia", "Rossa", "
 
 // conteggio in memoria: { "2026-09-22|19:15": 2, ... } — si azzera se il server si riavvia
 let slotCounts = {};
+
+// normalizza un numero di telefono per il confronto (toglie spazi, trattini, prefisso +39/0039)
+function normalizePhone(phone){
+  if(!phone) return '';
+  let p = String(phone).replace(/[\s\-().]/g, '');
+  p = p.replace(/^\+39/, '').replace(/^0039/, '');
+  return p;
+}
 
 function dateKey(d){
   const y = d.getFullYear();
@@ -635,6 +649,16 @@ app.post('/api/orders', async (req, res) => {
     return res.status(400).json({ ok: false, error: 'Ordine non valido' });
   }
 
+  if (blockedPhonesCache.has(normalizePhone(order.phone))) {
+    return res.status(403).json({
+      ok: false,
+      error: 'numero_bloccato',
+      message: 'Non è stato possibile completare l\'ordine. Contatta la pizzeria telefonicamente.'
+    });
+  }
+
+  order.ipCliente = req.ip || null;
+
   if (order.modalita === 'consegna' && (order.subtotale || 0) < MIN_DELIVERY_ORDER) {
     return res.status(400).json({
       ok: false,
@@ -662,6 +686,16 @@ app.post('/api/checkout/create-session', async (req, res) => {
   if (!order || !order.testoStampa || !order.grandTotal) {
     return res.status(400).json({ ok: false, error: 'Ordine non valido' });
   }
+
+  if (blockedPhonesCache.has(normalizePhone(order.phone))) {
+    return res.status(403).json({
+      ok: false,
+      error: 'numero_bloccato',
+      message: 'Non è stato possibile completare l\'ordine. Contatta la pizzeria telefonicamente.'
+    });
+  }
+
+  order.ipCliente = req.ip || null;
 
   if (order.modalita === 'consegna' && (order.subtotale || 0) < MIN_DELIVERY_ORDER) {
     return res.status(400).json({
@@ -908,6 +942,35 @@ app.get('/api/menu-catalog', (req, res) => {
 // ---------- Endpoint: elenco prodotti attualmente esauriti ----------
 app.get('/api/sold-out', (req, res) => {
   res.json([...soldOutCache]);
+});
+
+// ---------- Endpoint: lista nera numeri di telefono ----------
+app.get('/api/blacklist', (req, res) => {
+  res.json([...blockedPhonesCache]);
+});
+
+app.post('/api/blacklist/add', async (req, res) => {
+  const numero = normalizePhone(req.body && req.body.numero);
+  if (!numero) return res.status(400).json({ ok: false, error: 'Numero non valido' });
+  blockedPhonesCache.add(numero);
+  if (blacklistCollection) {
+    await blacklistCollection.updateOne({ _id: numero }, { $set: { _id: numero } }, { upsert: true }).catch(err => {
+      console.error('Errore salvataggio numero bloccato:', err);
+    });
+  }
+  res.json({ ok: true, bloccati: [...blockedPhonesCache] });
+});
+
+app.post('/api/blacklist/remove', async (req, res) => {
+  const numero = normalizePhone(req.body && req.body.numero);
+  if (!numero) return res.status(400).json({ ok: false, error: 'Numero non valido' });
+  blockedPhonesCache.delete(numero);
+  if (blacklistCollection) {
+    await blacklistCollection.deleteOne({ _id: numero }).catch(err => {
+      console.error('Errore rimozione numero bloccato:', err);
+    });
+  }
+  res.json({ ok: true, bloccati: [...blockedPhonesCache] });
 });
 
 // ---------- Endpoint: segna tutti i prodotti come disponibili (azzera l'elenco esauriti) ----------
