@@ -314,7 +314,7 @@ const MAX_DAYS_AHEAD = 3; // si può ordinare/prenotare da oggi fino a 3 giorni 
 const ASAP_DISABLED_WEEKDAYS_CONSEGNA = [0, 6]; // 0=domenica, 6=sabato: niente "il prima possibile" per le consegne
 
 // catalogo di categorie e nomi articoli (usato dal pannello di stampa per segnare i prodotti esauriti)
-const MENU_CATALOG = [{"cat": "Pizza", "items": ["Faccia Di Vecchia", "Rossa", "Biancaneve", "Marinara", "Margherita", "Patapizza", "Bufala", "Diavola", "Pizza Regina", "Tonno & Cipolla", "Napoli", "Oslo", "Norma", "Berlino", "Tropea", "Helsinki", "Sfiziosa", "Nairobi", "Mosca", "Rio", "Tutti I Gusti", "Ripiegata", "4 Formaggi", "007", "La Casa Di Carta", "Parmigiana", "4 Stagioni", "Bella Ciao", "Marsiglia", "Ai Porcini", "Vegetariana", "Pizza Kebab", "Gustosa", "Tokio", "Bogotà", "Frutti Di Mare", "Cincinnati", "Suprema"], "keyPrefix": "Pizza"}, {"cat": "Pizza Dolce", "items": ["Nutella", "Kinder Bueno", "Dubai"], "keyPrefix": "Pizza Dolce"}, {"cat": "Panini", "items": ["Panino Patatine, Wurstel", "Panino con Patatine", "Panino Crocchette di Patate & Patatine", "Panino Patatine, Wurstel in Salsa Rosa", "Panino Pollo al Curry & Patatine", "Panino Pollo ai Funghi & Patatine", "Panino Pollo Impanato & Patatine", "Panino Pollo Messicano & Patatine", "Panino Pollo al Barbecue & Patatine", "Panino Petto di Pollo alla Griglia & Patatine", "Panino Arrosto di Pollo & Patatine", "Panino Petto di Pollo Sfilettato & Patatine", "Panino Porchettata & Patatine", "Panino Salame Piccante e Mozzarella & Patatine", "Panino Salame Piccante e Svizzero & Patatine", "Panino Bella Ciao & Patatine", "Panino 4 Formaggi & Patatine", "Panino Prosciutto Mozzarella & Patatine", "Cocktail Di Tonno & Patatine", "Panino Kebab & Patatine", "Panino Polpette di Cavallo & Patatine", "Panino Cavallo & Patatine", "Panino Salsiccia & Patatine", "Panino in Cocktail di Gamberi in Salsa Rosa & Patatine", "Hamburger di Scottona & Patatine", "Hamburger di Angus & Patatine", "Panino Porchetta Artigianale e Patatine", "Panino con Salsiccia di Cavallo & Patatine"], "keyPrefix": "Panini"}, {"cat": "Hamburger", "items": ["Brooklyn", "Bronx", "Spicy", "Manathan", "Queens"], "keyPrefix": "Hamburger"}, {"cat": "Focacce", "items": ["Focaccia Vuota Da Condire", "Casareccia", "Focaccia Prosciutto", "Focaccia Caprese", "Focaccia Del Pirata", "Focaccia Mista", "Deliziosa", "Focaccia 4 Formaggi", "Bella Ciao", "Focaccia Nairobi"], "keyPrefix": "Focacce"}, {"cat": "Fritture", "items": ["Vaschetta Piccola — Patatine", "Vaschetta Media — Patatine", "Patatine con Buccia", "Vaschetta Piccola — 4 Würstel & Patatine", "Vaschetta — 8 Würstel", "Vaschetta — Crocchette di Patate", "Anelli di Cipolla", "Panzerotti Fritti Mignon Pomodoro e Mozzarella", "Mozzarelline Impanate", "Arancini Mignon al Ragù", "Nuggets 10 Pezzi"], "keyPrefix": "Fritture"}, {"cat": "Bevande", "items": ["Gassosa", "Acqua Naturale Piccola", "Acqua Frizzante", "Coca Cola 33", "Coca Cola Zero", "Birra Moretti", "Birra Peroni", "Coca Cola Vetro cl 33", "Estathe Pesca", "Nastro Azzurro", "Ceres", "Coca Cola Bottiglia Grande", "Birra Messina Grande", "Birra Nastro Azzurro Grande", "Peroni Chill Lemon"], "keyPrefix": "Bevande"}, {"cat": "Extra", "items": ["Bustina Maionese", "Bustina Ketchup"], "keyPrefix": "Extra"}, {"cat": "🧀 Extra ingredienti — Pizza/Focacce", "items": ["Extra Mozzarella", "Scaglie di Grana Padano DOP", "Patatine", "Gorgonzola", "Formaggio Svizzero", "Prosciutto Crudo Ferrarini", "Olive", "Rucola", "Ciliegino", "Piselli", "Funghi", "Speck", "Funghi Porcini", "Lattuga", "Spinaci", "Cipolla", "Carciofi in Spicchi", "Prosciutto Cotto", "Uovo", "Wurstel", "Granella di Pistacchio", "Crocchette Patate", "Crema di Pistacchio", "Acciughe", "Tonno", "Salame Piccante", "Bresaola", "Polpette di Cavallo", "Bacon", "Mozzarella di Bufala", "Salmone", "Patate della Nonna", "Salsiccia di Maiale", "Fettina di Pollo alla Griglia", "Pollo Sfilettato", "Pollo al Curry", "Fettina di Cavallo", "Melanzana Fritta", "Stracciatella di Bufala", "Capuliato", "Kebab", "Pollo Impanato", "Cipolla Croccante"], "keyPrefix": "EXTRA_PIZZA"}, {"cat": "🧀 Extra ingredienti — Panini/Hamburger/Fritture", "items": ["Lattuga", "Ciliegino", "Cipolla", "Mozzarella", "Gorgonzola", "Würstel", "Grana Padano DOP", "Formaggio Svizzero", "Prosciutto Crudo", "Speck", "Prosciutto Cotto", "Crocchette di Patate", "Salame Piccante", "Funghi Freschi", "Mozzarella di Bufala", "Granella di Pistacchio", "Crema di Pistacchio", "Würstel in Salsa Rosa", "Bresaola", "Rucola", "Salmone 50g", "Funghi Piccanti", "Cipolla Croccante"], "keyPrefix": "EXTRA_PANINO"}];
+const MENU_CATALOG = [{"cat": "Pizza", "items": ["Faccia Di Vecchia", "Rossa", "Biancaneve", "Marinara", "Margherita", "Patapizza", "Bufala", "Diavola", "Pizza Regina", "Tonno & Cipolla", "Napoli", "Oslo", "Norma", "Berlino", "Tropea", "Helsinki", "Sfiziosa", "Nairobi", "Mosca", "Rio", "Tutti I Gusti", "Ripiegata", "4 Formaggi", "007", "La Casa Di Carta", "Parmigiana", "4 Stagioni", "Bella Ciao", "Marsiglia", "Ai Porcini", "Vegetariana", "Pizza Kebab", "Gustosa", "Tokio", "Bogotà", "Frutti Di Mare", "Cincinnati", "Suprema"], "keyPrefix": "Pizza"}, {"cat": "Pizza Dolce", "items": ["Nutella", "Kinder Bueno", "Dubai"], "keyPrefix": "Pizza Dolce"}, {"cat": "Panini", "items": ["Panino Patatine, Wurstel", "Panino con Patatine", "Panino Crocchette di Patate & Patatine", "Panino Patatine, Wurstel in Salsa Rosa", "Panino Pollo al Curry & Patatine", "Panino Pollo ai Funghi & Patatine", "Panino Pollo Impanato & Patatine", "Panino Pollo Messicano & Patatine", "Panino Pollo al Barbecue & Patatine", "Panino Petto di Pollo alla Griglia & Patatine", "Panino Arrosto di Pollo & Patatine", "Panino Petto di Pollo Sfilettato & Patatine", "Panino Porchettata & Patatine", "Panino Salame Piccante e Mozzarella & Patatine", "Panino Salame Piccante e Svizzero & Patatine", "Panino Bella Ciao & Patatine", "Panino 4 Formaggi & Patatine", "Panino Prosciutto Mozzarella & Patatine", "Cocktail Di Tonno & Patatine", "Panino Kebab & Patatine", "Panino Polpette di Cavallo & Patatine", "Panino Cavallo & Patatine", "Panino Salsiccia & Patatine", "Panino in Cocktail di Gamberi in Salsa Rosa & Patatine", "Hamburger di Scottona & Patatine", "Hamburger di Angus & Patatine", "Panino Porchetta Artigianale e Patatine", "Panino con Salsiccia di Cavallo & Patatine"], "keyPrefix": "Panini"}, {"cat": "Hamburger", "items": ["Brooklyn", "Bronx", "Spicy", "Manathan", "Queens"], "keyPrefix": "Hamburger"}, {"cat": "Focacce", "items": ["Focaccia Vuota Da Condire", "Casareccia", "Focaccia Prosciutto", "Focaccia Caprese", "Focaccia Del Pirata", "Focaccia Mista", "Deliziosa", "Focaccia 4 Formaggi", "Bella Ciao", "Focaccia Nairobi"], "keyPrefix": "Focacce"}, {"cat": "Fritture", "items": ["Vaschetta Piccola — Patatine", "Vaschetta Media — Patatine", "Patatine con Buccia", "Vaschetta Piccola — 4 Würstel & Patatine", "Vaschetta — 8 Würstel", "Vaschetta — Crocchette di Patate", "Anelli di Cipolla", "Panzerotti Fritti Mignon Pomodoro e Mozzarella", "Mozzarelline Impanate", "Bocconcini Pollo Amadori Impanato Piccante", "Arancini Mignon al Ragù", "Nuggets 10 Pezzi"], "keyPrefix": "Fritture"}, {"cat": "Bevande", "items": ["Gassosa", "Acqua Naturale Piccola", "Acqua Frizzante", "Coca Cola 33", "Coca Cola Zero", "Birra Moretti", "Birra Peroni", "Coca Cola Vetro cl 33", "Estathe Pesca", "Nastro Azzurro", "Ceres", "Coca Cola Bottiglia Grande", "Birra Messina Grande", "Birra Nastro Azzurro Grande", "Peroni Chill Lemon"], "keyPrefix": "Bevande"}, {"cat": "Extra", "items": ["Bustina Maionese", "Bustina Ketchup"], "keyPrefix": "Extra"}, {"cat": "🧀 Extra ingredienti — Pizza/Focacce", "items": ["Extra Mozzarella", "Scaglie di Grana Padano DOP", "Patatine", "Gorgonzola", "Formaggio Svizzero", "Prosciutto Crudo Ferrarini", "Olive", "Rucola", "Ciliegino", "Piselli", "Funghi", "Speck", "Funghi Porcini", "Lattuga", "Spinaci", "Cipolla", "Carciofi in Spicchi", "Prosciutto Cotto", "Uovo", "Wurstel", "Granella di Pistacchio", "Crocchette Patate", "Crema di Pistacchio", "Acciughe", "Tonno", "Salame Piccante", "Bresaola", "Polpette di Cavallo", "Bacon", "Mozzarella di Bufala", "Salmone", "Patate della Nonna", "Salsiccia di Maiale", "Fettina di Pollo alla Griglia", "Pollo Sfilettato", "Pollo al Curry", "Fettina di Cavallo", "Melanzana Fritta", "Stracciatella di Bufala", "Capuliato", "Kebab", "Pollo Impanato", "Cipolla Croccante"], "keyPrefix": "EXTRA_PIZZA"}, {"cat": "🧀 Extra ingredienti — Panini/Hamburger/Fritture", "items": ["Lattuga", "Ciliegino", "Cipolla", "Mozzarella", "Gorgonzola", "Würstel", "Grana Padano DOP", "Formaggio Svizzero", "Prosciutto Crudo", "Speck", "Prosciutto Cotto", "Crocchette di Patate", "Salame Piccante", "Funghi Freschi", "Mozzarella di Bufala", "Granella di Pistacchio", "Crema di Pistacchio", "Würstel in Salsa Rosa", "Bresaola", "Rucola", "Salmone 50g", "Funghi Piccanti", "Cipolla Croccante"], "keyPrefix": "EXTRA_PANINO"}];
 
 // conteggio in memoria: { "2026-09-22|19:15": 2, ... } — si azzera se il server si riavvia
 let slotCounts = {};
@@ -582,11 +582,12 @@ async function finalizeOrder(order, customerId){
   order.numeroOrdine = ++orderCounter;
   order.ricevutoAlle = new Date().toISOString();
   order.stato = 'da_preparare';
+  order.metodoPagamento = order.pagatoOnline ? 'online' : null; // 'online' | 'contanti' | 'bancomat' | null (da registrare)
   orderHistory.unshift(order);
   if (orderHistory.length > MAX_HISTORY) orderHistory.pop();
 
-  if (customerId && ordersCollection) {
-    ordersCollection.insertOne({ ...order, customerId }).catch(err => {
+  if (ordersCollection) {
+    ordersCollection.insertOne({ ...order, customerId: customerId || null }).catch(err => {
       console.error('Errore salvataggio storico ordine:', err);
     });
   }
@@ -930,6 +931,29 @@ app.post('/api/orders/:numeroOrdine/pronto', (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- Endpoint: il pannello di stampa registra qui come ha pagato il cliente (contanti/bancomat) ----------
+app.post('/api/orders/:numeroOrdine/pagamento', (req, res) => {
+  const numeroOrdine = Number(req.params.numeroOrdine);
+  const { metodo } = req.body || {};
+  if (metodo !== 'contanti' && metodo !== 'bancomat') {
+    return res.status(400).json({ ok: false, error: 'Metodo non valido' });
+  }
+  const order = orderHistory.find(o => o.numeroOrdine === numeroOrdine);
+  if (!order) return res.status(404).json({ ok: false, error: 'Ordine non trovato' });
+  if (order.pagatoOnline) return res.status(400).json({ ok: false, error: 'Questo ordine è già pagato online' });
+
+  order.metodoPagamento = metodo;
+
+  if (ordersCollection) {
+    ordersCollection.updateOne({ numeroOrdine }, { $set: { metodoPagamento: metodo } }).catch(err => {
+      console.error('Errore salvataggio metodo di pagamento:', err);
+    });
+  }
+
+  broadcastOrder({ evento: 'pagamento_registrato', numeroOrdine, metodoPagamento: metodo });
+  res.json({ ok: true });
+});
+
 // ---------- Endpoint: elenco ordini pronti da caricare in consegna (per la pagina del fattorino) ----------
 // ---------- Endpoint: catalogo prodotti (per la lista da spuntare nel pannello di stampa) ----------
 // tipi di pane per i panini (deve combaciare con BREAD_OPTIONS nel sito)
@@ -1050,6 +1074,137 @@ app.post('/api/orders/:numeroOrdine/in-consegna', (req, res) => {
 
   res.json({ ok: true });
 });
+
+// ---------- Resoconto giornaliero via email (ogni giorno alle 23:30, ora italiana) ----------
+function getTodayRangeISO(){
+  const now = new Date(); // il processo gira con TZ=Europe/Rome
+  const y = now.getFullYear(), m = now.getMonth(), d = now.getDate();
+  const start = new Date(y, m, d, 0, 0, 0, 0);
+  const end = new Date(y, m, d, 23, 59, 59, 999);
+  return { startISO: start.toISOString(), endISO: end.toISOString() };
+}
+
+async function buildDailyReport(){
+  const { startISO, endISO } = getTodayRangeISO();
+  const orders = ordersCollection
+    ? await ordersCollection.find({ ricevutoAlle: { $gte: startISO, $lte: endISO } }).toArray()
+    : orderHistory.filter(o => o.ricevutoAlle >= startISO && o.ricevutoAlle <= endISO);
+
+  const perMetodo = {
+    online:    { label: '💳 Pagati online',      count: 0, tot: 0 },
+    bancomat:  { label: '💳 Bancomat',            count: 0, tot: 0 },
+    contanti:  { label: '💵 Contanti',            count: 0, tot: 0 },
+    daRegistrare: { label: '⚠️ Non registrato',   count: 0, tot: 0 },
+  };
+  const perModalita = {
+    consegna: { label: '🛵 Consegna a domicilio', count: 0, tot: 0 },
+    ritiro:   { label: '🏠 Ritiro in sede',        count: 0, tot: 0 },
+  };
+  let totaleGiorno = 0;
+
+  orders.forEach(o => {
+    const importo = Number(o.grandTotal || o.subtotale || 0);
+    totaleGiorno += importo;
+
+    const metodo = o.metodoPagamento && perMetodo[o.metodoPagamento] ? o.metodoPagamento : 'daRegistrare';
+    perMetodo[metodo].count++;
+    perMetodo[metodo].tot += importo;
+
+    const modalita = o.modalita === 'consegna' ? 'consegna' : 'ritiro';
+    perModalita[modalita].count++;
+    perModalita[modalita].tot += importo;
+  });
+
+  const oggi = new Date().toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+
+  let testo = `RESOCONTO GIORNALIERO — LA CASA DI CARTA\n${oggi}\n${'-'.repeat(40)}\n\n`;
+  testo += `Ordini totali: ${orders.length}\nIncasso totale: ${money(totaleGiorno)}\n\n`;
+  testo += `PAGAMENTI\n`;
+  Object.values(perMetodo).forEach(v => { testo += `${v.label}: ${v.count} ordini — ${money(v.tot)}\n`; });
+  testo += `\nCONSEGNA / RITIRO\n`;
+  Object.values(perModalita).forEach(v => { testo += `${v.label}: ${v.count} ordini — ${money(v.tot)}\n`; });
+
+  const logoUrl = `${SITE_URL}/icon-512.png?v=${ASSET_VERSION}`;
+  const riga = (v) => `<tr><td style="padding:8px 0;border-bottom:1px solid #eee;color:#333;">${v.label}</td><td style="padding:8px 0;border-bottom:1px solid #eee;text-align:right;color:#8a8a8a;white-space:nowrap;">${v.count} ordini</td><td style="padding:8px 0;border-bottom:1px solid #eee;text-align:right;font-weight:700;color:#222;white-space:nowrap;">${money(v.tot)}</td></tr>`;
+  const rigaFinale = (v) => `<tr><td style="padding:8px 0;color:#333;">${v.label}</td><td style="padding:8px 0;text-align:right;color:#8a8a8a;white-space:nowrap;">${v.count} ordini</td><td style="padding:8px 0;text-align:right;font-weight:700;color:#222;white-space:nowrap;">${money(v.tot)}</td></tr>`;
+  const tabella = (obj) => {
+    const rows = Object.values(obj);
+    return rows.map((v,i) => i === rows.length-1 ? rigaFinale(v) : riga(v)).join('');
+  };
+
+  const html = `
+<!DOCTYPE html>
+<html lang="it">
+<body style="margin:0;padding:0;background:#f4f1ee;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f1ee;padding:24px 0;">
+    <tr><td align="center">
+      <table width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 4px 18px rgba(0,0,0,0.08);">
+
+        <tr><td style="background:linear-gradient(135deg,#c1382b,#7a1f16);padding:28px 24px;text-align:center;">
+          <img src="${logoUrl}" alt="La Casa di Carta" width="72" height="72" style="border-radius:20px;display:block;margin:0 auto 12px;">
+          <div style="color:#ffffff;font-size:20px;font-weight:700;letter-spacing:0.02em;">Resoconto giornaliero</div>
+          <div style="color:rgba(255,255,255,0.85);font-size:13px;margin-top:2px;text-transform:capitalize;">${oggi}</div>
+        </td></tr>
+
+        <tr><td style="padding:26px 24px 6px;text-align:center;">
+          <div style="font-size:13px;color:#8a8a8a;text-transform:uppercase;letter-spacing:0.06em;">Incasso totale</div>
+          <div style="font-size:36px;font-weight:800;color:#c1382b;margin-top:4px;">${money(totaleGiorno)}</div>
+          <div style="font-size:13px;color:#8a8a8a;margin-top:2px;">${orders.length} ordini ricevuti oggi</div>
+        </td></tr>
+
+        <tr><td style="padding:22px 24px 0;">
+          <table width="100%" cellpadding="0" cellspacing="0" style="font-size:14px;background:#f8f5f2;border-radius:12px;padding:16px;">
+            <tr><td colspan="3" style="padding:0 0 8px;font-weight:700;color:#222;">💰 Pagamenti</td></tr>
+            ${tabella(perMetodo)}
+          </table>
+        </td></tr>
+
+        <tr><td style="padding:16px 24px 0;">
+          <table width="100%" cellpadding="0" cellspacing="0" style="font-size:14px;background:#f8f5f2;border-radius:12px;padding:16px;">
+            <tr><td colspan="3" style="padding:0 0 8px;font-weight:700;color:#222;">📦 Consegna / Ritiro</td></tr>
+            ${tabella(perModalita)}
+          </table>
+        </td></tr>
+
+        <tr><td style="padding:22px 24px 28px;text-align:center;">
+          <div style="font-size:13px;color:#8a8a8a;">Buon riposo — a domani! 🔥</div>
+          <div style="font-size:12px;color:#b5b5b5;margin-top:14px;">La Casa di Carta · Via XX Settembre 192, Niscemi CL · +39 327 101 8160</div>
+        </td></tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+
+  return { testo, html, oggi };
+}
+
+async function sendDailyReport(){
+  try {
+    const { testo, html, oggi } = await buildDailyReport();
+    await sendEmail(ORDER_EMAIL, `Resoconto giornaliero — ${oggi}`, testo, html);
+    console.log('Resoconto giornaliero inviato.');
+  } catch (err) {
+    console.error('Errore invio resoconto giornaliero:', err);
+  }
+}
+
+// Endpoint per testare subito il resoconto (utile prima di fidarsi dell'invio automatico delle 23:30)
+app.get('/api/daily-report/test', async (req, res) => {
+  await sendDailyReport();
+  res.json({ ok: true, message: 'Resoconto inviato (controlla la mail).' });
+});
+
+let ultimoResocontoInviatoIl = null; // evita invii doppi nello stesso minuto/giorno
+setInterval(() => {
+  const now = new Date(); // ora italiana grazie a TZ=Europe/Rome
+  const oggiKey = dateKey(now);
+  if (now.getHours() === 23 && now.getMinutes() === 30 && ultimoResocontoInviatoIl !== oggiKey) {
+    ultimoResocontoInviatoIl = oggiKey;
+    sendDailyReport();
+  }
+}, 60 * 1000);
 
 // ---------- Pagina di controllo semplice ----------
 app.get('/', (req, res) => {
