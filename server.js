@@ -649,9 +649,16 @@ async function assignDeliverySlotIfNeeded(order){
   }
   reserveSlot(dKey, slot);
   order.slotAssegnato = slot;
-  const giornoLabel = dKey !== dateKey(now) ? ` del ${new Date(dKey + 'T00:00:00').toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric', month: 'long' })}` : '';
-  order.orarioLabel = `Alle ${slot}${giornoLabel}`;
-  order.testoStampa = (order.testoStampa || '').replace(/Orario richiesto:.*$/m, `Orario richiesto: Alle ${slot}${giornoLabel}`);
+  if (order.timing === 'orario') {
+    const giornoLabel = dKey !== dateKey(now) ? ` del ${new Date(dKey + 'T00:00:00').toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric', month: 'long' })}` : '';
+    order.orarioLabel = `Alle ${slot}${giornoLabel}`;
+    order.testoStampa = (order.testoStampa || '').replace(/Orario richiesto:.*$/m, `Orario richiesto: Alle ${slot}${giornoLabel}`);
+  } else {
+    // "il prima possibile": lo slot qui sopra serve solo per contare i posti in cucina,
+    // non è un orario scelto dal cliente — non va mostrato come tale.
+    order.orarioLabel = 'Il prima possibile';
+    order.testoStampa = (order.testoStampa || '').replace(/Orario richiesto:.*$/m, `Orario richiesto: Il prima possibile`);
+  }
   return { ok: true };
 }
 
