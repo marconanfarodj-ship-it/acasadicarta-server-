@@ -1106,7 +1106,7 @@ async function buildDailyReport(){
     const importo = Number(o.grandTotal || o.subtotale || 0);
     totaleGiorno += importo;
 
-    const metodo = o.metodoPagamento && perMetodo[o.metodoPagamento] ? o.metodoPagamento : 'daRegistrare';
+    const metodo = o.pagatoOnline ? 'online' : ((o.metodoPagamento && perMetodo[o.metodoPagamento]) ? o.metodoPagamento : 'daRegistrare');
     perMetodo[metodo].count++;
     perMetodo[metodo].tot += importo;
 
