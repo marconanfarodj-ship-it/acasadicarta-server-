@@ -222,6 +222,86 @@ function esc(s){
 }
 function money(n){ return '€' + (Number(n) || 0).toFixed(2).replace('.', ','); }
 
+function buildOwnerOrderHtml(order) {
+  const logoUrl = `${SITE_URL}/icon-512.png?v=${ASSET_VERSION}`;
+
+  const righeArticoli = (order.articoli || []).map(a => {
+    const dettagli = (a.dettagli || []).map(d => `<div style="font-size:12px;color:#8a8a8a;margin-top:2px;">${esc(d)}</div>`).join('');
+    return `
+      <tr>
+        <td style="padding:10px 0;border-bottom:1px solid #eee;vertical-align:top;">
+          <div style="font-weight:600;color:#222;">${a.qty}× ${esc(a.nome)}</div>
+          ${dettagli}
+        </td>
+        <td style="padding:10px 0;border-bottom:1px solid #eee;text-align:right;white-space:nowrap;color:#222;vertical-align:top;">${money(a.prezzo)}</td>
+      </tr>`;
+  }).join('');
+
+  const modalitaLabel = order.modalita === 'consegna' ? '🛵 Consegna a domicilio' : '🏠 Ritiro in sede';
+  const rigaIndirizzo = order.modalita === 'consegna' && order.address
+    ? `<tr><td style="padding:4px 0;color:#8a8a8a;">Indirizzo</td><td style="padding:4px 0;text-align:right;color:#222;">${esc(order.address)}</td></tr>`
+    : '';
+  const rigaConsegna = order.speseConsegna
+    ? `<tr><td style="padding:8px 0 0;color:#8a8a8a;">Spese di consegna</td><td style="padding:8px 0 0;text-align:right;color:#222;">${money(order.speseConsegna)}</td></tr>`
+    : '';
+  const pagamentoLabel = order.pagatoOnline ? '✅ Pagato online' : '⏳ Da riscuotere alla consegna/ritiro';
+  const rigaPagamento = `<tr><td style="padding:2px 0;color:#8a8a8a;">Pagamento</td><td style="padding:2px 0;text-align:right;color:${order.pagatoOnline ? '#1a9c4a' : '#c1382b'};font-weight:700;">${pagamentoLabel}</td></tr>`;
+  const rigaTelefono = order.phone
+    ? `<tr><td style="padding:2px 0;color:#8a8a8a;">Telefono</td><td style="padding:2px 0;text-align:right;color:#222;">${esc(order.phone)}</td></tr>`
+    : '';
+
+  return `
+<!DOCTYPE html>
+<html lang="it">
+<body style="margin:0;padding:0;background:#f4f1ee;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f1ee;padding:24px 0;">
+    <tr><td align="center">
+      <table width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 4px 18px rgba(0,0,0,0.08);">
+
+        <tr><td style="background:linear-gradient(135deg,#c1382b,#7a1f16);padding:28px 24px;text-align:center;">
+          <img src="${logoUrl}" alt="La Casa di Carta" width="64" height="64" style="border-radius:18px;display:block;margin:0 auto 10px;">
+          <div style="color:#ffffff;font-size:20px;font-weight:700;letter-spacing:0.02em;">🔥 Nuovo ordine ricevuto!</div>
+          <div style="color:rgba(255,255,255,0.9);font-size:15px;margin-top:4px;font-weight:700;">Ordine #${order.numeroOrdine || ''}</div>
+        </td></tr>
+
+        <tr><td style="padding:22px 24px 6px;">
+          <div style="font-size:17px;font-weight:700;color:#222;">${esc(order.name || order.nome || 'Cliente')}</div>
+          <div style="font-size:14px;color:#555;margin-top:2px;">${modalitaLabel} · ${esc(order.orarioLabel || '')}</div>
+        </td></tr>
+
+        <tr><td style="padding:10px 24px 0;">
+          <table width="100%" cellpadding="0" cellspacing="0">
+            ${righeArticoli}
+          </table>
+        </td></tr>
+
+        <tr><td style="padding:14px 24px 0;">
+          <table width="100%" cellpadding="0" cellspacing="0" style="font-size:14px;">
+            <tr><td style="padding:4px 0;color:#8a8a8a;">Subtotale</td><td style="padding:4px 0;text-align:right;color:#222;">${money(order.subtotale)}</td></tr>
+            ${rigaConsegna}
+            <tr><td style="padding:10px 0 0;font-weight:700;color:#222;border-top:1px solid #eee;">Totale</td><td style="padding:10px 0 0;text-align:right;font-weight:700;color:#c1382b;border-top:1px solid #eee;">${money(order.grandTotal)}</td></tr>
+          </table>
+        </td></tr>
+
+        <tr><td style="padding:20px 24px 0;">
+          <table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;background:#f8f5f2;border-radius:12px;padding:14px;">
+            ${rigaTelefono}
+            ${rigaIndirizzo}
+            ${rigaPagamento}
+          </table>
+        </td></tr>
+
+        <tr><td style="padding:22px 24px 28px;text-align:center;">
+          <div style="font-size:12px;color:#b5b5b5;">La Casa di Carta · Via XX Settembre 192, Niscemi CL · +39 327 101 8160</div>
+        </td></tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+}
+
 function buildCustomerConfirmationHtml(order) {
   const logoUrl = `${SITE_URL}/icon-512.png?v=${ASSET_VERSION}`;
 
@@ -593,7 +673,7 @@ async function finalizeOrder(order, customerId){
   }
 
   broadcastOrder(order);
-  sendEmail(ORDER_EMAIL, order.oggettoEmail || 'Nuovo ordine — La Casa di Carta', order.testoStampa);
+  sendEmail(ORDER_EMAIL, order.oggettoEmail || 'Nuovo ordine — La Casa di Carta', order.testoStampa, buildOwnerOrderHtml(order));
   if (order.email) {
     sendEmail(order.email, 'Conferma ordine — La Casa di Carta', buildCustomerConfirmationText(order), buildCustomerConfirmationHtml(order));
   }
