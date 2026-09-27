@@ -74,6 +74,23 @@ let soldOutCollection = null;
 let soldOutCache = new Set();
 let blacklistCollection = null;
 let blockedPhonesCache = new Set(); // riserva in memoria, usata se il database non è raggiungibile
+let ordersPaused = false; // interruttore manuale: se true, il sito rifiuta ogni nuovo ordine
+let settingsCollection = null;
+
+// prezzi di partenza di ogni voce del menu (chiave uguale a quella usata per gli esauriti);
+// quando il titolare modifica un prezzo dal pannello, il nuovo valore viene salvato in
+// priceOverridesCache e ha sempre la precedenza su questi valori di base.
+const DEFAULT_PRICES = {"Pizza|Faccia Di Vecchia": 3, "Pizza|Rossa": 4, "Pizza|Biancaneve": 5, "Pizza|Marinara": 4.5, "Pizza|Margherita": 5, "Pizza|Patapizza": 6.5, "Pizza|Bufala": 7, "Pizza|Diavola": 6, "Pizza|Pizza Regina": 7, "Pizza|Tonno & Cipolla": 7, "Pizza|Napoli": 6.5, "Pizza|Oslo": 6.5, "Pizza|Norma": 6.5, "Pizza|Berlino": 7, "Pizza|Tropea": 8.5, "Pizza|Helsinki": 9, "Pizza|Sfiziosa": 9, "Pizza|Nairobi": 9, "Pizza|Mosca": 9, "Pizza|Rio": 8.5, "Pizza|Tutti I Gusti": 9, "Pizza|Ripiegata": 8.5, "Pizza|4 Formaggi": 8, "Pizza|007": 8, "Pizza|La Casa Di Carta": 8.5, "Pizza|Parmigiana": 8, "Pizza|4 Stagioni": 8, "Pizza|Bella Ciao": 8, "Pizza|Marsiglia": 8.5, "Pizza|Ai Porcini": 9, "Pizza|Vegetariana": 8, "Pizza|Pizza Kebab": 9, "Pizza|Gustosa": 9, "Pizza|Tokio": 8.5, "Pizza|Bogotà": 11, "Pizza|Frutti Di Mare": 11, "Pizza|Cincinnati": 10, "Pizza|Suprema": 13, "Pizza Dolce|Nutella": 5, "Pizza Dolce|Kinder Bueno": 7, "Pizza Dolce|Dubai": 7, "Panini|Panino Patatine, Wurstel": 3, "Panini|Panino con Patatine": 2.5, "Panini|Panino Crocchette di Patate & Patatine": 3, "Panini|Panino Patatine, Wurstel in Salsa Rosa": 3.5, "Panini|Panino Pollo al Curry & Patatine": 5, "Panini|Panino Pollo ai Funghi & Patatine": 5.5, "Panini|Panino Pollo Impanato & Patatine": 5, "Panini|Panino Pollo Messicano & Patatine": 5, "Panini|Panino Pollo al Barbecue & Patatine": 5, "Panini|Panino Petto di Pollo alla Griglia & Patatine": 5, "Panini|Panino Arrosto di Pollo & Patatine": 5, "Panini|Panino Petto di Pollo Sfilettato & Patatine": 5, "Panini|Panino Porchettata & Patatine": 4, "Panini|Panino Salame Piccante e Mozzarella & Patatine": 4, "Panini|Panino Salame Piccante e Svizzero & Patatine": 4, "Panini|Panino Bella Ciao & Patatine": 5.5, "Panini|Panino 4 Formaggi & Patatine": 4.5, "Panini|Panino Prosciutto Mozzarella & Patatine": 4, "Panini|Cocktail Di Tonno & Patatine": 5, "Panini|Panino Kebab & Patatine": 5, "Panini|Panino Polpette di Cavallo & Patatine": 6, "Panini|Panino Cavallo & Patatine": 6, "Panini|Panino Salsiccia & Patatine": 5, "Panini|Panino in Cocktail di Gamberi in Salsa Rosa & Patatine": 6.5, "Panini|Hamburger di Scottona & Patatine": 6, "Panini|Hamburger di Angus & Patatine": 6, "Panini|Panino Porchetta Artigianale e Patatine": 6, "Panini|Panino con Salsiccia di Cavallo & Patatine": 6, "Hamburger|Brooklyn": 5, "Hamburger|Bronx": 8, "Hamburger|Spicy": 8, "Hamburger|Manathan": 9, "Hamburger|Queens": 5, "Focacce|Focaccia Vuota Da Condire": 3, "Focacce|Casareccia": 4.5, "Focacce|Focaccia Prosciutto": 6.5, "Focacce|Focaccia Caprese": 6.5, "Focacce|Focaccia Del Pirata": 6.5, "Focacce|Focaccia Mista": 7, "Focacce|Deliziosa": 7, "Focacce|Focaccia 4 Formaggi": 7.5, "Focacce|Bella Ciao": 8, "Focacce|Focaccia Nairobi": 9, "Fritture|Vaschetta Piccola — Patatine": 2, "Fritture|Vaschetta Media — Patatine": 3, "Fritture|Patatine con Buccia": 3, "Fritture|Vaschetta Piccola — 4 Würstel & Patatine": 2, "Fritture|Vaschetta — 8 Würstel": 2, "Fritture|Vaschetta — Crocchette di Patate": 2, "Fritture|Anelli di Cipolla": 3, "Fritture|Panzerotti Fritti Mignon Pomodoro e Mozzarella": 3, "Fritture|Mozzarelline Impanate": 3.5, "Fritture|Bocconcini Pollo Amadori Impanato Piccante": 3.5, "Fritture|Arancini Mignon al Ragù": 3, "Fritture|Nuggets 10 Pezzi": 5, "Bevande|Gassosa": 1, "Bevande|Acqua Naturale Piccola": 1, "Bevande|Acqua Frizzante": 1, "Bevande|Coca Cola 33": 2, "Bevande|Coca Cola Zero": 2, "Bevande|Birra Moretti": 2, "Bevande|Birra Peroni": 2, "Bevande|Coca Cola Vetro cl 33": 2.5, "Bevande|Estathe Pesca": 2.5, "Bevande|Nastro Azzurro": 3, "Bevande|Ceres": 3.5, "Bevande|Coca Cola Bottiglia Grande": 4, "Bevande|Birra Messina Grande": 5, "Bevande|Birra Nastro Azzurro Grande": 5, "Bevande|Peroni Chill Lemon": 2.5, "Extra|Bustina Maionese": 0.25, "Extra|Bustina Ketchup": 0.25, "EXTRA_PIZZA|Extra Mozzarella": 1.5, "EXTRA_PIZZA|Scaglie di Grana Padano DOP": 1, "EXTRA_PIZZA|Patatine": 1.5, "EXTRA_PIZZA|Gorgonzola": 1, "EXTRA_PIZZA|Formaggio Svizzero": 0.5, "EXTRA_PIZZA|Prosciutto Crudo Ferrarini": 1.5, "EXTRA_PIZZA|Olive": 0.5, "EXTRA_PIZZA|Rucola": 0.5, "EXTRA_PIZZA|Ciliegino": 0.5, "EXTRA_PIZZA|Piselli": 0.5, "EXTRA_PIZZA|Funghi": 1, "EXTRA_PIZZA|Speck": 1, "EXTRA_PIZZA|Funghi Porcini": 2.5, "EXTRA_PIZZA|Lattuga": 0.5, "EXTRA_PIZZA|Spinaci": 0.5, "EXTRA_PIZZA|Cipolla": 0.5, "EXTRA_PIZZA|Carciofi in Spicchi": 1, "EXTRA_PIZZA|Prosciutto Cotto": 1, "EXTRA_PIZZA|Uovo": 0.5, "EXTRA_PIZZA|Wurstel": 0.5, "EXTRA_PIZZA|Granella di Pistacchio": 2, "EXTRA_PIZZA|Crocchette Patate": 1, "EXTRA_PIZZA|Crema di Pistacchio": 2, "EXTRA_PIZZA|Acciughe": 1, "EXTRA_PIZZA|Tonno": 1.5, "EXTRA_PIZZA|Salame Piccante": 1, "EXTRA_PIZZA|Bresaola": 2.5, "EXTRA_PIZZA|Polpette di Cavallo": 3, "EXTRA_PIZZA|Bacon": 1, "EXTRA_PIZZA|Mozzarella di Bufala": 2, "EXTRA_PIZZA|Salmone": 2.5, "EXTRA_PIZZA|Patate della Nonna": 1, "EXTRA_PIZZA|Salsiccia di Maiale": 1.5, "EXTRA_PIZZA|Fettina di Pollo alla Griglia": 3.5, "EXTRA_PIZZA|Pollo Sfilettato": 3.5, "EXTRA_PIZZA|Pollo al Curry": 3.5, "EXTRA_PIZZA|Fettina di Cavallo": 4, "EXTRA_PIZZA|Melanzana Fritta": 1, "EXTRA_PIZZA|Stracciatella di Bufala": 2, "EXTRA_PIZZA|Capuliato": 0.5, "EXTRA_PIZZA|Kebab": 3.5, "EXTRA_PIZZA|Pollo Impanato": 4, "EXTRA_PIZZA|Cipolla Croccante": 0.5, "EXTRA_PANINO|Lattuga": 0.5, "EXTRA_PANINO|Ciliegino": 0.5, "EXTRA_PANINO|Cipolla": 0.5, "EXTRA_PANINO|Mozzarella": 0.5, "EXTRA_PANINO|Gorgonzola": 0.5, "EXTRA_PANINO|Würstel": 0.5, "EXTRA_PANINO|Grana Padano DOP": 0.5, "EXTRA_PANINO|Formaggio Svizzero": 0.5, "EXTRA_PANINO|Prosciutto Crudo": 1.5, "EXTRA_PANINO|Speck": 0.5, "EXTRA_PANINO|Prosciutto Cotto": 1, "EXTRA_PANINO|Crocchette di Patate": 1, "EXTRA_PANINO|Salame Piccante": 1, "EXTRA_PANINO|Funghi Freschi": 1, "EXTRA_PANINO|Mozzarella di Bufala": 2, "EXTRA_PANINO|Granella di Pistacchio": 1, "EXTRA_PANINO|Crema di Pistacchio": 1, "EXTRA_PANINO|Würstel in Salsa Rosa": 1.5, "EXTRA_PANINO|Bresaola": 2, "EXTRA_PANINO|Rucola": 0.5, "EXTRA_PANINO|Salmone 50g": 3, "EXTRA_PANINO|Funghi Piccanti": 1, "EXTRA_PANINO|Cipolla Croccante": 0.5}
+;
+let priceOverridesCache = {};
+let priceOverridesCollection = null;
+
+function getCurrentPrice(chiave){
+  if (priceOverridesCache[chiave] !== undefined) return priceOverridesCache[chiave];
+  if (DEFAULT_PRICES[chiave] !== undefined) return DEFAULT_PRICES[chiave];
+  return null;
+}
+
 
 async function connectDB(){
   if(!MONGODB_URI){
@@ -96,6 +113,13 @@ async function connectDB(){
     soldOutCache = new Set(soldOutDocs.map(d => d._id));
     const blockedDocs = await blacklistCollection.find({}).toArray();
     blockedPhonesCache = new Set(blockedDocs.map(d => d._id));
+    priceOverridesCollection = db.collection('priceOverrides');
+    const priceDocs = await priceOverridesCollection.find({}).toArray();
+    priceOverridesCache = {};
+    priceDocs.forEach(d => { priceOverridesCache[d._id] = d.prezzo; });
+    settingsCollection = db.collection('settings');
+    const pausedDoc = await settingsCollection.findOne({ _id: 'ordersPaused' });
+    ordersPaused = !!(pausedDoc && pausedDoc.value);
     console.log('Connesso a MongoDB Atlas.');
   }catch(err){
     console.error('Errore connessione MongoDB:', err);
@@ -611,6 +635,7 @@ async function assignDeliverySlotIfNeeded(order){
     };
   }
   const now = new Date();
+  const TEMPO_PREPARAZIONE_ASAP_MIN = 30; // per "il prima possibile": tempo realistico di preparazione + consegna
   let requestedDate = now;
   let dKey = dateKey(now);
 
@@ -629,8 +654,12 @@ async function assignDeliverySlotIfNeeded(order){
     const [h, m] = order.orarioRichiesto.split(':').map(Number);
     requestedDate = new Date(dKey + 'T00:00:00');
     requestedDate.setHours(h, m, 0, 0);
+  } else {
+    // "il prima possibile": non è realistico che arrivi nello stesso istante,
+    // quindi contiamo il posto in cucina e stimiamo l'orario 30 minuti da adesso
+    requestedDate = new Date(now.getTime() + TEMPO_PREPARAZIONE_ASAP_MIN * 60000);
+    dKey = dateKey(requestedDate);
   }
-  // "prima" (il prima possibile) usa sempre il momento attuale, solo per oggi
 
   const slot = slotLabel(requestedDate);
   if (order.timing === 'orario' && isSlotInPast(dKey, slot)) {
@@ -654,10 +683,9 @@ async function assignDeliverySlotIfNeeded(order){
     order.orarioLabel = `Alle ${slot}${giornoLabel}`;
     order.testoStampa = (order.testoStampa || '').replace(/Orario richiesto:.*$/m, `Orario richiesto: Alle ${slot}${giornoLabel}`);
   } else {
-    // "il prima possibile": lo slot qui sopra serve solo per contare i posti in cucina,
-    // non è un orario scelto dal cliente — non va mostrato come tale.
-    order.orarioLabel = 'Il prima possibile';
-    order.testoStampa = (order.testoStampa || '').replace(/Orario richiesto:.*$/m, `Orario richiesto: Il prima possibile`);
+    // "il prima possibile": mostriamo una stima realistica (30 minuti), non l'ora esatta di invio
+    order.orarioLabel = `Il prima possibile (circa alle ${slot})`;
+    order.testoStampa = (order.testoStampa || '').replace(/Orario richiesto:.*$/m, `Orario richiesto: Il prima possibile (circa alle ${slot})`);
   }
   return { ok: true };
 }
@@ -737,6 +765,14 @@ app.post('/api/orders', async (req, res) => {
     return res.status(400).json({ ok: false, error: 'Ordine non valido' });
   }
 
+  if (ordersPaused) {
+    return res.status(403).json({
+      ok: false,
+      error: 'ordini_sospesi',
+      message: 'Siamo momentaneamente pieni e non possiamo accettare altri ordini. Riprova tra qualche minuto!'
+    });
+  }
+
   if (blockedPhonesCache.has(normalizePhone(order.phone))) {
     return res.status(403).json({
       ok: false,
@@ -773,6 +809,14 @@ app.post('/api/checkout/create-session', async (req, res) => {
   const order = req.body;
   if (!order || !order.testoStampa || !order.grandTotal) {
     return res.status(400).json({ ok: false, error: 'Ordine non valido' });
+  }
+
+  if (ordersPaused) {
+    return res.status(403).json({
+      ok: false,
+      error: 'ordini_sospesi',
+      message: 'Siamo momentaneamente pieni e non possiamo accettare altri ordini. Riprova tra qualche minuto!'
+    });
   }
 
   if (blockedPhonesCache.has(normalizePhone(order.phone))) {
@@ -1053,6 +1097,51 @@ app.get('/api/menu-catalog', (req, res) => {
 // ---------- Endpoint: elenco prodotti attualmente esauriti ----------
 app.get('/api/sold-out', (req, res) => {
   res.json([...soldOutCache]);
+});
+
+// ---------- Endpoint: interruttore "sospendi ordini" (usato dal pannello di stampa) ----------
+app.get('/api/orders-status', (req, res) => {
+  res.json({ paused: ordersPaused });
+});
+
+app.post('/api/orders-status/toggle', async (req, res) => {
+  ordersPaused = !ordersPaused;
+  if (settingsCollection) {
+    settingsCollection.updateOne(
+      { _id: 'ordersPaused' },
+      { $set: { value: ordersPaused } },
+      { upsert: true }
+    ).catch(err => console.error('Errore salvataggio stato ordini:', err));
+  }
+  broadcastOrder({ evento: 'ordini_sospesi_aggiornato', paused: ordersPaused });
+  res.json({ ok: true, paused: ordersPaused });
+});
+
+// ---------- Endpoint: prezzi correnti di tutte le voci del menu (di base + eventuali modifiche) ----------
+app.get('/api/menu-prices', (req, res) => {
+  const prezzi = {};
+  Object.keys(DEFAULT_PRICES).forEach(chiave => {
+    prezzi[chiave] = getCurrentPrice(chiave);
+  });
+  res.json(prezzi);
+});
+
+// ---------- Endpoint: il titolare modifica il prezzo di una voce dal pannello di stampa ----------
+app.post('/api/menu-prices/update', async (req, res) => {
+  const { chiave, prezzo } = req.body || {};
+  const nuovoPrezzo = Number(prezzo);
+  if (!chiave || typeof chiave !== 'string' || !Number.isFinite(nuovoPrezzo) || nuovoPrezzo < 0) {
+    return res.status(400).json({ ok: false, error: 'Dati non validi' });
+  }
+  priceOverridesCache[chiave] = nuovoPrezzo;
+  if (priceOverridesCollection) {
+    priceOverridesCollection.updateOne(
+      { _id: chiave },
+      { $set: { prezzo: nuovoPrezzo } },
+      { upsert: true }
+    ).catch(err => console.error('Errore salvataggio prezzo:', err));
+  }
+  res.json({ ok: true, chiave, prezzo: nuovoPrezzo });
 });
 
 // ---------- Endpoint: lista nera numeri di telefono ----------
