@@ -445,6 +445,67 @@ function normalizePhone(phone){
   return p;
 }
 
+// normalizza un indirizzo di consegna per un confronto affidabile (minuscolo, spazi ridotti,
+// niente punteggiatura): serve a riconoscere lo stesso indirizzo anche scritto in modo leggermente diverso
+function normalizeAddress(address){
+  if(!address) return '';
+  return String(address)
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // toglie gli accenti
+    .replace(/[.,]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+const SCONTO_PRIMO_ORDINE = 0.10; // 10%, solo sui piatti (mai sulle spese di consegna)
+
+async function isFirstOrderForPhone(phone, address){
+  if(!ordersCollection) return false;
+  const normPhone = normalizePhone(phone);
+  const normAddress = normalizeAddress(address);
+  if(!normPhone) return false;
+  try{
+    // niente sconto se questo numero HA GIA' ordinato, oppure se questo indirizzo di consegna
+    // è già comparso in un ordine passato (anche con un numero di telefono diverso)
+    const query = normAddress
+      ? { $or: [{ phoneNormalized: normPhone }, { addressNormalized: normAddress }] }
+      : { phoneNormalized: normPhone };
+    const esistente = await ordersCollection.findOne(query);
+    return !esistente;
+  }catch(err){
+    console.error('Errore controllo primo ordine:', err);
+    return false; // in caso di dubbio, niente sconto: evitiamo di regalarlo per un errore tecnico
+  }
+}
+
+function round2(n){ return Math.round(n * 100) / 100; }
+
+// Ricalcola sconto/subtotale/totale in modo autorevole: non ci fidiamo mai dei valori
+// mandati dal sito, li ricalcoliamo sempre qui prima di stampare/salvare/far pagare.
+async function applyFirstOrderDiscount(order){
+  const subtotaleBase = round2(Number(order.subtotaleBase != null ? order.subtotaleBase : order.subtotale) || 0);
+  const eligible = await isFirstOrderForPhone(order.phone, order.address);
+  const sconto = eligible ? round2(subtotaleBase * SCONTO_PRIMO_ORDINE) : 0;
+
+  order.subtotaleBase = subtotaleBase;
+  order.scontoPrimoOrdine = sconto;
+  order.subtotale = round2(subtotaleBase - sconto);
+  order.grandTotal = round2(order.subtotale + (Number(order.speseConsegna) || 0));
+
+  if (order.testoStampa) {
+    // togliamo un'eventuale riga sconto scritta dal sito (potrebbe essere sbagliata/vecchia) e la
+    // riscriviamo noi, insieme al totale finale, in base al calcolo vero appena fatto qui sopra
+    order.testoStampa = order.testoStampa.replace(/\n🎉 Sconto primo ordine \([^)]*\): -[^\n]*\n/, '\n');
+    if (sconto > 0) {
+      order.testoStampa = order.testoStampa.replace(
+        /\n(-{5,}\nTOTALE:)/,
+        `\n🎉 Sconto primo ordine (20%): -${money(sconto)}\n$1`
+      );
+    }
+    order.testoStampa = order.testoStampa.replace(/TOTALE: [^\n]*/, `TOTALE: ${money(order.grandTotal)}`);
+  }
+}
+
 function dateKey(d){
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, '0');
@@ -712,6 +773,8 @@ async function finalizeOrder(order, customerId){
   order.ricevutoAlle = new Date().toISOString();
   order.stato = 'da_preparare';
   order.metodoPagamento = order.pagatoOnline ? 'online' : null; // 'online' | 'contanti' | 'bancomat' | null (da registrare)
+  order.phoneNormalized = normalizePhone(order.phone);
+  order.addressNormalized = normalizeAddress(order.address);
   orderHistory.unshift(order);
   if (orderHistory.length > MAX_HISTORY) orderHistory.pop();
 
@@ -797,13 +860,16 @@ app.post('/api/orders', async (req, res) => {
 
   order.ipCliente = req.ip || null;
 
-  if (order.modalita === 'consegna' && (order.subtotale || 0) < MIN_DELIVERY_ORDER) {
+  const subtotaleForMinimo = Number(order.subtotaleBase != null ? order.subtotaleBase : order.subtotale) || 0;
+  if (order.modalita === 'consegna' && subtotaleForMinimo < MIN_DELIVERY_ORDER) {
     return res.status(400).json({
       ok: false,
       error: 'ordine_minimo',
       message: `L'ordine minimo per la consegna a domicilio è di €${MIN_DELIVERY_ORDER.toFixed(2).replace('.', ',')}.`
     });
   }
+
+  await applyFirstOrderDiscount(order); // ricalcola sconto/subtotale/totale in modo autorevole
 
   const slotResult = await assignDeliverySlotIfNeeded(order);
   if (!slotResult.ok) {
@@ -843,13 +909,16 @@ app.post('/api/checkout/create-session', async (req, res) => {
 
   order.ipCliente = req.ip || null;
 
-  if (order.modalita === 'consegna' && (order.subtotale || 0) < MIN_DELIVERY_ORDER) {
+  const subtotaleForMinimo = Number(order.subtotaleBase != null ? order.subtotaleBase : order.subtotale) || 0;
+  if (order.modalita === 'consegna' && subtotaleForMinimo < MIN_DELIVERY_ORDER) {
     return res.status(400).json({
       ok: false,
       error: 'ordine_minimo',
       message: `L'ordine minimo per la consegna a domicilio è di €${MIN_DELIVERY_ORDER.toFixed(2).replace('.', ',')}.`
     });
   }
+
+  await applyFirstOrderDiscount(order); // ricalcola sconto/subtotale/totale in modo autorevole
 
   // controllo preventivo: se lo slot è già pieno (o la data non valida), non ha senso far pagare il cliente
   if (order.modalita === 'consegna' && order.timing === 'prima' && ASAP_DISABLED_WEEKDAYS_CONSEGNA.includes(new Date().getDay())) {
@@ -1278,6 +1347,12 @@ app.post('/api/product-photos/delete', async (req, res) => {
     });
   }
   res.json({ ok: true });
+});
+
+// ---------- Endpoint: controlla se questo numero ha diritto allo sconto primo ordine ----------
+app.get('/api/check-first-order-discount', async (req, res) => {
+  const eligible = await isFirstOrderForPhone(req.query.phone, req.query.address);
+  res.json({ eligible, percentuale: eligible ? Math.round(SCONTO_PRIMO_ORDINE * 100) : 0 });
 });
 
 // ---------- Endpoint: lista nera numeri di telefono ----------
