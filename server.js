@@ -264,7 +264,11 @@ function buildOwnerOrderHtml(order) {
   const logoUrl = `${SITE_URL}/icon-512.png?v=${ASSET_VERSION}`;
 
   const righeArticoli = (order.articoli || []).map(a => {
-    const dettagli = (a.dettagli || []).map(d => `<div style="font-size:12px;color:#8a8a8a;margin-top:2px;">${esc(d)}</div>`).join('');
+    const dettagli = (a.dettagli || []).map(d => {
+      const isSenza = /^Senza:/i.test(d);
+      const stile = isSenza ? 'font-size:12px;color:#c1382b;margin-top:2px;font-weight:700;text-decoration:underline;' : 'font-size:12px;color:#8a8a8a;margin-top:2px;';
+      return `<div style="${stile}">${esc(d)}</div>`;
+    }).join('');
     return `
       <tr>
         <td style="padding:10px 0;border-bottom:1px solid #eee;vertical-align:top;">
@@ -344,7 +348,11 @@ function buildCustomerConfirmationHtml(order) {
   const logoUrl = `${SITE_URL}/icon-512.png?v=${ASSET_VERSION}`;
 
   const righeArticoli = (order.articoli || []).map(a => {
-    const dettagli = (a.dettagli || []).map(d => `<div style="font-size:12px;color:#8a8a8a;margin-top:2px;">${esc(d)}</div>`).join('');
+    const dettagli = (a.dettagli || []).map(d => {
+      const isSenza = /^Senza:/i.test(d);
+      const stile = isSenza ? 'font-size:12px;color:#c1382b;margin-top:2px;font-weight:700;text-decoration:underline;' : 'font-size:12px;color:#8a8a8a;margin-top:2px;';
+      return `<div style="${stile}">${esc(d)}</div>`;
+    }).join('');
     return `
       <tr>
         <td style="padding:10px 0;border-bottom:1px solid #eee;vertical-align:top;">
