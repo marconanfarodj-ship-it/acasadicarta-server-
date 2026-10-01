@@ -286,6 +286,9 @@ function buildOwnerOrderHtml(order) {
   const rigaConsegna = order.speseConsegna
     ? `<tr><td style="padding:8px 0 0;color:#8a8a8a;">Spese di consegna</td><td style="padding:8px 0 0;text-align:right;color:#222;">${money(order.speseConsegna)}</td></tr>`
     : '';
+  const rigaSconto = order.scontoPrimoOrdine
+    ? `<tr><td style="padding:4px 0;color:#1a9c4a;">🎉 Sconto primo ordine</td><td style="padding:4px 0;text-align:right;color:#1a9c4a;font-weight:700;">-${money(order.scontoPrimoOrdine)}</td></tr>`
+    : '';
   const pagamentoLabel = order.pagatoOnline ? '✅ Pagato online' : '⏳ Da riscuotere alla consegna/ritiro';
   const rigaPagamento = `<tr><td style="padding:2px 0;color:#8a8a8a;">Pagamento</td><td style="padding:2px 0;text-align:right;color:${order.pagatoOnline ? '#1a9c4a' : '#c1382b'};font-weight:700;">${pagamentoLabel}</td></tr>`;
   const rigaTelefono = order.phone
@@ -319,7 +322,8 @@ function buildOwnerOrderHtml(order) {
 
         <tr><td style="padding:14px 24px 0;">
           <table width="100%" cellpadding="0" cellspacing="0" style="font-size:14px;">
-            <tr><td style="padding:4px 0;color:#8a8a8a;">Subtotale</td><td style="padding:4px 0;text-align:right;color:#222;">${money(order.subtotale)}</td></tr>
+            <tr><td style="padding:4px 0;color:#8a8a8a;">Subtotale</td><td style="padding:4px 0;text-align:right;color:#222;">${money(order.subtotaleBase != null ? order.subtotaleBase : order.subtotale)}</td></tr>
+            ${rigaSconto}
             ${rigaConsegna}
             <tr><td style="padding:10px 0 0;font-weight:700;color:#222;border-top:1px solid #eee;">Totale</td><td style="padding:10px 0 0;text-align:right;font-weight:700;color:#c1382b;border-top:1px solid #eee;">${money(order.grandTotal)}</td></tr>
           </table>
@@ -370,6 +374,9 @@ function buildCustomerConfirmationHtml(order) {
   const rigaConsegna = order.speseConsegna
     ? `<tr><td style="padding:8px 0 0;color:#8a8a8a;">Spese di consegna</td><td style="padding:8px 0 0;text-align:right;color:#222;">${money(order.speseConsegna)}</td></tr>`
     : '';
+  const rigaSconto = order.scontoPrimoOrdine
+    ? `<tr><td style="padding:4px 0;color:#1a9c4a;">🎉 Sconto primo ordine</td><td style="padding:4px 0;text-align:right;color:#1a9c4a;font-weight:700;">-${money(order.scontoPrimoOrdine)}</td></tr>`
+    : '';
   const pagamentoLabel = order.pagatoOnline
     ? '✅ Pagato online'
     : (order.pagamento === 'contanti' ? 'Contanti alla consegna/ritiro' : 'Bancomat/Carta alla consegna/ritiro');
@@ -402,7 +409,8 @@ function buildCustomerConfirmationHtml(order) {
 
         <tr><td style="padding:14px 24px 0;">
           <table width="100%" cellpadding="0" cellspacing="0" style="font-size:14px;">
-            <tr><td style="padding:4px 0;color:#8a8a8a;">Subtotale</td><td style="padding:4px 0;text-align:right;color:#222;">${money(order.subtotale)}</td></tr>
+            <tr><td style="padding:4px 0;color:#8a8a8a;">Subtotale</td><td style="padding:4px 0;text-align:right;color:#222;">${money(order.subtotaleBase != null ? order.subtotaleBase : order.subtotale)}</td></tr>
+            ${rigaSconto}
             ${rigaConsegna}
             <tr><td style="padding:10px 0 0;font-weight:700;color:#222;border-top:1px solid #eee;">Totale</td><td style="padding:10px 0 0;text-align:right;font-weight:700;color:#c1382b;border-top:1px solid #eee;">${money(order.grandTotal)}</td></tr>
           </table>
