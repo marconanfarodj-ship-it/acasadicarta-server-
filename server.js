@@ -584,8 +584,19 @@ let printClients = [];
 
 function broadcastOrder(order) {
   const payload = `data: ${JSON.stringify(order)}\n\n`;
-  printClients.forEach(res => res.write(payload));
+  printClients.forEach(res => {
+    try { res.write(payload); } catch (e) { /* il client verrà rimosso al prossimo "close" */ }
+  });
 }
+
+// Un "battito" ogni 25 secondi: tiene viva la connessione attraverso eventuali proxy/timeout
+// di rete, ed evita che il pannello resti "appeso" senza accorgersi che la linea è caduta.
+setInterval(() => {
+  printClients = printClients.filter(res => {
+    try { res.write(': ping\n\n'); return true; }
+    catch (e) { return false; }
+  });
+}, 25000);
 
 // ---------- Storico ordini in memoria (si azzera se il server si riavvia) ----------
 let orderHistory = [];
