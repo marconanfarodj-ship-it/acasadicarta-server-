@@ -1282,6 +1282,60 @@ app.post('/api/orders-status/toggle', async (req, res) => {
   res.json({ ok: true, paused: ordersPaused });
 });
 
+// ---------- Endpoint: statistiche per la dashboard (incassi e numero ordini) ----------
+app.get('/api/dashboard-stats', async (req, res) => {
+  const vuoto = { incasso: 0, ordini: 0 };
+  if (!ordersCollection) {
+    return res.json({ today: vuoto, week: vuoto, month: vuoto, daily: [] });
+  }
+  try {
+    const now = new Date(); // ora italiana, grazie a TZ=Europe/Rome impostato a inizio file
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+    const dayOfWeek = now.getDay(); // 0=domenica, 1=lunedì, ...
+    const diffToMonday = (dayOfWeek === 0 ? 6 : dayOfWeek - 1);
+    const startOfWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() - diffToMonday, 0, 0, 0, 0);
+
+    const orders = await ordersCollection.find(
+      { ricevutoAlle: { $gte: startOfMonth.toISOString() } },
+      { projection: { ricevutoAlle: 1, grandTotal: 1, subtotale: 1 } }
+    ).toArray();
+
+    const todayKey = dateKey(now);
+    const startOfWeekKey = dateKey(startOfWeek);
+    const today = { incasso: 0, ordini: 0 };
+    const week = { incasso: 0, ordini: 0 };
+    const month = { incasso: 0, ordini: 0 };
+    const dailyMap = {};
+
+    orders.forEach(o => {
+      const importo = Number(o.grandTotal != null ? o.grandTotal : o.subtotale) || 0;
+      const key = dateKey(new Date(o.ricevutoAlle));
+
+      month.incasso += importo; month.ordini++;
+      if (key >= startOfWeekKey) { week.incasso += importo; week.ordini++; }
+      if (key === todayKey) { today.incasso += importo; today.ordini++; }
+
+      if (!dailyMap[key]) dailyMap[key] = { incasso: 0, ordini: 0 };
+      dailyMap[key].incasso += importo;
+      dailyMap[key].ordini++;
+    });
+
+    const daily = Object.keys(dailyMap).sort().map(k => ({
+      data: k, incasso: round2(dailyMap[k].incasso), ordini: dailyMap[k].ordini
+    }));
+
+    res.json({
+      today: { incasso: round2(today.incasso), ordini: today.ordini },
+      week: { incasso: round2(week.incasso), ordini: week.ordini },
+      month: { incasso: round2(month.incasso), ordini: month.ordini },
+      daily
+    });
+  } catch (err) {
+    console.error('Errore calcolo statistiche dashboard:', err);
+    res.status(500).json({ today: vuoto, week: vuoto, month: vuoto, daily: [] });
+  }
+});
+
 // ---------- Endpoint: prezzi correnti di tutte le voci del menu (di base + eventuali modifiche) ----------
 app.get('/api/menu-prices', (req, res) => {
   const prezzi = {};
