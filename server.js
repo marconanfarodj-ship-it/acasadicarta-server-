@@ -1361,8 +1361,11 @@ function finalizzaAggregato(agg, clientiNuovi){
 app.get('/api/orders/non-stampati', async (req, res) => {
   if (!ordersCollection) return res.json([]);
   try {
+    // solo ultime 6 ore: evita di recuperare ordini vecchi/storici (es. quelli di prima
+    // che esistesse questo controllo, che non hanno mai avuto il campo "stampato" impostato)
+    const limiteOrario = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
     const ordini = await ordersCollection.find(
-      { stampato: { $ne: true } },
+      { stampato: { $ne: true }, ricevutoAlle: { $gte: limiteOrario } },
       { sort: { ricevutoAlle: 1 }, limit: 50 }
     ).toArray();
     res.json(ordini);
