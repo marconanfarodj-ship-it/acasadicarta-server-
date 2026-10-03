@@ -800,6 +800,7 @@ async function finalizeOrder(order, customerId){
   order.ricevutoAlle = new Date().toISOString();
   order.stato = 'da_preparare';
   order.metodoPagamento = order.pagatoOnline ? 'online' : null; // 'online' | 'contanti' | 'bancomat' | null (da registrare)
+  order.stampato = false; // diventa true quando un pannello lo stampa (anche in differita, vedi /api/orders/non-stampati)
   order.phoneNormalized = normalizePhone(order.phone);
   order.addressNormalized = normalizeAddress(order.address);
   orderHistory.unshift(order);
@@ -1283,56 +1284,199 @@ app.post('/api/orders-status/toggle', async (req, res) => {
 });
 
 // ---------- Endpoint: statistiche per la dashboard (incassi e numero ordini) ----------
+// Costo ingredienti noto solo per questi piatti (vedi food-cost.md): finché non censiamo gli
+// altri piatti, il "guadagno netto" nella dashboard resta calcolato solo su questi.
+const COSTO_INGREDIENTI = {
+  'Capricciosa': 2.24,
+};
+
+function nuovoAggregato(){
+  return {
+    incasso: 0, ordini: 0,
+    topItems: {}, // nome -> { qty, incasso }
+    pagamenti: { online: 0, contanti: 0, bancomat: 0, nonRegistrato: 0 },
+    pagamentiIncasso: { online: 0, contanti: 0, bancomat: 0, nonRegistrato: 0 },
+    modalita: { consegna: 0, ritiro: 0 },
+    modalitaIncasso: { consegna: 0, ritiro: 0 },
+    scontoTotale: 0,
+    guadagnoNetto: 0,
+    qtyGuadagnoNetto: 0, // quante unità dei piatti censiti sono state vendute (per trasparenza)
+    phones: new Set(),
+  };
+}
+
+function accumula(agg, o){
+  const importo = Number(o.grandTotal != null ? o.grandTotal : o.subtotale) || 0;
+  agg.incasso += importo; agg.ordini++;
+
+  const metodo = o.metodoPagamento && agg.pagamenti[o.metodoPagamento] !== undefined ? o.metodoPagamento : 'nonRegistrato';
+  agg.pagamenti[metodo]++; agg.pagamentiIncasso[metodo] += importo;
+
+  const modo = o.modalita === 'consegna' ? 'consegna' : 'ritiro';
+  agg.modalita[modo]++; agg.modalitaIncasso[modo] += importo;
+
+  agg.scontoTotale += Number(o.scontoPrimoOrdine) || 0;
+  if (o.phoneNormalized) agg.phones.add(o.phoneNormalized);
+
+  (o.articoli || []).forEach(a => {
+    const nome = a.nome;
+    const qty = Number(a.qty) || 0;
+    const incassoRiga = Number(a.prezzo) || 0;
+    if (!agg.topItems[nome]) agg.topItems[nome] = { qty: 0, incasso: 0 };
+    agg.topItems[nome].qty += qty;
+    agg.topItems[nome].incasso += incassoRiga;
+
+    if (COSTO_INGREDIENTI[nome] != null) {
+      agg.guadagnoNetto += incassoRiga - (COSTO_INGREDIENTI[nome] * qty);
+      agg.qtyGuadagnoNetto += qty;
+    }
+  });
+}
+
+function finalizzaAggregato(agg, clientiNuovi){
+  const topItems = Object.entries(agg.topItems)
+    .map(([nome, v]) => ({ nome, qty: v.qty, incasso: round2(v.incasso) }))
+    .sort((a, b) => b.qty - a.qty)
+    .slice(0, 8);
+  return {
+    incasso: round2(agg.incasso),
+    ordini: agg.ordini,
+    scontrinoMedio: agg.ordini ? round2(agg.incasso / agg.ordini) : 0,
+    topItems,
+    pagamenti: agg.pagamenti,
+    pagamentiIncasso: Object.fromEntries(Object.entries(agg.pagamentiIncasso).map(([k, v]) => [k, round2(v)])),
+    modalita: agg.modalita,
+    modalitaIncasso: Object.fromEntries(Object.entries(agg.modalitaIncasso).map(([k, v]) => [k, round2(v)])),
+    scontoTotale: round2(agg.scontoTotale),
+    guadagnoNetto: round2(agg.guadagnoNetto),
+    qtyGuadagnoNetto: agg.qtyGuadagnoNetto,
+    clientiNuovi,
+    clientiAbituali: Math.max(0, agg.phones.size - clientiNuovi),
+  };
+}
+
+// ---------- Endpoint: ordini arrivati ma non ancora stampati da nessun pannello ----------
+// Serve a recuperare gli ordini ricevuti mentre il pannello era chiuso/disconnesso: appena
+// il pannello si (ri)apre, li chiede qui e li stampa come se arrivassero ora.
+app.get('/api/orders/non-stampati', async (req, res) => {
+  if (!ordersCollection) return res.json([]);
+  try {
+    const ordini = await ordersCollection.find(
+      { stampato: { $ne: true } },
+      { sort: { ricevutoAlle: 1 }, limit: 50 }
+    ).toArray();
+    res.json(ordini);
+  } catch (err) {
+    console.error('Errore recupero ordini non stampati:', err);
+    res.json([]);
+  }
+});
+
+app.post('/api/orders/segna-stampato', async (req, res) => {
+  const numeroOrdine = Number(req.body && req.body.numeroOrdine);
+  if (!numeroOrdine) return res.status(400).json({ ok: false, error: 'Numero ordine mancante' });
+
+  const inMemoria = orderHistory.find(o => o.numeroOrdine === numeroOrdine);
+  if (inMemoria) inMemoria.stampato = true;
+
+  if (ordersCollection) {
+    try { await ordersCollection.updateOne({ numeroOrdine }, { $set: { stampato: true } }); }
+    catch (err) { console.error('Errore salvataggio stampato:', err); }
+  }
+  res.json({ ok: true });
+});
+
 app.get('/api/dashboard-stats', async (req, res) => {
   const vuoto = { incasso: 0, ordini: 0 };
   if (!ordersCollection) {
-    return res.json({ today: vuoto, week: vuoto, month: vuoto, daily: [] });
+    return res.json({ today: vuoto, week: vuoto, month: vuoto, daily: [], periods: {}, peakHours: [] });
   }
   try {
     const now = new Date(); // ora italiana, grazie a TZ=Europe/Rome impostato a inizio file
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
     const dayOfWeek = now.getDay(); // 0=domenica, 1=lunedì, ...
     const diffToMonday = (dayOfWeek === 0 ? 6 : dayOfWeek - 1);
     const startOfWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() - diffToMonday, 0, 0, 0, 0);
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+    const startOfPrevWeek = new Date(startOfWeek.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const startOfPrevMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1, 0, 0, 0, 0);
+    // margine di sicurezza: partiamo da qui per essere certi di avere anche settimana/mese precedenti
+    const queryStart = new Date(Math.min(startOfPrevMonth.getTime(), startOfPrevWeek.getTime()) - 24 * 60 * 60 * 1000);
 
     const orders = await ordersCollection.find(
-      { ricevutoAlle: { $gte: startOfMonth.toISOString() } },
-      { projection: { ricevutoAlle: 1, grandTotal: 1, subtotale: 1 } }
+      { ricevutoAlle: { $gte: queryStart.toISOString() } },
+      { projection: { ricevutoAlle: 1, grandTotal: 1, subtotale: 1, articoli: 1, metodoPagamento: 1, modalita: 1, scontoPrimoOrdine: 1, phoneNormalized: 1 } }
     ).toArray();
 
-    const todayKey = dateKey(now);
-    const startOfWeekKey = dateKey(startOfWeek);
-    const today = { incasso: 0, ordini: 0 };
-    const week = { incasso: 0, ordini: 0 };
-    const month = { incasso: 0, ordini: 0 };
+    // per "clienti nuovi vs abituali": chi aveva già un numero di telefono visto PRIMA dell'inizio di ciascun periodo
+    const phoneVistiPrima = { today: new Set(), week: new Set(), month: new Set() };
+    orders.forEach(o => {
+      if (!o.phoneNormalized) return;
+      const t = new Date(o.ricevutoAlle);
+      if (t < startOfToday) phoneVistiPrima.today.add(o.phoneNormalized);
+      if (t < startOfWeek) phoneVistiPrima.week.add(o.phoneNormalized);
+      if (t < startOfMonth) phoneVistiPrima.month.add(o.phoneNormalized);
+    });
+
+    const todayAgg = nuovoAggregato(), weekAgg = nuovoAggregato(), monthAgg = nuovoAggregato();
+    const prevWeekTot = { incasso: 0, ordini: 0 }, prevMonthTot = { incasso: 0, ordini: 0 };
     const dailyMap = {};
+    const oreMap = {}; // 0-23 -> numero ordini, calcolato sul mese in corso
+
+    const nuoviToday = new Set(), nuoviWeek = new Set(), nuoviMonth = new Set();
 
     orders.forEach(o => {
       const importo = Number(o.grandTotal != null ? o.grandTotal : o.subtotale) || 0;
-      const key = dateKey(new Date(o.ricevutoAlle));
+      const t = new Date(o.ricevutoAlle);
+      const key = dateKey(t);
 
-      month.incasso += importo; month.ordini++;
-      if (key >= startOfWeekKey) { week.incasso += importo; week.ordini++; }
-      if (key === todayKey) { today.incasso += importo; today.ordini++; }
+      if (t >= startOfMonth) {
+        accumula(monthAgg, o);
+        if (o.phoneNormalized && !phoneVistiPrima.month.has(o.phoneNormalized)) nuoviMonth.add(o.phoneNormalized);
+        const ora = t.getHours();
+        oreMap[ora] = (oreMap[ora] || 0) + 1;
+        if (!dailyMap[key]) dailyMap[key] = { incasso: 0, ordini: 0 };
+        dailyMap[key].incasso += importo; dailyMap[key].ordini++;
+      } else if (t >= startOfPrevMonth) {
+        prevMonthTot.incasso += importo; prevMonthTot.ordini++;
+      }
 
-      if (!dailyMap[key]) dailyMap[key] = { incasso: 0, ordini: 0 };
-      dailyMap[key].incasso += importo;
-      dailyMap[key].ordini++;
+      if (t >= startOfWeek) {
+        accumula(weekAgg, o);
+        if (o.phoneNormalized && !phoneVistiPrima.week.has(o.phoneNormalized)) nuoviWeek.add(o.phoneNormalized);
+      } else if (t >= startOfPrevWeek && t < startOfWeek) {
+        prevWeekTot.incasso += importo; prevWeekTot.ordini++;
+      }
+
+      if (t >= startOfToday) {
+        accumula(todayAgg, o);
+        if (o.phoneNormalized && !phoneVistiPrima.today.has(o.phoneNormalized)) nuoviToday.add(o.phoneNormalized);
+      }
     });
 
     const daily = Object.keys(dailyMap).sort().map(k => ({
       data: k, incasso: round2(dailyMap[k].incasso), ordini: dailyMap[k].ordini
     }));
+    const peakHours = Array.from({ length: 24 }, (_, ora) => ({ ora, ordini: oreMap[ora] || 0 }));
 
     res.json({
-      today: { incasso: round2(today.incasso), ordini: today.ordini },
-      week: { incasso: round2(week.incasso), ordini: week.ordini },
-      month: { incasso: round2(month.incasso), ordini: month.ordini },
-      daily
+      today: { incasso: round2(todayAgg.incasso), ordini: todayAgg.ordini },
+      week: { incasso: round2(weekAgg.incasso), ordini: weekAgg.ordini },
+      month: { incasso: round2(monthAgg.incasso), ordini: monthAgg.ordini },
+      weekPrev: { incasso: round2(prevWeekTot.incasso), ordini: prevWeekTot.ordini },
+      monthPrev: { incasso: round2(prevMonthTot.incasso), ordini: prevMonthTot.ordini },
+      daily,
+      peakHours,
+      periods: {
+        today: finalizzaAggregato(todayAgg, nuoviToday.size),
+        week: finalizzaAggregato(weekAgg, nuoviWeek.size),
+        month: finalizzaAggregato(monthAgg, nuoviMonth.size),
+      },
+      costiCensiti: Object.keys(COSTO_INGREDIENTI),
     });
   } catch (err) {
     console.error('Errore calcolo statistiche dashboard:', err);
-    res.status(500).json({ today: vuoto, week: vuoto, month: vuoto, daily: [] });
+    res.status(500).json({ today: vuoto, week: vuoto, month: vuoto, daily: [], periods: {}, peakHours: [] });
   }
 });
 
