@@ -279,7 +279,7 @@ function buildOwnerOrderHtml(order) {
       </tr>`;
   }).join('');
 
-  const modalitaLabel = order.modalita === 'consegna' ? '🛵 Consegna a domicilio' : '🏠 Ritiro in sede';
+  const modalitaLabel = order.modalita === 'consegna' ? '🛵 Consegna a domicilio' : order.modalita === 'tavolo' ? `🪑 Tavolo ${esc(order.numeroTavolo || '')}` : '🏠 Ritiro in sede';
   const rigaIndirizzo = order.modalita === 'consegna' && order.address
     ? `<tr><td style="padding:4px 0;color:#8a8a8a;">Indirizzo</td><td style="padding:4px 0;text-align:right;color:#222;">${esc(order.address)}</td></tr>`
     : '';
@@ -289,7 +289,7 @@ function buildOwnerOrderHtml(order) {
   const rigaSconto = order.scontoPrimoOrdine
     ? `<tr><td style="padding:4px 0;color:#1a9c4a;">🎉 Sconto primo ordine</td><td style="padding:4px 0;text-align:right;color:#1a9c4a;font-weight:700;">-${money(order.scontoPrimoOrdine)}</td></tr>`
     : '';
-  const pagamentoLabel = order.pagatoOnline ? '✅ Pagato online' : '⏳ Da riscuotere alla consegna/ritiro';
+  const pagamentoLabel = order.pagatoOnline ? '✅ Pagato online' : order.modalita === 'tavolo' ? '🪑 Da pagare al tavolo' : '⏳ Da riscuotere alla consegna/ritiro';
   const rigaPagamento = `<tr><td style="padding:2px 0;color:#8a8a8a;">Pagamento</td><td style="padding:2px 0;text-align:right;color:${order.pagatoOnline ? '#1a9c4a' : '#c1382b'};font-weight:700;">${pagamentoLabel}</td></tr>`;
   const rigaTelefono = order.phone
     ? `<tr><td style="padding:2px 0;color:#8a8a8a;">Telefono</td><td style="padding:2px 0;text-align:right;color:#222;">${esc(order.phone)}</td></tr>`
@@ -367,7 +367,7 @@ function buildCustomerConfirmationHtml(order) {
       </tr>`;
   }).join('');
 
-  const modalitaLabel = order.modalita === 'consegna' ? 'Consegna a domicilio' : 'Ritiro in sede';
+  const modalitaLabel = order.modalita === 'consegna' ? 'Consegna a domicilio' : order.modalita === 'tavolo' ? `Tavolo ${esc(order.numeroTavolo || '')}` : 'Ritiro in sede';
   const rigaIndirizzo = order.modalita === 'consegna' && order.address
     ? `<tr><td style="padding:4px 0;color:#8a8a8a;">Indirizzo</td><td style="padding:4px 0;text-align:right;color:#222;">${esc(order.address)}</td></tr>`
     : '';
@@ -379,6 +379,7 @@ function buildCustomerConfirmationHtml(order) {
     : '';
   const pagamentoLabel = order.pagatoOnline
     ? '✅ Pagato online'
+    : order.pagamento === 'tavolo' ? 'Da pagare al tavolo'
     : (order.pagamento === 'contanti' ? 'Contanti alla consegna/ritiro' : 'Bancomat/Carta alla consegna/ritiro');
   const rigaPagamento = `<tr><td style="padding:2px 0;color:#8a8a8a;">Pagamento</td><td style="padding:2px 0;text-align:right;color:${order.pagatoOnline ? '#1a9c4a' : '#222'};font-weight:${order.pagatoOnline ? '700' : '400'};">${pagamentoLabel}</td></tr>`;
 
@@ -495,110 +496,6 @@ async function isFirstOrderForPhone(phone, address){
 }
 
 function round2(n){ return Math.round(n * 100) / 100; }
-
-// ---------- Zona di consegna: prezzo in base alla distanza dalla pizzeria ----------
-// Fino a 2,5 km (tutto il paese) spese normali; da 2,5 a 8 km (contrade/campagna) +3€;
-// oltre 8 km niente consegna. Distanza calcolata "in linea d'aria" dalla pizzeria.
-const PIZZERIA_POS = { lat: 37.1484812, lng: 14.3868172 }; // Via XX Settembre 192, Niscemi
-const SPESE_CONSEGNA_BASE = 1.50;
-const RAGGIO_PAESE_KM = 2.5;
-const SOVRAPPREZZO_FUORI_PAESE = 3.00;
-const RAGGIO_MAX_KM = 8;
-
-function distanzaKm(a, b){
-  const R = 6371;
-  const toRad = x => x * Math.PI / 180;
-  const dLat = toRad(b.lat - a.lat);
-  const dLng = toRad(b.lng - a.lng);
-  const h = Math.sin(dLat/2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng/2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(h));
-}
-
-// trova le coordinate di un indirizzo (solo nella zona di Niscemi), con cache in memoria
-const geocodeCache = new Map();
-async function geocodeAddress(address){
-  const key = normalizeAddress(address);
-  if (!key) return null;
-  if (geocodeCache.has(key)) return geocodeCache.get(key);
-  const q = /niscemi/i.test(address) ? address : `${address}, Niscemi`;
-  const url = 'https://nominatim.openstreetmap.org/search?' + new URLSearchParams({
-    q, format: 'json', limit: '1', countrycodes: 'it',
-    viewbox: '14.237,37.268,14.537,37.028', bounded: '1' // ~12 km attorno a Niscemi
-  });
-  try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 5000);
-    const r = await fetch(url, {
-      headers: { 'User-Agent': 'LaCasaDiCarta-Ordini/1.0 (ordini.pizzerialacasadicarta.it)', 'Accept-Language': 'it' },
-      signal: ctrl.signal
-    });
-    clearTimeout(timer);
-    if (!r.ok) return null; // errore temporaneo: non lo salviamo in cache
-    const arr = await r.json();
-    const pos = Array.isArray(arr) && arr[0] ? { lat: parseFloat(arr[0].lat), lng: parseFloat(arr[0].lon) } : null;
-    geocodeCache.set(key, pos);
-    return pos;
-  } catch (err) {
-    console.error('Errore ricerca indirizzo:', err.message);
-    return null;
-  }
-}
-
-// calcola spese e zona. Se l'indirizzo non si trova sulla mappa usa la posizione GPS del cliente
-// (se l'ha condivisa), altrimenti la zona dichiarata dal cliente, segnata "da verificare".
-async function calcolaZonaConsegna({ address, lat, lng, zonaDichiarata }){
-  let pos = await geocodeAddress(address);
-  let fonte = 'indirizzo';
-  if (!pos && Number.isFinite(lat) && Number.isFinite(lng)) { pos = { lat, lng }; fonte = 'gps'; }
-
-  if (!pos) {
-    const fuori = zonaDichiarata === 'fuori';
-    return {
-      ok: true, trovato: false, chiediZona: !zonaDichiarata, daVerificare: true,
-      fuoriPaese: fuori, distanzaKm: null,
-      spese: round2(SPESE_CONSEGNA_BASE + (fuori ? SOVRAPPREZZO_FUORI_PAESE : 0))
-    };
-  }
-
-  const km = Math.round(distanzaKm(PIZZERIA_POS, pos) * 10) / 10;
-  if (km > RAGGIO_MAX_KM) {
-    return {
-      ok: false, error: 'fuori_zona', distanzaKm: km,
-      message: `Ci dispiace, l'indirizzo è a circa ${String(km).replace('.', ',')} km dalla pizzeria: consegniamo fino a ${RAGGIO_MAX_KM} km. Puoi scegliere il ritiro in sede.`
-    };
-  }
-  const fuori = km > RAGGIO_PAESE_KM;
-  return {
-    ok: true, trovato: true, fonte, daVerificare: false,
-    fuoriPaese: fuori, distanzaKm: km,
-    spese: round2(SPESE_CONSEGNA_BASE + (fuori ? SOVRAPPREZZO_FUORI_PAESE : 0))
-  };
-}
-
-// imposta in modo autorevole le spese di consegna dell'ordine (mai fidarsi del valore del sito)
-async function applyDeliveryZone(order){
-  if (order.modalita !== 'consegna') { order.speseConsegna = 0; return { ok: true }; }
-  const z = await calcolaZonaConsegna({
-    address: order.address,
-    lat: Number(order.lat), lng: Number(order.lng),
-    zonaDichiarata: order.zonaDichiarata
-  });
-  if (!z.ok) return z;
-
-  order.speseConsegna = z.spese;
-  order.distanzaKm = z.distanzaKm;
-  order.fuoriPaese = !!z.fuoriPaese;
-  order.zonaDaVerificare = !!z.daVerificare;
-
-  if (order.testoStampa) {
-    let riga = `Consegna a domicilio: +${money(z.spese)}`;
-    if (z.fuoriPaese) riga += ' (fuori paese)';
-    if (z.distanzaKm != null) riga += ` — ${String(z.distanzaKm).replace('.', ',')} km`;
-    if (z.daVerificare) riga += `\n⚠️ ZONA DA VERIFICARE: indirizzo non trovato, il cliente dice "${z.fuoriPaese ? 'fuori paese' : 'in paese'}"`;
-    order.testoStampa = order.testoStampa.replace(/Consegna a domicilio: \+[^\n]*/, riga);
-  }
-  return { ok: true };
-}
 
 // Ricalcola sconto/subtotale/totale in modo autorevole: non ci fidiamo mai dei valori
 // mandati dal sito, li ricalcoliamo sempre qui prima di stampare/salvare/far pagare.
@@ -1001,9 +898,6 @@ app.post('/api/orders', async (req, res) => {
     });
   }
 
-  const zona = await applyDeliveryZone(order); // spese di consegna in base alla distanza
-  if (!zona.ok) return res.status(400).json(zona);
-
   await applyFirstOrderDiscount(order); // ricalcola sconto/subtotale/totale in modo autorevole
 
   const slotResult = await assignDeliverySlotIfNeeded(order);
@@ -1052,9 +946,6 @@ app.post('/api/checkout/create-session', async (req, res) => {
       message: `L'ordine minimo per la consegna a domicilio è di €${MIN_DELIVERY_ORDER.toFixed(2).replace('.', ',')}.`
     });
   }
-
-  const zona = await applyDeliveryZone(order); // spese di consegna in base alla distanza
-  if (!zona.ok) return res.status(400).json(zona);
 
   await applyFirstOrderDiscount(order); // ricalcola sconto/subtotale/totale in modo autorevole
 
@@ -1691,16 +1582,6 @@ app.post('/api/product-photos/delete', async (req, res) => {
 app.get('/api/check-first-order-discount', async (req, res) => {
   const eligible = await isFirstOrderForPhone(req.query.phone, req.query.address);
   res.json({ eligible, percentuale: eligible ? Math.round(SCONTO_PRIMO_ORDINE * 100) : 0 });
-});
-
-// ---------- Endpoint: preventivo spese di consegna per un indirizzo (usato dal sito) ----------
-app.get('/api/delivery-quote', async (req, res) => {
-  const z = await calcolaZonaConsegna({
-    address: String(req.query.address || ''),
-    lat: parseFloat(req.query.lat), lng: parseFloat(req.query.lng),
-    zonaDichiarata: req.query.zona || null
-  });
-  res.json({ ...z, raggioPaeseKm: RAGGIO_PAESE_KM, raggioMaxKm: RAGGIO_MAX_KM, speseBase: SPESE_CONSEGNA_BASE, sovrapprezzo: SOVRAPPREZZO_FUORI_PAESE });
 });
 
 // ---------- Endpoint: lista nera numeri di telefono ----------
