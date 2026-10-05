@@ -75,6 +75,8 @@ let soldOutCache = new Set();
 let blacklistCollection = null;
 let blockedPhonesCache = new Set(); // riserva in memoria, usata se il database non è raggiungibile
 let ordersPaused = false; // interruttore manuale: se true, il sito rifiuta ogni nuovo ordine
+// calendario deciso dal titolare dal pannello: giorni di chiusura in più e martedì eccezionalmente aperti
+let calendario = { chiusi: [], aperti: [] }; // date "YYYY-MM-DD"
 let settingsCollection = null;
 
 // prezzi di partenza di ogni voce del menu (chiave uguale a quella usata per gli esauriti);
@@ -127,6 +129,8 @@ async function connectDB(){
     settingsCollection = db.collection('settings');
     const pausedDoc = await settingsCollection.findOne({ _id: 'ordersPaused' });
     ordersPaused = !!(pausedDoc && pausedDoc.value);
+    const calDoc = await settingsCollection.findOne({ _id: 'calendario' });
+    if (calDoc && calDoc.value) calendario = { chiusi: calDoc.value.chiusi || [], aperti: calDoc.value.aperti || [] };
     productPhotosCollection = db.collection('productPhotos');
     const photoDocs = await productPhotosCollection.find({}, { projection: { data: 0 } }).toArray();
     // all'avvio carichiamo solo l'elenco delle chiavi con foto (leggero); l'immagine vera si scarica
@@ -379,7 +383,6 @@ function buildCustomerConfirmationHtml(order) {
     : '';
   const pagamentoLabel = order.pagatoOnline
     ? '✅ Pagato online'
-    : order.pagamento === 'tavolo' ? 'Da pagare al tavolo'
     : (order.pagamento === 'contanti' ? 'Contanti alla consegna/ritiro' : 'Bancomat/Carta alla consegna/ritiro');
   const rigaPagamento = `<tr><td style="padding:2px 0;color:#8a8a8a;">Pagamento</td><td style="padding:2px 0;text-align:right;color:${order.pagatoOnline ? '#1a9c4a' : '#222'};font-weight:${order.pagatoOnline ? '700' : '400'};">${pagamentoLabel}</td></tr>`;
 
@@ -497,6 +500,110 @@ async function isFirstOrderForPhone(phone, address){
 
 function round2(n){ return Math.round(n * 100) / 100; }
 
+// ---------- Zona di consegna: prezzo in base alla distanza dalla pizzeria ----------
+// Fino a 2,5 km (tutto il paese) spese normali; da 2,5 a 8 km (contrade/campagna) +3€;
+// oltre 8 km niente consegna. Distanza calcolata "in linea d'aria" dalla pizzeria.
+const PIZZERIA_POS = { lat: 37.1484812, lng: 14.3868172 }; // Via XX Settembre 192, Niscemi
+const SPESE_CONSEGNA_BASE = 1.50;
+const RAGGIO_PAESE_KM = 2.5;
+const SOVRAPPREZZO_FUORI_PAESE = 3.00;
+const RAGGIO_MAX_KM = 8;
+
+function distanzaKm(a, b){
+  const R = 6371;
+  const toRad = x => x * Math.PI / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const h = Math.sin(dLat/2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng/2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+// trova le coordinate di un indirizzo (solo nella zona di Niscemi), con cache in memoria
+const geocodeCache = new Map();
+async function geocodeAddress(address){
+  const key = normalizeAddress(address);
+  if (!key) return null;
+  if (geocodeCache.has(key)) return geocodeCache.get(key);
+  const q = /niscemi/i.test(address) ? address : `${address}, Niscemi`;
+  const url = 'https://nominatim.openstreetmap.org/search?' + new URLSearchParams({
+    q, format: 'json', limit: '1', countrycodes: 'it',
+    viewbox: '14.237,37.268,14.537,37.028', bounded: '1' // ~12 km attorno a Niscemi
+  });
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
+    const r = await fetch(url, {
+      headers: { 'User-Agent': 'LaCasaDiCarta-Ordini/1.0 (ordini.pizzerialacasadicarta.it)', 'Accept-Language': 'it' },
+      signal: ctrl.signal
+    });
+    clearTimeout(timer);
+    if (!r.ok) return null; // errore temporaneo: non lo salviamo in cache
+    const arr = await r.json();
+    const pos = Array.isArray(arr) && arr[0] ? { lat: parseFloat(arr[0].lat), lng: parseFloat(arr[0].lon) } : null;
+    geocodeCache.set(key, pos);
+    return pos;
+  } catch (err) {
+    console.error('Errore ricerca indirizzo:', err.message);
+    return null;
+  }
+}
+
+// calcola spese e zona. Se l'indirizzo non si trova sulla mappa usa la posizione GPS del cliente
+// (se l'ha condivisa), altrimenti la zona dichiarata dal cliente, segnata "da verificare".
+async function calcolaZonaConsegna({ address, lat, lng, zonaDichiarata }){
+  let pos = await geocodeAddress(address);
+  let fonte = 'indirizzo';
+  if (!pos && Number.isFinite(lat) && Number.isFinite(lng)) { pos = { lat, lng }; fonte = 'gps'; }
+
+  if (!pos) {
+    const fuori = zonaDichiarata === 'fuori';
+    return {
+      ok: true, trovato: false, chiediZona: !zonaDichiarata, daVerificare: true,
+      fuoriPaese: fuori, distanzaKm: null,
+      spese: round2(SPESE_CONSEGNA_BASE + (fuori ? SOVRAPPREZZO_FUORI_PAESE : 0))
+    };
+  }
+
+  const km = Math.round(distanzaKm(PIZZERIA_POS, pos) * 10) / 10;
+  if (km > RAGGIO_MAX_KM) {
+    return {
+      ok: false, error: 'fuori_zona', distanzaKm: km,
+      message: `Ci dispiace, l'indirizzo è a circa ${String(km).replace('.', ',')} km dalla pizzeria: consegniamo fino a ${RAGGIO_MAX_KM} km. Puoi scegliere il ritiro in sede.`
+    };
+  }
+  const fuori = km > RAGGIO_PAESE_KM;
+  return {
+    ok: true, trovato: true, fonte, daVerificare: false,
+    fuoriPaese: fuori, distanzaKm: km,
+    spese: round2(SPESE_CONSEGNA_BASE + (fuori ? SOVRAPPREZZO_FUORI_PAESE : 0))
+  };
+}
+
+// imposta in modo autorevole le spese di consegna dell'ordine (mai fidarsi del valore del sito)
+async function applyDeliveryZone(order){
+  if (order.modalita !== 'consegna') { order.speseConsegna = 0; return { ok: true }; }
+  const z = await calcolaZonaConsegna({
+    address: order.address,
+    lat: Number(order.lat), lng: Number(order.lng),
+    zonaDichiarata: order.zonaDichiarata
+  });
+  if (!z.ok) return z;
+
+  order.speseConsegna = z.spese;
+  order.distanzaKm = z.distanzaKm;
+  order.fuoriPaese = !!z.fuoriPaese;
+  order.zonaDaVerificare = !!z.daVerificare;
+
+  if (order.testoStampa) {
+    let riga = `Consegna a domicilio: +${money(z.spese)}`;
+    if (z.fuoriPaese) riga += ' (fuori paese)';
+    if (z.distanzaKm != null) riga += ` — ${String(z.distanzaKm).replace('.', ',')} km`;
+    if (z.daVerificare) riga += `\n⚠️ ZONA DA VERIFICARE: indirizzo non trovato, il cliente dice "${z.fuoriPaese ? 'fuori paese' : 'in paese'}"`;
+    order.testoStampa = order.testoStampa.replace(/Consegna a domicilio: \+[^\n]*/, riga);
+  }
+  return { ok: true };
+}
+
 // Ricalcola sconto/subtotale/totale in modo autorevole: non ci fidiamo mai dei valori
 // mandati dal sito, li ricalcoliamo sempre qui prima di stampare/salvare/far pagare.
 async function applyFirstOrderDiscount(order){
@@ -583,8 +690,15 @@ function isSlotInPast(dateStr, slot){
   return slotDate < minAllowed;
 }
 
+// giorno chiuso? Prima conta il calendario del titolare, poi il martedì di chiusura fisso
+function isClosedDate(dateStr){
+  if (calendario.chiusi.includes(dateStr)) return true;
+  if (calendario.aperti.includes(dateStr)) return false;
+  return new Date(dateStr + 'T00:00:00').getDay() === CLOSED_WEEKDAY;
+}
+
 // controlla che una data (stringa "YYYY-MM-DD") sia tra oggi e i prossimi
-// MAX_DAYS_AHEAD giorni, e che non cada di martedì (giorno di chiusura)
+// MAX_DAYS_AHEAD giorni, e che non sia un giorno di chiusura
 function isValidRequestDate(dateStr){
   if(!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return false;
   const today = new Date();
@@ -592,7 +706,7 @@ function isValidRequestDate(dateStr){
   const requested = new Date(dateStr + 'T00:00:00');
   const diffDays = Math.round((requested - today) / 86400000);
   if(diffDays < 0 || diffDays > MAX_DAYS_AHEAD) return false;
-  if(requested.getDay() === CLOSED_WEEKDAY) return false;
+  if(isClosedDate(dateStr)) return false;
   return true;
 }
 
@@ -879,6 +993,17 @@ app.post('/api/orders', async (req, res) => {
     });
   }
 
+  {
+    const giornoOrdine = (order.timing === 'orario' && order.dataRichiesta) ? order.dataRichiesta : dateKey(new Date());
+    if (isClosedDate(giornoOrdine)) {
+      return res.status(409).json({
+        ok: false,
+        error: 'giorno_chiuso',
+        message: 'Quel giorno siamo chiusi. Scegli un altro giorno tra quelli disponibili.'
+      });
+    }
+  }
+
   if (blockedPhonesCache.has(normalizePhone(order.phone))) {
     return res.status(403).json({
       ok: false,
@@ -897,6 +1022,9 @@ app.post('/api/orders', async (req, res) => {
       message: `L'ordine minimo per la consegna a domicilio è di €${MIN_DELIVERY_ORDER.toFixed(2).replace('.', ',')}.`
     });
   }
+
+  const zona = await applyDeliveryZone(order); // spese di consegna in base alla distanza
+  if (!zona.ok) return res.status(400).json(zona);
 
   await applyFirstOrderDiscount(order); // ricalcola sconto/subtotale/totale in modo autorevole
 
@@ -928,6 +1056,17 @@ app.post('/api/checkout/create-session', async (req, res) => {
     });
   }
 
+  {
+    const giornoOrdine = (order.timing === 'orario' && order.dataRichiesta) ? order.dataRichiesta : dateKey(new Date());
+    if (isClosedDate(giornoOrdine)) {
+      return res.status(409).json({
+        ok: false,
+        error: 'giorno_chiuso',
+        message: 'Quel giorno siamo chiusi. Scegli un altro giorno tra quelli disponibili.'
+      });
+    }
+  }
+
   if (blockedPhonesCache.has(normalizePhone(order.phone))) {
     return res.status(403).json({
       ok: false,
@@ -946,6 +1085,9 @@ app.post('/api/checkout/create-session', async (req, res) => {
       message: `L'ordine minimo per la consegna a domicilio è di €${MIN_DELIVERY_ORDER.toFixed(2).replace('.', ',')}.`
     });
   }
+
+  const zona = await applyDeliveryZone(order); // spese di consegna in base alla distanza
+  if (!zona.ok) return res.status(400).json(zona);
 
   await applyFirstOrderDiscount(order); // ricalcola sconto/subtotale/totale in modo autorevole
 
@@ -1284,6 +1426,35 @@ app.post('/api/orders-status/toggle', async (req, res) => {
   res.json({ ok: true, paused: ordersPaused });
 });
 
+// ---------- Endpoint: calendario aperture/chiusure (deciso dal titolare dal pannello) ----------
+function pulisciCalendario(){
+  const oggi = dateKey(new Date());
+  calendario.chiusi = [...new Set(calendario.chiusi)].filter(d => d >= oggi).sort();
+  calendario.aperti = [...new Set(calendario.aperti)].filter(d => d >= oggi).sort();
+}
+
+app.get('/api/calendario', (req, res) => {
+  pulisciCalendario();
+  res.json({ ...calendario, giornoChiusuraSettimanale: CLOSED_WEEKDAY });
+});
+
+// body: { data: "YYYY-MM-DD", chiuso: true|false }
+app.post('/api/calendario/giorno', async (req, res) => {
+  const { data, chiuso } = req.body || {};
+  if (!data || !/^\d{4}-\d{2}-\d{2}$/.test(data)) return res.status(400).json({ ok: false, error: 'Data non valida' });
+  calendario.chiusi = calendario.chiusi.filter(d => d !== data);
+  calendario.aperti = calendario.aperti.filter(d => d !== data);
+  const eMartedi = new Date(data + 'T00:00:00').getDay() === CLOSED_WEEKDAY;
+  if (chiuso && !eMartedi) calendario.chiusi.push(data);   // giorno di chiusura in più
+  if (!chiuso && eMartedi) calendario.aperti.push(data);   // martedì aperto eccezionalmente
+  pulisciCalendario();
+  if (settingsCollection) {
+    settingsCollection.updateOne({ _id: 'calendario' }, { $set: { value: calendario } }, { upsert: true })
+      .catch(err => console.error('Errore salvataggio calendario:', err));
+  }
+  res.json({ ok: true, ...calendario });
+});
+
 // ---------- Endpoint: statistiche per la dashboard (incassi e numero ordini) ----------
 // Costo ingredienti noto solo per questi piatti (vedi food-cost.md): finché non censiamo gli
 // altri piatti, il "guadagno netto" nella dashboard resta calcolato solo su questi.
@@ -1584,6 +1755,16 @@ app.get('/api/check-first-order-discount', async (req, res) => {
   res.json({ eligible, percentuale: eligible ? Math.round(SCONTO_PRIMO_ORDINE * 100) : 0 });
 });
 
+// ---------- Endpoint: preventivo spese di consegna per un indirizzo (usato dal sito) ----------
+app.get('/api/delivery-quote', async (req, res) => {
+  const z = await calcolaZonaConsegna({
+    address: String(req.query.address || ''),
+    lat: parseFloat(req.query.lat), lng: parseFloat(req.query.lng),
+    zonaDichiarata: req.query.zona || null
+  });
+  res.json({ ...z, raggioPaeseKm: RAGGIO_PAESE_KM, raggioMaxKm: RAGGIO_MAX_KM, speseBase: SPESE_CONSEGNA_BASE, sovrapprezzo: SOVRAPPREZZO_FUORI_PAESE });
+});
+
 // ---------- Endpoint: lista nera numeri di telefono ----------
 app.get('/api/blacklist', (req, res) => {
   res.json([...blockedPhonesCache]);
@@ -1689,6 +1870,164 @@ app.post('/api/orders/:numeroOrdine/in-consegna', (req, res) => {
   }
 
   res.json({ ok: true });
+});
+
+// =====================================================================
+//  JARVIS / PERSONALE: ristampa comande e ordini presi a voce (telefono, banco, tavolo)
+// =====================================================================
+// Facoltativo: impostando STAFF_KEY su Render, questi endpoint accettano solo chi manda
+// l'intestazione x-staff-key uguale (Jarvis la manda se ha la stessa chiave).
+const STAFF_KEY = process.env.STAFF_KEY || '';
+function staffOk(req){ return !STAFF_KEY || req.get('x-staff-key') === STAFF_KEY; }
+
+async function trovaOrdine(numeroOrdine){
+  let o = orderHistory.find(x => x.numeroOrdine === numeroOrdine);
+  if (!o && ordersCollection) { try { o = await ordersCollection.findOne({ numeroOrdine }); } catch (e) {} }
+  return o || null;
+}
+
+// Ristampa: il pannello di stampa riceve l'ordine e lo ristampa (non lo aggiunge di nuovo alla lista)
+app.post('/api/orders/:numeroOrdine/ristampa', async (req, res) => {
+  if (!staffOk(req)) return res.status(403).json({ ok: false, error: 'non autorizzato' });
+  const numeroOrdine = Number(req.params.numeroOrdine);
+  const order = await trovaOrdine(numeroOrdine);
+  if (!order) return res.status(404).json({ ok: false, error: 'Ordine non trovato' });
+  const { _id, ...pulito } = order;
+  broadcastOrder({ evento: 'ristampa', ordine: pulito });
+  res.json({ ok: true, numeroOrdine, pannelli: printClients.length });
+});
+
+// ---------- ricerca delle voci del menu per nome (come le dice una persona) ----------
+const normNome = s => String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+  .replace(/&/g, ' e ').replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim()
+  .replace(/\bquattro\b/g, '4').replace(/\bsette\b/g, '7').replace(/\bdieci\b/g, '10').replace(/\bwurstel\b/g, 'wurstel');
+function vociMenu(){
+  const out = [];
+  MENU_CATALOG.forEach(g => g.items.forEach(nome => out.push({ chiave: `${g.keyPrefix}|${nome}`, nome, cat: g.cat, prefisso: g.keyPrefix })));
+  customMenuItemsCache.forEach(i => out.push({ chiave: `${i.cat}|${i.nome}`, nome: i.nome, cat: i.cat, prefisso: i.cat, prezzoCustom: i.prezzo }));
+  return out;
+}
+function trovaVoce(nome, categoria, prefissoExtra){
+  const q = normNome(nome);
+  if (!q) return null;
+  let voci = vociMenu().filter(v => prefissoExtra ? v.prefisso === prefissoExtra : !String(v.prefisso).startsWith('EXTRA_'));
+  const qc = normNome(categoria);
+  if (qc) { const f = voci.filter(v => normNome(v.cat).includes(qc) || qc.includes(normNome(v.prefisso))); if (f.length) voci = f; }
+  const n = v => normNome(v.nome);
+  const senzaPizza = q.replace(/^pizza /, '');
+  return voci.find(v => n(v) === q) || voci.find(v => n(v) === senzaPizza) || voci.find(v => n(v) === 'pizza ' + senzaPizza)
+    || voci.find(v => n(v).startsWith(q)) || voci.find(v => n(v).split(' ').includes(senzaPizza))
+    || voci.find(v => n(v).includes(q)) || voci.find(v => n(v).length > 3 && q.includes(n(v)))
+    || voci.find(v => { const t = n(v).split(' '); return senzaPizza.split(' ').filter(w => w.length > 1 && w !== 'e' && w !== 'di').every(w => t.some(x => x.startsWith(w))); })
+    || null;
+}
+function prezzoVoce(v){
+  const p = getCurrentPrice(v.chiave);
+  return p !== null && p !== undefined && Number.isFinite(Number(p)) ? Number(p) : (Number(v.prezzoCustom) || 0);
+}
+
+// Ordine interno (telefono, banco, tavolo): i prezzi li calcola il server dal menu.
+// Senza "conferma: true" restituisce solo l'anteprima (nulla viene creato né stampato).
+app.post('/api/orders/interno', async (req, res) => {
+  if (!staffOk(req)) return res.status(403).json({ ok: false, error: 'non autorizzato' });
+  const b = req.body || {};
+  const righe = Array.isArray(b.articoli) ? b.articoli.slice(0, 60) : [];
+  if (!righe.length) return res.status(400).json({ ok: false, error: 'Nessun articolo' });
+
+  const nonTrovati = [], esauriti = [], articoli = [];
+  let subtotale = 0;
+  for (const r of righe) {
+    const voce = trovaVoce(r.nome, r.categoria);
+    if (!voce) { nonTrovati.push(String(r.nome || '')); continue; }
+    const qty = Math.max(1, Math.min(50, parseInt(r.qty, 10) || 1));
+    let unit = prezzoVoce(voce);
+    const dettagli = [];
+    const prefExtra = /pizza|focacc/i.test(voce.prefisso + ' ' + voce.cat) ? 'EXTRA_PIZZA' : 'EXTRA_PANINO';
+    for (const e of (Array.isArray(r.aggiunte) ? r.aggiunte : [])) {
+      const ve = trovaVoce(e, '', prefExtra);
+      if (!ve) { nonTrovati.push(`aggiunta «${e}» per ${voce.nome}`); continue; }
+      const pe = prezzoVoce(ve); unit += pe;
+      dettagli.push(`+ ${ve.nome} (${money(pe)})`);
+    }
+    for (const s of (Array.isArray(r.senza) ? r.senza : [])) dettagli.push(`Senza: ${s}`);
+    if (r.pane) dettagli.push(`Pane: ${String(r.pane).slice(0, 40)}`);
+    if (r.note) dettagli.push(String(r.note).slice(0, 120));
+    if (soldOutCache.has(voce.chiave)) esauriti.push(voce.nome);
+    const prezzo = round2(unit * qty);
+    subtotale += prezzo;
+    articoli.push({ qty, nome: voce.nome, prezzo, dettagli, chiave: voce.chiave });
+  }
+  if (nonTrovati.length) {
+    return res.status(422).json({ ok: false, error: 'voci_non_trovate', non_trovati: nonTrovati,
+      message: 'Non trovo nel menu: ' + nonTrovati.join(', ') });
+  }
+
+  const modalita = ['consegna', 'tavolo'].includes(b.modalita) ? b.modalita : 'ritiro';
+  subtotale = round2(subtotale);
+  // spese di consegna: calcolate dalla distanza come per il sito (si possono forzare con speseConsegna)
+  let spese = 0, zonaInfo = null;
+  if (modalita === 'consegna' && b.indirizzo) {
+    if (b.speseConsegna != null && b.speseConsegna !== '') spese = round2(Number(b.speseConsegna) || 0);
+    else {
+      zonaInfo = await calcolaZonaConsegna({ address: String(b.indirizzo), zonaDichiarata: b.fuoriPaese === true ? 'fuori' : b.fuoriPaese === false ? 'paese' : null });
+      if (!zonaInfo.ok) return res.status(400).json(zonaInfo);
+      spese = round2(Number(zonaInfo.spese) || 0);
+    }
+  }
+  const orario = /^\d{1,2}:\d{2}$/.test(String(b.orario || '')) ? String(b.orario).padStart(5, '0') : '';
+  const nome = String(b.nome || (modalita === 'tavolo' ? `Tavolo ${b.tavolo || ''}` : 'Cliente')).slice(0, 60);
+  const fonte = String(b.fonte || 'jarvis').slice(0, 20);
+  const etichettaFonte = modalita === 'tavolo' ? 'TAVOLO' : fonte === 'banco' ? 'BANCO' : 'TELEFONO';
+
+  if (modalita === 'consegna' && !b.indirizzo) return res.status(400).json({ ok: false, error: 'manca_indirizzo', message: "Per la consegna serve l'indirizzo." });
+
+  const anteprima = {
+    modalita, nome, tavolo: modalita === 'tavolo' ? String(b.tavolo || '') : '', orario: orario || 'il prima possibile',
+    articoli: articoli.map(a => ({ qty: a.qty, nome: a.nome, prezzo: a.prezzo, dettagli: a.dettagli })),
+    subtotale, speseConsegna: spese, totale: round2(subtotale + spese), esauriti,
+    zona: zonaInfo ? { distanzaKm: zonaInfo.distanzaKm ?? null, fuoriPaese: !!zonaInfo.fuoriPaese, daVerificare: !!zonaInfo.daVerificare, chiediZona: !!zonaInfo.chiediZona } : null,
+  };
+  if (!b.conferma) return res.json({ ok: true, anteprima: true, ...anteprima });
+
+  const sep = '------------------------------';
+  let testo = `ORDINE ${etichettaFonte} — LA CASA DI CARTA\n${sep}\n`;
+  testo += `Modalità: ${modalita === 'consegna' ? 'Consegna a domicilio' : modalita === 'tavolo' ? 'Al tavolo ' + (b.tavolo || '') : 'Ritiro in sede'}\n`;
+  testo += `Orario richiesto: ${orario ? 'Alle ' + orario : (modalita === 'tavolo' ? 'Subito' : 'Il prima possibile')}\n`;
+  testo += `Nome: ${nome}\n`;
+  if (b.telefono) testo += `Telefono: ${b.telefono}\n`;
+  if (modalita === 'consegna') {
+    testo += `Indirizzo: ${b.indirizzo}\n`;
+    if (zonaInfo && zonaInfo.distanzaKm != null) testo += `Distanza: ${String(zonaInfo.distanzaKm).replace('.', ',')} km${zonaInfo.fuoriPaese ? ' (fuori paese)' : ''}\n`;
+    if (zonaInfo && zonaInfo.daVerificare) testo += `⚠️ ZONA DA VERIFICARE: indirizzo non trovato sulla mappa\n`;
+  }
+  testo += `${sep}\n`;
+  articoli.forEach(a => { testo += `${a.qty}x ${a.nome}  ${money(a.prezzo)}\n`; a.dettagli.forEach(d => { testo += `   ${d}\n`; }); });
+  testo += `${sep}\nSubtotale: ${money(subtotale)}\n`;
+  if (spese) testo += `Spese di consegna: ${money(spese)}\n`;
+  testo += `Totale: ${money(subtotale + spese)}\n`;
+  if (b.note) testo += `Note: ${b.note}\n`;
+
+  const order = {
+    fonte, interno: true, modalita, numeroTavolo: modalita === 'tavolo' ? String(b.tavolo || '') : undefined,
+    nome, name: nome, phone: String(b.telefono || ''), address: modalita === 'consegna' ? String(b.indirizzo) : '',
+    note: String(b.note || '').slice(0, 300), articoli, subtotaleBase: subtotale, scontoPrimoOrdine: 0, subtotale,
+    speseConsegna: spese, grandTotal: round2(subtotale + spese), pagamento: b.pagamento === 'carta' ? 'carta' : 'contanti',
+    timing: orario ? 'orario' : 'prima', orarioRichiesto: orario || undefined, testoStampa: testo,
+    oggettoEmail: `Nuovo ordine (${etichettaFonte.toLowerCase()}) — ${nome}`,
+    distanzaKm: zonaInfo ? zonaInfo.distanzaKm : undefined, fuoriPaese: zonaInfo ? !!zonaInfo.fuoriPaese : undefined,
+    zonaDaVerificare: zonaInfo ? !!zonaInfo.daVerificare : undefined,
+  };
+
+  if (modalita === 'consegna' && !b.forza) {
+    const slot = await assignDeliverySlotIfNeeded(order);
+    if (!slot.ok) return res.status(409).json(slot);
+  } else {
+    order.orarioLabel = modalita === 'tavolo' ? (orario ? `Tavolo ${b.tavolo || ''} · alle ${orario}` : `Tavolo ${b.tavolo || ''}`) : orario ? `Alle ${orario}` : 'Il prima possibile';
+  }
+
+  order.pagatoOnline = false;
+  await finalizeOrder(order, null);
+  res.json({ ok: true, numeroOrdine: order.numeroOrdine, totale: order.grandTotal, orario: order.orarioLabel, pannelli: printClients.length, esauriti });
 });
 
 // ---------- Resoconto giornaliero via email (ogni giorno alle 23:30, ora italiana) ----------
