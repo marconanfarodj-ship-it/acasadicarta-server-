@@ -55,6 +55,8 @@ const JWT_SECRET = process.env.JWT_SECRET || "cambia-questa-chiave-segreta";
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
 const SITE_URL = process.env.SITE_URL || "https://ordini.pizzerialacasadicarta.it";
+// password dell'app Titolare (incassi): si imposta SOLO su Render, mai scritta nel codice
+const TITOLARE_PASSWORD = process.env.TITOLARE_PASSWORD || "";
 // cambia ogni volta che il server si riavvia: serve per far capire alle app di posta
 // (soprattutto Mail su iPhone) che il logo è "nuovo" quando lo aggiorniamo
 const ASSET_VERSION = Date.now();
@@ -1617,7 +1619,7 @@ app.post('/api/orders/segna-stampato', async (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/dashboard-stats', async (req, res) => {
+app.get('/api/dashboard-stats', soloTitolare, async (req, res) => {
   const vuoto = { incasso: 0, ordini: 0 };
   if (!ordersCollection) {
     return res.json({ today: vuoto, week: vuoto, month: vuoto, daily: [], periods: {}, peakHours: [] });
@@ -2044,6 +2046,10 @@ app.post('/api/staff/comande', async (req, res) => {
   try {
     const info = infoComandaDaBody(req.body || {});
     if (info.tipo === 'tavolo' && !info.tavolo) return res.status(400).json({ ok: false, error: 'Scrivi il numero del tavolo' });
+    if (info.tipo === 'tavolo') {
+      const giaAperta = (await comandeList({ stato: 'aperta' })).find(c => c.tipo === 'tavolo' && c.tavolo === info.tavolo);
+      if (giaAperta) return res.json({ ok: true, esistente: true, comanda: { ...giaAperta, totale: totaleComanda(giaAperta) } });
+    }
     const giorno = dateKey(new Date());
     const diOggi = await comandeList({ giorno });
     const numero = diOggi.reduce((m, c) => Math.max(m, c.numero || 0), 0) + 1;
@@ -2063,7 +2069,14 @@ app.put('/api/staff/comande/:id', async (req, res) => {
   if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
   const b = req.body || {};
   if (Array.isArray(b.righe)) c.righe = normalizzaRighe(b.righe);
-  if (b.info) Object.assign(c, infoComandaDaBody(b.info, c));
+  if (b.info) {
+    const info = infoComandaDaBody(b.info, c);
+    if (info.tipo === 'tavolo' && info.tavolo !== c.tavolo) {
+      const occupato = (await comandeList({ stato: 'aperta' })).find(x => x._id !== c._id && x.tipo === 'tavolo' && x.tavolo === info.tavolo);
+      if (occupato) return res.status(409).json({ ok: false, error: `Il tavolo ${info.tavolo} è già occupato` });
+    }
+    Object.assign(c, info);
+  }
   await comandaSave(c);
   res.json({ ok: true, comanda: { ...c, totale: totaleComanda(c) } });
 });
@@ -2134,6 +2147,90 @@ app.post('/api/staff/comande/:id/annulla', async (req, res) => {
   c.stato = 'annullata';
   await comandaSave(c);
   res.json({ ok: true });
+});
+
+// ---------- Accesso Titolare: password controllata dal server ----------
+const cryptoTit = require('crypto');
+function tokenTitolare(){
+  // il "pass" dura finché non cambi la password su Render: cambiandola, tutti i telefoni devono rientrare
+  return cryptoTit.createHmac('sha256', JWT_SECRET).update('titolare:' + TITOLARE_PASSWORD).digest('hex');
+}
+function uguali(a, b){
+  const x = Buffer.from(String(a)), y = Buffer.from(String(b));
+  return x.length === y.length && cryptoTit.timingSafeEqual(x, y);
+}
+function soloTitolare(req, res, next){
+  if (!TITOLARE_PASSWORD) return res.status(503).json({ ok: false, error: 'password_non_impostata' });
+  const t = req.get('x-titolare-token') || '';
+  if (!t || !uguali(t, tokenTitolare())) return res.status(401).json({ ok: false, error: 'accesso_negato' });
+  next();
+}
+const tentativiLogin = new Map(); // ip -> { n, dal }
+app.post('/api/titolare/login', (req, res) => {
+  if (!TITOLARE_PASSWORD) return res.status(503).json({ ok: false, error: 'La password non è ancora impostata sul server (TITOLARE_PASSWORD su Render).' });
+  const ip = req.ip || 'x';
+  const t = tentativiLogin.get(ip) || { n: 0, dal: Date.now() };
+  if (Date.now() - t.dal > 10 * 60 * 1000) { t.n = 0; t.dal = Date.now(); }
+  if (t.n >= 5) return res.status(429).json({ ok: false, error: 'Troppi tentativi. Riprova tra 10 minuti.' });
+  if (!uguali((req.body || {}).password || '', TITOLARE_PASSWORD)) {
+    t.n++; tentativiLogin.set(ip, t);
+    return res.status(401).json({ ok: false, error: 'Password sbagliata' });
+  }
+  tentativiLogin.delete(ip);
+  res.json({ ok: true, token: tokenTitolare() });
+});
+
+// statistiche delle comande dello staff (sala, banco, telefono) per la dashboard dell'app titolare
+app.get('/api/staff/stats', soloTitolare, async (req, res) => {
+  try {
+    const now = new Date();
+    const oggi = dateKey(now);
+    const dow = now.getDay();
+    const lunedi = new Date(now.getFullYear(), now.getMonth(), now.getDate() - (dow === 0 ? 6 : dow - 1));
+    const inizioSett = dateKey(lunedi);
+    const inizioMese = dateKey(new Date(now.getFullYear(), now.getMonth(), 1));
+    const da14 = dateKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 13));
+    const daQuando = da14 < inizioMese ? da14 : inizioMese;
+    const chiuse = await comandeList({ stato: 'chiusa', giorno: { $gte: daQuando } });
+
+    const vuoto = () => ({ incasso: 0, comande: 0, contanti: 0, carta: 0, tavoli: 0, asporto: 0, piatti: {} });
+    const per = { oggi: vuoto(), settimana: vuoto(), mese: vuoto() };
+    const giorni = {};
+    chiuse.forEach(c => {
+      const imp = Number(c.totaleIncassato) || 0;
+      giorni[c.giorno] = (giorni[c.giorno] || 0) + imp;
+      const dove = [];
+      if (c.giorno === oggi) dove.push(per.oggi);
+      if (c.giorno >= inizioSett) dove.push(per.settimana);
+      if (c.giorno >= inizioMese) dove.push(per.mese);
+      dove.forEach(a => {
+        a.incasso += imp; a.comande++;
+        if (c.pagamento === 'carta') a.carta += imp; else a.contanti += imp;
+        if (c.tipo === 'tavolo') a.tavoli++; else a.asporto++;
+        (c.righe || []).forEach(r => {
+          if (!a.piatti[r.nome]) a.piatti[r.nome] = { qty: 0, incasso: 0 };
+          a.piatti[r.nome].qty += r.qty;
+          a.piatti[r.nome].incasso += r.prezzo * r.qty;
+        });
+      });
+    });
+    const fine = a => ({
+      incasso: round2(a.incasso), comande: a.comande, contanti: round2(a.contanti), carta: round2(a.carta),
+      tavoli: a.tavoli, asporto: a.asporto, medio: a.comande ? round2(a.incasso / a.comande) : 0,
+      top: Object.entries(a.piatti).map(([nome, v]) => ({ nome, qty: v.qty, incasso: round2(v.incasso) }))
+        .sort((x, y) => y.qty - x.qty).slice(0, 8)
+    });
+    const ultimi14 = [];
+    for (let i = 13; i >= 0; i--) {
+      const k = dateKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - i));
+      ultimi14.push({ data: k, incasso: round2(giorni[k] || 0) });
+    }
+    const aperte = await comandeList({ stato: 'aperta' });
+    res.json({
+      oggi: fine(per.oggi), settimana: fine(per.settimana), mese: fine(per.mese), ultimi14,
+      aperte: { numero: aperte.length, totale: round2(aperte.reduce((t, c) => t + totaleComanda(c) + (c.spese || 0), 0)) }
+    });
+  } catch (err) { console.error('Errore statistiche staff:', err); res.status(500).json({ ok: false, error: 'Errore server' }); }
 });
 
 // listino per l'app staff: categorie, voci con prezzo attuale ed esauriti
