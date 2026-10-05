@@ -78,6 +78,8 @@ let ordersPaused = false; // interruttore manuale: se true, il sito rifiuta ogni
 // calendario deciso dal titolare dal pannello: giorni di chiusura in più e martedì eccezionalmente aperti
 let calendario = { chiusi: [], aperti: [] }; // date "YYYY-MM-DD"
 let settingsCollection = null;
+let comandeCollection = null;   // comande dell'app staff (sala, banco, telefono)
+let comandeMemoria = {};        // riserva in memoria se il database non è disponibile
 
 // prezzi di partenza di ogni voce del menu (chiave uguale a quella usata per gli esauriti);
 // quando il titolare modifica un prezzo dal pannello, il nuovo valore viene salvato in
@@ -136,6 +138,8 @@ async function connectDB(){
     // all'avvio carichiamo solo l'elenco delle chiavi con foto (leggero); l'immagine vera si scarica
     // una alla volta quando serve, tramite /api/product-photos/img/:chiave
     photoDocs.forEach(d => { productPhotosCache[d._id] = true; });
+    comandeCollection = db.collection('comandeStaff');
+    await comandeCollection.createIndex({ stato: 1, aggiornataAlle: -1 });
     customMenuItemsCollection = db.collection('customMenuItems');
     customMenuItemsCache = await customMenuItemsCollection.find({}).toArray();
     console.log('Connesso a MongoDB Atlas.');
@@ -283,7 +287,7 @@ function buildOwnerOrderHtml(order) {
       </tr>`;
   }).join('');
 
-  const modalitaLabel = order.modalita === 'consegna' ? '🛵 Consegna a domicilio' : order.modalita === 'tavolo' ? `🪑 Tavolo ${esc(order.numeroTavolo || '')}` : '🏠 Ritiro in sede';
+  const modalitaLabel = order.modalita === 'consegna' ? '🛵 Consegna a domicilio' : '🏠 Ritiro in sede';
   const rigaIndirizzo = order.modalita === 'consegna' && order.address
     ? `<tr><td style="padding:4px 0;color:#8a8a8a;">Indirizzo</td><td style="padding:4px 0;text-align:right;color:#222;">${esc(order.address)}</td></tr>`
     : '';
@@ -293,7 +297,7 @@ function buildOwnerOrderHtml(order) {
   const rigaSconto = order.scontoPrimoOrdine
     ? `<tr><td style="padding:4px 0;color:#1a9c4a;">🎉 Sconto primo ordine</td><td style="padding:4px 0;text-align:right;color:#1a9c4a;font-weight:700;">-${money(order.scontoPrimoOrdine)}</td></tr>`
     : '';
-  const pagamentoLabel = order.pagatoOnline ? '✅ Pagato online' : order.modalita === 'tavolo' ? '🪑 Da pagare al tavolo' : '⏳ Da riscuotere alla consegna/ritiro';
+  const pagamentoLabel = order.pagatoOnline ? '✅ Pagato online' : '⏳ Da riscuotere alla consegna/ritiro';
   const rigaPagamento = `<tr><td style="padding:2px 0;color:#8a8a8a;">Pagamento</td><td style="padding:2px 0;text-align:right;color:${order.pagatoOnline ? '#1a9c4a' : '#c1382b'};font-weight:700;">${pagamentoLabel}</td></tr>`;
   const rigaTelefono = order.phone
     ? `<tr><td style="padding:2px 0;color:#8a8a8a;">Telefono</td><td style="padding:2px 0;text-align:right;color:#222;">${esc(order.phone)}</td></tr>`
@@ -371,7 +375,7 @@ function buildCustomerConfirmationHtml(order) {
       </tr>`;
   }).join('');
 
-  const modalitaLabel = order.modalita === 'consegna' ? 'Consegna a domicilio' : order.modalita === 'tavolo' ? `Tavolo ${esc(order.numeroTavolo || '')}` : 'Ritiro in sede';
+  const modalitaLabel = order.modalita === 'consegna' ? 'Consegna a domicilio' : 'Ritiro in sede';
   const rigaIndirizzo = order.modalita === 'consegna' && order.address
     ? `<tr><td style="padding:4px 0;color:#8a8a8a;">Indirizzo</td><td style="padding:4px 0;text-align:right;color:#222;">${esc(order.address)}</td></tr>`
     : '';
@@ -1765,6 +1769,275 @@ app.get('/api/delivery-quote', async (req, res) => {
   res.json({ ...z, raggioPaeseKm: RAGGIO_PAESE_KM, raggioMaxKm: RAGGIO_MAX_KM, speseBase: SPESE_CONSEGNA_BASE, sovrapprezzo: SOVRAPPREZZO_FUORI_PAESE });
 });
 
+// =====================================================================
+// ---------- APP STAFF: comande salvate, modificabili, conto ----------
+// =====================================================================
+const crypto = require('crypto');
+
+async function comandaGet(id){
+  if (comandeCollection) return await comandeCollection.findOne({ _id: id });
+  return comandeMemoria[id] || null;
+}
+async function comandaSave(c){
+  c.aggiornataAlle = new Date().toISOString();
+  if (comandeCollection) await comandeCollection.replaceOne({ _id: c._id }, c, { upsert: true });
+  else comandeMemoria[c._id] = c;
+  return c;
+}
+async function comandeList(filtro){
+  if (comandeCollection) return await comandeCollection.find(filtro).sort({ creataAlle: -1 }).limit(200).toArray();
+  return Object.values(comandeMemoria).filter(c => Object.entries(filtro).every(([k, v]) => {
+    if (v && typeof v === 'object' && v.$gte) return c[k] >= v.$gte;
+    return c[k] === v;
+  })).sort((a, b) => b.creataAlle.localeCompare(a.creataAlle));
+}
+
+function oraIT(d = new Date()){
+  return d.toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Rome' });
+}
+function etichettaComanda(c){
+  if (c.tipo === 'tavolo') return `TAVOLO ${c.tavolo}`;
+  if (c.tipo === 'consegna') return `CONSEGNA S${c.numero}`;
+  return `ASPORTO S${c.numero}`;
+}
+
+// pulisce le righe mandate dall'app e mette il prezzo giusto preso dal listino del server
+function normalizzaRighe(righe){
+  if (!Array.isArray(righe)) return [];
+  return righe.slice(0, 300).map(r => {
+    const chiave = String(r.chiave || '');
+    const listino = getCurrentPrice(chiave);
+    const prezzo = listino != null ? listino : Math.max(0, Number(r.prezzo) || 0); // voci libere: prezzo scritto dallo staff
+    return {
+      rid: String(r.rid || crypto.randomUUID()),
+      chiave,
+      nome: String(r.nome || '').slice(0, 120),
+      cat: String(r.cat || '').slice(0, 80),
+      qty: Math.max(0, Math.min(99, parseInt(r.qty, 10) || 0)),
+      note: String(r.note || '').slice(0, 200),
+      prezzo: round2(prezzo)
+    };
+  }).filter(r => r.nome && r.qty > 0);
+}
+
+function totaleComanda(c){
+  return round2((c.righe || []).reduce((t, r) => t + r.prezzo * r.qty, 0));
+}
+
+// differenze tra quanto già mandato in cucina e la comanda attuale
+function diffComanda(inviate, righe){
+  const prima = new Map((inviate || []).map(r => [r.rid, r]));
+  const dopo = new Map((righe || []).map(r => [r.rid, r]));
+  const aggiunte = [], tolte = [], note = [];
+  dopo.forEach((r, rid) => {
+    const p = prima.get(rid);
+    if (!p) aggiunte.push({ ...r });
+    else {
+      if (r.qty > p.qty) aggiunte.push({ ...r, qty: r.qty - p.qty });
+      if (r.qty < p.qty) tolte.push({ ...r, qty: p.qty - r.qty });
+      if ((r.note || '') !== (p.note || '')) note.push(r);
+    }
+  });
+  prima.forEach((p, rid) => { if (!dopo.has(rid)) tolte.push({ ...p }); });
+  return { aggiunte, tolte, note };
+}
+
+function testoComandaCucina(c, diff, primaVolta){
+  const L = [];
+  L.push('================================');
+  L.push(etichettaComanda(c));
+  if (c.nome) L.push(`Cliente: ${c.nome}`);
+  if (c.tipo === 'consegna' && c.indirizzo) L.push(`Indirizzo: ${c.indirizzo}`);
+  if (c.telefono && c.tipo !== 'tavolo') L.push(`Tel: ${c.telefono}`);
+  if (c.orario) L.push(`Per le ore: ${c.orario}`);
+  L.push(primaVolta ? `NUOVA COMANDA - ore ${oraIT()}` : `*** MODIFICA n.${c.invii} - ore ${oraIT()} ***`);
+  L.push('================================');
+  if (diff.aggiunte.length){
+    if (!primaVolta) L.push('AGGIUNGERE:');
+    diff.aggiunte.forEach(r => {
+      L.push(`${primaVolta ? '' : '+ '}${r.qty}x ${r.nome}`);
+      if (r.note) L.push(`   >> ${r.note}`);
+    });
+  }
+  if (diff.tolte.length){
+    if (diff.aggiunte.length) L.push('');
+    L.push('TOGLIERE:');
+    diff.tolte.forEach(r => L.push(`- ${r.qty}x ${r.nome}`));
+  }
+  if (diff.note.length){
+    if (diff.aggiunte.length || diff.tolte.length) L.push('');
+    L.push('NOTE CAMBIATE:');
+    diff.note.forEach(r => L.push(`* ${r.nome}: ${r.note || '(nessuna nota)'}`));
+  }
+  if (primaVolta && c.noteComanda) { L.push(''); L.push(`NOTE: ${c.noteComanda}`); }
+  L.push('================================');
+  return L.join('\n');
+}
+
+function testoConto(c){
+  const L = [];
+  L.push('PIZZERIA LA CASA DI CARTA');
+  L.push('Via XX Settembre 192 - Niscemi');
+  L.push('--------------------------------');
+  L.push(`${etichettaComanda(c)} - ${oraIT()}`);
+  L.push('PRECONTO (non fiscale)');
+  L.push('--------------------------------');
+  (c.righe || []).forEach(r => L.push(`${r.qty}x ${r.nome}  ${money(r.prezzo * r.qty)}`));
+  L.push('--------------------------------');
+  if (c.spese) L.push(`Consegna: ${money(c.spese)}`);
+  L.push(`TOTALE: ${money(totaleComanda(c) + (c.spese || 0))}`);
+  return L.join('\n');
+}
+
+function stampaStaff(testo, rif){
+  broadcastOrder({ evento: 'stampa_staff', testoStampa: testo, rif });
+}
+
+function infoComandaDaBody(b, c){
+  const tipo = ['tavolo', 'asporto', 'consegna'].includes(b.tipo) ? b.tipo : (c && c.tipo) || 'tavolo';
+  return {
+    tipo,
+    tavolo: tipo === 'tavolo' ? String(b.tavolo || '').slice(0, 10) : '',
+    nome: String(b.nome || '').slice(0, 80),
+    telefono: String(b.telefono || '').slice(0, 30),
+    indirizzo: tipo === 'consegna' ? String(b.indirizzo || '').slice(0, 200) : '',
+    orario: String(b.orario || '').slice(0, 10),
+    noteComanda: String(b.noteComanda || '').slice(0, 300),
+    spese: tipo === 'consegna' ? Math.max(0, Number(b.spese) || 0) : 0
+  };
+}
+
+// elenco: aperte, oppure chiuse di oggi
+app.get('/api/staff/comande', async (req, res) => {
+  try {
+    const stato = req.query.stato === 'chiusa' ? 'chiusa' : 'aperta';
+    const filtro = stato === 'aperta' ? { stato: 'aperta' } : { stato: 'chiusa', giorno: dateKey(new Date()) };
+    const lista = await comandeList(filtro);
+    res.json(lista.map(c => ({ ...c, totale: totaleComanda(c) })));
+  } catch (err) { console.error(err); res.status(500).json({ ok: false, error: 'Errore server' }); }
+});
+
+app.get('/api/staff/comande/:id', async (req, res) => {
+  const c = await comandaGet(req.params.id);
+  if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
+  res.json({ ...c, totale: totaleComanda(c) });
+});
+
+// nuova comanda
+app.post('/api/staff/comande', async (req, res) => {
+  try {
+    const info = infoComandaDaBody(req.body || {});
+    if (info.tipo === 'tavolo' && !info.tavolo) return res.status(400).json({ ok: false, error: 'Scrivi il numero del tavolo' });
+    const giorno = dateKey(new Date());
+    const diOggi = await comandeList({ giorno });
+    const numero = diOggi.reduce((m, c) => Math.max(m, c.numero || 0), 0) + 1;
+    const c = {
+      _id: crypto.randomUUID(), numero, giorno, ...info,
+      righe: [], inviate: [], invii: 0, stato: 'aperta',
+      creataAlle: new Date().toISOString()
+    };
+    await comandaSave(c);
+    res.json({ ok: true, comanda: { ...c, totale: 0 } });
+  } catch (err) { console.error(err); res.status(500).json({ ok: false, error: 'Errore server' }); }
+});
+
+// salva (senza stampare) righe e/o dati della comanda
+app.put('/api/staff/comande/:id', async (req, res) => {
+  const c = await comandaGet(req.params.id);
+  if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
+  const b = req.body || {};
+  if (Array.isArray(b.righe)) c.righe = normalizzaRighe(b.righe);
+  if (b.info) Object.assign(c, infoComandaDaBody(b.info, c));
+  await comandaSave(c);
+  res.json({ ok: true, comanda: { ...c, totale: totaleComanda(c) } });
+});
+
+// manda in cucina: stampa solo le differenze rispetto all'ultimo invio
+app.post('/api/staff/comande/:id/invia', async (req, res) => {
+  const c = await comandaGet(req.params.id);
+  if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
+  if (Array.isArray((req.body || {}).righe)) c.righe = normalizzaRighe(req.body.righe);
+  const diff = diffComanda(c.inviate, c.righe);
+  if (!diff.aggiunte.length && !diff.tolte.length && !diff.note.length) {
+    return res.json({ ok: true, nienteDaInviare: true, comanda: { ...c, totale: totaleComanda(c) } });
+  }
+  const primaVolta = c.invii === 0;
+  c.invii += 1;
+  stampaStaff(testoComandaCucina(c, diff, primaVolta), `${etichettaComanda(c)} #${c.invii}`);
+  c.inviate = c.righe.map(r => ({ ...r }));
+  c.ultimoInvio = new Date().toISOString();
+  await comandaSave(c);
+  res.json({ ok: true, comanda: { ...c, totale: totaleComanda(c) } });
+});
+
+app.post('/api/staff/comande/:id/ristampa', async (req, res) => {
+  const c = await comandaGet(req.params.id);
+  if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
+  if (!c.invii) return res.status(400).json({ ok: false, error: 'Non è ancora stata mandata in cucina' });
+  const testo = testoComandaCucina(c, { aggiunte: c.inviate || [], tolte: [], note: [] }, true)
+    .replace(/NUOVA COMANDA - ore/, 'RISTAMPA COMPLETA - ore');
+  stampaStaff(testo, `Ristampa ${etichettaComanda(c)}`);
+  res.json({ ok: true });
+});
+
+app.post('/api/staff/comande/:id/conto', async (req, res) => {
+  const c = await comandaGet(req.params.id);
+  if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
+  stampaStaff(testoConto(c), `Conto ${etichettaComanda(c)}`);
+  res.json({ ok: true });
+});
+
+app.post('/api/staff/comande/:id/chiudi', async (req, res) => {
+  const c = await comandaGet(req.params.id);
+  if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
+  const pagamento = ['contanti', 'carta'].includes((req.body || {}).pagamento) ? req.body.pagamento : 'contanti';
+  c.stato = 'chiusa';
+  c.pagamento = pagamento;
+  c.totaleIncassato = round2(totaleComanda(c) + (c.spese || 0));
+  c.chiusaAlle = new Date().toISOString();
+  await comandaSave(c);
+  res.json({ ok: true });
+});
+
+app.post('/api/staff/comande/:id/riapri', async (req, res) => {
+  const c = await comandaGet(req.params.id);
+  if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
+  c.stato = 'aperta';
+  delete c.pagamento; delete c.totaleIncassato; delete c.chiusaAlle;
+  await comandaSave(c);
+  res.json({ ok: true, comanda: { ...c, totale: totaleComanda(c) } });
+});
+
+// annulla: se qualcosa era già in cucina, stampa l'avviso di annullamento
+app.post('/api/staff/comande/:id/annulla', async (req, res) => {
+  const c = await comandaGet(req.params.id);
+  if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
+  if (c.invii > 0) {
+    stampaStaff(['================================', etichettaComanda(c), `*** COMANDA ANNULLATA - ore ${oraIT()} ***`, 'Non preparare nulla di questa comanda', '================================'].join('\n'), `Annullata ${etichettaComanda(c)}`);
+  }
+  c.stato = 'annullata';
+  await comandaSave(c);
+  res.json({ ok: true });
+});
+
+// listino per l'app staff: categorie, voci con prezzo attuale ed esauriti
+app.get('/api/staff/menu', (req, res) => {
+  const categorie = MENU_CATALOG.map(g => ({ cat: g.cat, keyPrefix: g.keyPrefix, items: [...g.items] }));
+  customMenuItemsCache.forEach(item => {
+    let g = categorie.find(x => x.cat === item.cat && !String(x.keyPrefix).startsWith('EXTRA_'));
+    if (!g) { g = { cat: item.cat, keyPrefix: item.cat, items: [] }; categorie.push(g); }
+    if (!g.items.includes(item.nome)) g.items.push(item.nome);
+  });
+  res.json(categorie.map(g => ({
+    cat: g.cat,
+    extra: String(g.keyPrefix).startsWith('EXTRA_'),
+    items: g.items.map(nome => {
+      const chiave = `${g.keyPrefix}|${nome}`;
+      return { nome, chiave, prezzo: getCurrentPrice(chiave), esaurito: soldOutCache.has(chiave) };
+    })
+  })));
+});
+
 // ---------- Endpoint: lista nera numeri di telefono ----------
 app.get('/api/blacklist', (req, res) => {
   res.json([...blockedPhonesCache]);
@@ -1870,164 +2143,6 @@ app.post('/api/orders/:numeroOrdine/in-consegna', (req, res) => {
   }
 
   res.json({ ok: true });
-});
-
-// =====================================================================
-//  JARVIS / PERSONALE: ristampa comande e ordini presi a voce (telefono, banco, tavolo)
-// =====================================================================
-// Facoltativo: impostando STAFF_KEY su Render, questi endpoint accettano solo chi manda
-// l'intestazione x-staff-key uguale (Jarvis la manda se ha la stessa chiave).
-const STAFF_KEY = process.env.STAFF_KEY || '';
-function staffOk(req){ return !STAFF_KEY || req.get('x-staff-key') === STAFF_KEY; }
-
-async function trovaOrdine(numeroOrdine){
-  let o = orderHistory.find(x => x.numeroOrdine === numeroOrdine);
-  if (!o && ordersCollection) { try { o = await ordersCollection.findOne({ numeroOrdine }); } catch (e) {} }
-  return o || null;
-}
-
-// Ristampa: il pannello di stampa riceve l'ordine e lo ristampa (non lo aggiunge di nuovo alla lista)
-app.post('/api/orders/:numeroOrdine/ristampa', async (req, res) => {
-  if (!staffOk(req)) return res.status(403).json({ ok: false, error: 'non autorizzato' });
-  const numeroOrdine = Number(req.params.numeroOrdine);
-  const order = await trovaOrdine(numeroOrdine);
-  if (!order) return res.status(404).json({ ok: false, error: 'Ordine non trovato' });
-  const { _id, ...pulito } = order;
-  broadcastOrder({ evento: 'ristampa', ordine: pulito });
-  res.json({ ok: true, numeroOrdine, pannelli: printClients.length });
-});
-
-// ---------- ricerca delle voci del menu per nome (come le dice una persona) ----------
-const normNome = s => String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-  .replace(/&/g, ' e ').replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim()
-  .replace(/\bquattro\b/g, '4').replace(/\bsette\b/g, '7').replace(/\bdieci\b/g, '10').replace(/\bwurstel\b/g, 'wurstel');
-function vociMenu(){
-  const out = [];
-  MENU_CATALOG.forEach(g => g.items.forEach(nome => out.push({ chiave: `${g.keyPrefix}|${nome}`, nome, cat: g.cat, prefisso: g.keyPrefix })));
-  customMenuItemsCache.forEach(i => out.push({ chiave: `${i.cat}|${i.nome}`, nome: i.nome, cat: i.cat, prefisso: i.cat, prezzoCustom: i.prezzo }));
-  return out;
-}
-function trovaVoce(nome, categoria, prefissoExtra){
-  const q = normNome(nome);
-  if (!q) return null;
-  let voci = vociMenu().filter(v => prefissoExtra ? v.prefisso === prefissoExtra : !String(v.prefisso).startsWith('EXTRA_'));
-  const qc = normNome(categoria);
-  if (qc) { const f = voci.filter(v => normNome(v.cat).includes(qc) || qc.includes(normNome(v.prefisso))); if (f.length) voci = f; }
-  const n = v => normNome(v.nome);
-  const senzaPizza = q.replace(/^pizza /, '');
-  return voci.find(v => n(v) === q) || voci.find(v => n(v) === senzaPizza) || voci.find(v => n(v) === 'pizza ' + senzaPizza)
-    || voci.find(v => n(v).startsWith(q)) || voci.find(v => n(v).split(' ').includes(senzaPizza))
-    || voci.find(v => n(v).includes(q)) || voci.find(v => n(v).length > 3 && q.includes(n(v)))
-    || voci.find(v => { const t = n(v).split(' '); return senzaPizza.split(' ').filter(w => w.length > 1 && w !== 'e' && w !== 'di').every(w => t.some(x => x.startsWith(w))); })
-    || null;
-}
-function prezzoVoce(v){
-  const p = getCurrentPrice(v.chiave);
-  return p !== null && p !== undefined && Number.isFinite(Number(p)) ? Number(p) : (Number(v.prezzoCustom) || 0);
-}
-
-// Ordine interno (telefono, banco, tavolo): i prezzi li calcola il server dal menu.
-// Senza "conferma: true" restituisce solo l'anteprima (nulla viene creato né stampato).
-app.post('/api/orders/interno', async (req, res) => {
-  if (!staffOk(req)) return res.status(403).json({ ok: false, error: 'non autorizzato' });
-  const b = req.body || {};
-  const righe = Array.isArray(b.articoli) ? b.articoli.slice(0, 60) : [];
-  if (!righe.length) return res.status(400).json({ ok: false, error: 'Nessun articolo' });
-
-  const nonTrovati = [], esauriti = [], articoli = [];
-  let subtotale = 0;
-  for (const r of righe) {
-    const voce = trovaVoce(r.nome, r.categoria);
-    if (!voce) { nonTrovati.push(String(r.nome || '')); continue; }
-    const qty = Math.max(1, Math.min(50, parseInt(r.qty, 10) || 1));
-    let unit = prezzoVoce(voce);
-    const dettagli = [];
-    const prefExtra = /pizza|focacc/i.test(voce.prefisso + ' ' + voce.cat) ? 'EXTRA_PIZZA' : 'EXTRA_PANINO';
-    for (const e of (Array.isArray(r.aggiunte) ? r.aggiunte : [])) {
-      const ve = trovaVoce(e, '', prefExtra);
-      if (!ve) { nonTrovati.push(`aggiunta «${e}» per ${voce.nome}`); continue; }
-      const pe = prezzoVoce(ve); unit += pe;
-      dettagli.push(`+ ${ve.nome} (${money(pe)})`);
-    }
-    for (const s of (Array.isArray(r.senza) ? r.senza : [])) dettagli.push(`Senza: ${s}`);
-    if (r.pane) dettagli.push(`Pane: ${String(r.pane).slice(0, 40)}`);
-    if (r.note) dettagli.push(String(r.note).slice(0, 120));
-    if (soldOutCache.has(voce.chiave)) esauriti.push(voce.nome);
-    const prezzo = round2(unit * qty);
-    subtotale += prezzo;
-    articoli.push({ qty, nome: voce.nome, prezzo, dettagli, chiave: voce.chiave });
-  }
-  if (nonTrovati.length) {
-    return res.status(422).json({ ok: false, error: 'voci_non_trovate', non_trovati: nonTrovati,
-      message: 'Non trovo nel menu: ' + nonTrovati.join(', ') });
-  }
-
-  const modalita = ['consegna', 'tavolo'].includes(b.modalita) ? b.modalita : 'ritiro';
-  subtotale = round2(subtotale);
-  // spese di consegna: calcolate dalla distanza come per il sito (si possono forzare con speseConsegna)
-  let spese = 0, zonaInfo = null;
-  if (modalita === 'consegna' && b.indirizzo) {
-    if (b.speseConsegna != null && b.speseConsegna !== '') spese = round2(Number(b.speseConsegna) || 0);
-    else {
-      zonaInfo = await calcolaZonaConsegna({ address: String(b.indirizzo), zonaDichiarata: b.fuoriPaese === true ? 'fuori' : b.fuoriPaese === false ? 'paese' : null });
-      if (!zonaInfo.ok) return res.status(400).json(zonaInfo);
-      spese = round2(Number(zonaInfo.spese) || 0);
-    }
-  }
-  const orario = /^\d{1,2}:\d{2}$/.test(String(b.orario || '')) ? String(b.orario).padStart(5, '0') : '';
-  const nome = String(b.nome || (modalita === 'tavolo' ? `Tavolo ${b.tavolo || ''}` : 'Cliente')).slice(0, 60);
-  const fonte = String(b.fonte || 'jarvis').slice(0, 20);
-  const etichettaFonte = modalita === 'tavolo' ? 'TAVOLO' : fonte === 'banco' ? 'BANCO' : 'TELEFONO';
-
-  if (modalita === 'consegna' && !b.indirizzo) return res.status(400).json({ ok: false, error: 'manca_indirizzo', message: "Per la consegna serve l'indirizzo." });
-
-  const anteprima = {
-    modalita, nome, tavolo: modalita === 'tavolo' ? String(b.tavolo || '') : '', orario: orario || 'il prima possibile',
-    articoli: articoli.map(a => ({ qty: a.qty, nome: a.nome, prezzo: a.prezzo, dettagli: a.dettagli })),
-    subtotale, speseConsegna: spese, totale: round2(subtotale + spese), esauriti,
-    zona: zonaInfo ? { distanzaKm: zonaInfo.distanzaKm ?? null, fuoriPaese: !!zonaInfo.fuoriPaese, daVerificare: !!zonaInfo.daVerificare, chiediZona: !!zonaInfo.chiediZona } : null,
-  };
-  if (!b.conferma) return res.json({ ok: true, anteprima: true, ...anteprima });
-
-  const sep = '------------------------------';
-  let testo = `ORDINE ${etichettaFonte} — LA CASA DI CARTA\n${sep}\n`;
-  testo += `Modalità: ${modalita === 'consegna' ? 'Consegna a domicilio' : modalita === 'tavolo' ? 'Al tavolo ' + (b.tavolo || '') : 'Ritiro in sede'}\n`;
-  testo += `Orario richiesto: ${orario ? 'Alle ' + orario : (modalita === 'tavolo' ? 'Subito' : 'Il prima possibile')}\n`;
-  testo += `Nome: ${nome}\n`;
-  if (b.telefono) testo += `Telefono: ${b.telefono}\n`;
-  if (modalita === 'consegna') {
-    testo += `Indirizzo: ${b.indirizzo}\n`;
-    if (zonaInfo && zonaInfo.distanzaKm != null) testo += `Distanza: ${String(zonaInfo.distanzaKm).replace('.', ',')} km${zonaInfo.fuoriPaese ? ' (fuori paese)' : ''}\n`;
-    if (zonaInfo && zonaInfo.daVerificare) testo += `⚠️ ZONA DA VERIFICARE: indirizzo non trovato sulla mappa\n`;
-  }
-  testo += `${sep}\n`;
-  articoli.forEach(a => { testo += `${a.qty}x ${a.nome}  ${money(a.prezzo)}\n`; a.dettagli.forEach(d => { testo += `   ${d}\n`; }); });
-  testo += `${sep}\nSubtotale: ${money(subtotale)}\n`;
-  if (spese) testo += `Spese di consegna: ${money(spese)}\n`;
-  testo += `Totale: ${money(subtotale + spese)}\n`;
-  if (b.note) testo += `Note: ${b.note}\n`;
-
-  const order = {
-    fonte, interno: true, modalita, numeroTavolo: modalita === 'tavolo' ? String(b.tavolo || '') : undefined,
-    nome, name: nome, phone: String(b.telefono || ''), address: modalita === 'consegna' ? String(b.indirizzo) : '',
-    note: String(b.note || '').slice(0, 300), articoli, subtotaleBase: subtotale, scontoPrimoOrdine: 0, subtotale,
-    speseConsegna: spese, grandTotal: round2(subtotale + spese), pagamento: b.pagamento === 'carta' ? 'carta' : 'contanti',
-    timing: orario ? 'orario' : 'prima', orarioRichiesto: orario || undefined, testoStampa: testo,
-    oggettoEmail: `Nuovo ordine (${etichettaFonte.toLowerCase()}) — ${nome}`,
-    distanzaKm: zonaInfo ? zonaInfo.distanzaKm : undefined, fuoriPaese: zonaInfo ? !!zonaInfo.fuoriPaese : undefined,
-    zonaDaVerificare: zonaInfo ? !!zonaInfo.daVerificare : undefined,
-  };
-
-  if (modalita === 'consegna' && !b.forza) {
-    const slot = await assignDeliverySlotIfNeeded(order);
-    if (!slot.ok) return res.status(409).json(slot);
-  } else {
-    order.orarioLabel = modalita === 'tavolo' ? (orario ? `Tavolo ${b.tavolo || ''} · alle ${orario}` : `Tavolo ${b.tavolo || ''}`) : orario ? `Alle ${orario}` : 'Il prima possibile';
-  }
-
-  order.pagatoOnline = false;
-  await finalizeOrder(order, null);
-  res.json({ ok: true, numeroOrdine: order.numeroOrdine, totale: order.grandTotal, orario: order.orarioLabel, pannelli: printClients.length, esauriti });
 });
 
 // ---------- Resoconto giornaliero via email (ogni giorno alle 23:30, ora italiana) ----------
