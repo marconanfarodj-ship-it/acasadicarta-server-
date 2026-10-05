@@ -1807,7 +1807,13 @@ function normalizzaRighe(righe){
   return righe.slice(0, 300).map(r => {
     const chiave = String(r.chiave || '');
     const listino = getCurrentPrice(chiave);
-    const prezzo = listino != null ? listino : Math.max(0, Number(r.prezzo) || 0); // voci libere: prezzo scritto dallo staff
+    const base = listino != null ? listino : Math.max(0, Number(r.prezzoBase ?? r.prezzo) || 0); // voci libere: prezzo scritto dallo staff
+    // ingredienti extra: prezzo sempre dal listino del server
+    const extra = (Array.isArray(r.extra) ? r.extra : []).slice(0, 30).map(e => {
+      const k = String(e.chiave || '');
+      const p = getCurrentPrice(k);
+      return p == null ? null : { chiave: k, nome: String(e.nome || k.split('|')[1] || '').slice(0, 60), prezzo: round2(p) };
+    }).filter(Boolean);
     return {
       rid: String(r.rid || crypto.randomUUID()),
       chiave,
@@ -1815,13 +1821,29 @@ function normalizzaRighe(righe){
       cat: String(r.cat || '').slice(0, 80),
       qty: Math.max(0, Math.min(99, parseInt(r.qty, 10) || 0)),
       note: String(r.note || '').slice(0, 200),
-      prezzo: round2(prezzo)
+      pane: String(r.pane || '').slice(0, 40),
+      extra,
+      prezzoBase: round2(base),
+      prezzo: round2(base + extra.reduce((t, e) => t + e.prezzo, 0)) // prezzo di un pezzo, extra compresi
     };
   }).filter(r => r.nome && r.qty > 0);
 }
 
 function totaleComanda(c){
   return round2((c.righe || []).reduce((t, r) => t + r.prezzo * r.qty, 0));
+}
+
+// "firma" delle varianti: se cambia su un piatto già in cucina, va ristampato come modificato
+function firmaRiga(r){
+  return `${r.note || ''}|${r.pane || ''}|${(r.extra || []).map(e => e.chiave).sort().join(',')}`;
+}
+// righe di stampa per un piatto: nome, pane, extra, nota
+function righeStampa(r, prefisso){
+  const out = [`${prefisso}${r.qty}x ${r.nome}`];
+  if (r.pane) out.push(`   pane: ${r.pane}`);
+  if (r.extra && r.extra.length) out.push(`   + ${r.extra.map(e => e.nome).join(', + ')}`);
+  if (r.note) out.push(`   >> ${r.note}`);
+  return out;
 }
 
 // differenze tra quanto già mandato in cucina e la comanda attuale
@@ -1835,7 +1857,7 @@ function diffComanda(inviate, righe){
     else {
       if (r.qty > p.qty) aggiunte.push({ ...r, qty: r.qty - p.qty });
       if (r.qty < p.qty) tolte.push({ ...r, qty: p.qty - r.qty });
-      if ((r.note || '') !== (p.note || '')) note.push(r);
+      if (firmaRiga(r) !== firmaRiga(p)) note.push(r);
     }
   });
   prima.forEach((p, rid) => { if (!dopo.has(rid)) tolte.push({ ...p }); });
@@ -1854,10 +1876,7 @@ function testoComandaCucina(c, diff, primaVolta){
   L.push('================================');
   if (diff.aggiunte.length){
     if (!primaVolta) L.push('AGGIUNGERE:');
-    diff.aggiunte.forEach(r => {
-      L.push(`${primaVolta ? '' : '+ '}${r.qty}x ${r.nome}`);
-      if (r.note) L.push(`   >> ${r.note}`);
-    });
+    diff.aggiunte.forEach(r => L.push(...righeStampa(r, primaVolta ? '' : '+ ')));
   }
   if (diff.tolte.length){
     if (diff.aggiunte.length) L.push('');
@@ -1866,8 +1885,8 @@ function testoComandaCucina(c, diff, primaVolta){
   }
   if (diff.note.length){
     if (diff.aggiunte.length || diff.tolte.length) L.push('');
-    L.push('NOTE CAMBIATE:');
-    diff.note.forEach(r => L.push(`* ${r.nome}: ${r.note || '(nessuna nota)'}`));
+    L.push('CAMBIARE COSI\':');
+    diff.note.forEach(r => L.push(...righeStampa(r, '* ')));
   }
   if (primaVolta && c.noteComanda) { L.push(''); L.push(`NOTE: ${c.noteComanda}`); }
   L.push('================================');
@@ -1882,7 +1901,10 @@ function testoConto(c){
   L.push(`${etichettaComanda(c)} - ${oraIT()}`);
   L.push('PRECONTO (non fiscale)');
   L.push('--------------------------------');
-  (c.righe || []).forEach(r => L.push(`${r.qty}x ${r.nome}  ${money(r.prezzo * r.qty)}`));
+  (c.righe || []).forEach(r => {
+    L.push(`${r.qty}x ${r.nome}  ${money(r.prezzo * r.qty)}`);
+    (r.extra || []).forEach(e => L.push(`   + ${e.nome} ${money(e.prezzo)}`));
+  });
   L.push('--------------------------------');
   if (c.spese) L.push(`Consegna: ${money(c.spese)}`);
   L.push(`TOTALE: ${money(totaleComanda(c) + (c.spese || 0))}`);
@@ -2030,6 +2052,8 @@ app.get('/api/staff/menu', (req, res) => {
   });
   res.json(categorie.map(g => ({
     cat: g.cat,
+    gruppoExtra: String(g.keyPrefix).startsWith('EXTRA_') ? g.keyPrefix : null,
+    tipiPane: ['Panini', 'Hamburger'].includes(g.cat) ? BREAD_TYPES : [],
     extra: String(g.keyPrefix).startsWith('EXTRA_'),
     items: g.items.map(nome => {
       const chiave = `${g.keyPrefix}|${nome}`;
