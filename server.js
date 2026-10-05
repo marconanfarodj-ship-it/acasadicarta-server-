@@ -2160,7 +2160,7 @@ function uguali(a, b){
   return x.length === y.length && cryptoTit.timingSafeEqual(x, y);
 }
 function soloTitolare(req, res, next){
-  if (!TITOLARE_PASSWORD) return res.status(503).json({ ok: false, error: 'password_non_impostata' });
+  if (!TITOLARE_PASSWORD) return next(); // nessuna password impostata su Render: accesso libero
   const t = req.get('x-titolare-token') || '';
   if (!t || !uguali(t, tokenTitolare())) return res.status(401).json({ ok: false, error: 'accesso_negato' });
   next();
