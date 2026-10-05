@@ -78,6 +78,7 @@ let ordersPaused = false; // interruttore manuale: se true, il sito rifiuta ogni
 // calendario deciso dal titolare dal pannello: giorni di chiusura in più e martedì eccezionalmente aperti
 let calendario = { chiusi: [], aperti: [] }; // date "YYYY-MM-DD"
 let settingsCollection = null;
+let soloSalaCache = new Set();  // piatti ordinabili solo in sala (nascosti nel sito clienti)
 let comandeCollection = null;   // comande dell'app staff (sala, banco, telefono)
 let comandeMemoria = {};        // riserva in memoria se il database non è disponibile
 
@@ -131,6 +132,8 @@ async function connectDB(){
     settingsCollection = db.collection('settings');
     const pausedDoc = await settingsCollection.findOne({ _id: 'ordersPaused' });
     ordersPaused = !!(pausedDoc && pausedDoc.value);
+    const salaDoc = await settingsCollection.findOne({ _id: 'soloSala' });
+    if (salaDoc && Array.isArray(salaDoc.value)) soloSalaCache = new Set(salaDoc.value);
     const calDoc = await settingsCollection.findOne({ _id: 'calendario' });
     if (calDoc && calDoc.value) calendario = { chiusi: calDoc.value.chiusi || [], aperti: calDoc.value.aperti || [] };
     productPhotosCollection = db.collection('productPhotos');
@@ -1008,6 +1011,16 @@ app.post('/api/orders', async (req, res) => {
     }
   }
 
+  {
+    const vietato = articoloSoloSala(order.articoli);
+    if (vietato) {
+      return res.status(409).json({
+        ok: false, error: 'solo_sala',
+        message: `"${vietato}" si può ordinare solo al tavolo, in pizzeria. Toglilo dal carrello per continuare.`
+      });
+    }
+  }
+
   if (blockedPhonesCache.has(normalizePhone(order.phone))) {
     return res.status(403).json({
       ok: false,
@@ -1067,6 +1080,16 @@ app.post('/api/checkout/create-session', async (req, res) => {
         ok: false,
         error: 'giorno_chiuso',
         message: 'Quel giorno siamo chiusi. Scegli un altro giorno tra quelli disponibili.'
+      });
+    }
+  }
+
+  {
+    const vietato = articoloSoloSala(order.articoli);
+    if (vietato) {
+      return res.status(409).json({
+        ok: false, error: 'solo_sala',
+        message: `"${vietato}" si può ordinare solo al tavolo, in pizzeria. Toglilo dal carrello per continuare.`
       });
     }
   }
@@ -1368,13 +1391,14 @@ app.get('/api/custom-menu-items', (req, res) => {
 });
 
 app.post('/api/custom-menu-items/add', async (req, res) => {
-  const { cat, nome, descrizione, prezzo } = req.body || {};
+  const { cat, nome, descrizione, prezzo, soloSala } = req.body || {};
   const nuovoPrezzo = Number(prezzo);
   if (!cat || !nome || typeof cat !== 'string' || typeof nome !== 'string' || !Number.isFinite(nuovoPrezzo) || nuovoPrezzo < 0) {
     return res.status(400).json({ ok: false, error: 'Dati non validi' });
   }
   const chiave = `${cat}|${nome}`;
   const item = { _id: chiave, cat, nome, descrizione: descrizione || '', prezzo: nuovoPrezzo, createdAt: new Date().toISOString() };
+  if (soloSala) { soloSalaCache.add(chiave); salvaSoloSala(); }
 
   customMenuItemsCache = customMenuItemsCache.filter(i => i.cat !== cat || i.nome !== nome);
   customMenuItemsCache.push(item);
@@ -1398,6 +1422,7 @@ app.post('/api/custom-menu-items/delete', async (req, res) => {
   const { cat, nome } = req.body || {};
   if (!cat || !nome) return res.status(400).json({ ok: false, error: 'Dati mancanti' });
   const chiave = `${cat}|${nome}`;
+  if (soloSalaCache.delete(chiave)) salvaSoloSala();
   customMenuItemsCache = customMenuItemsCache.filter(i => i.cat !== cat || i.nome !== nome);
   if (customMenuItemsCollection) {
     customMenuItemsCollection.deleteOne({ _id: chiave }).catch(err => {
@@ -1428,6 +1453,33 @@ app.post('/api/orders-status/toggle', async (req, res) => {
   }
   broadcastOrder({ evento: 'ordini_sospesi_aggiornato', paused: ordersPaused });
   res.json({ ok: true, paused: ordersPaused });
+});
+
+// ---------- Piatti "solo sala": visibili solo nell'app staff, non ordinabili dal sito ----------
+function salvaSoloSala(){
+  if (settingsCollection) {
+    settingsCollection.updateOne({ _id: 'soloSala' }, { $set: { value: [...soloSalaCache] } }, { upsert: true })
+      .catch(err => console.error('Errore salvataggio solo sala:', err));
+  }
+}
+// un articolo è vietato online se il suo nome esiste SOLO tra i piatti solo sala
+// (così un omonimo in un'altra categoria ordinabile online non viene bloccato per errore)
+function articoloSoloSala(articoli){
+  if (!soloSalaCache.size || !Array.isArray(articoli)) return null;
+  const nomiSala = new Set([...soloSalaCache].map(k => k.split('|').slice(1).join('|')));
+  const nomiOnline = new Set();
+  MENU_CATALOG.forEach(g => g.items.forEach(n => { if (!soloSalaCache.has(`${g.keyPrefix}|${n}`)) nomiOnline.add(n); }));
+  customMenuItemsCache.forEach(i => { if (!soloSalaCache.has(`${i.cat}|${i.nome}`)) nomiOnline.add(i.nome); });
+  const a = articoli.find(x => x && nomiSala.has(x.nome) && !nomiOnline.has(x.nome));
+  return a ? a.nome : null;
+}
+app.get('/api/solo-sala', (req, res) => res.json([...soloSalaCache]));
+app.post('/api/solo-sala/toggle', (req, res) => {
+  const { chiave, soloSala } = req.body || {};
+  if (!chiave || typeof chiave !== 'string') return res.status(400).json({ ok: false, error: 'Dati non validi' });
+  if (soloSala) soloSalaCache.add(chiave); else soloSalaCache.delete(chiave);
+  salvaSoloSala();
+  res.json({ ok: true, soloSala: [...soloSalaCache] });
 });
 
 // ---------- Endpoint: calendario aperture/chiusure (deciso dal titolare dal pannello) ----------
@@ -1801,30 +1853,59 @@ function etichettaComanda(c){
   return `ASPORTO S${c.numero}`;
 }
 
+// opzioni a pagamento dell'app staff (uguali a quelle del sito clienti)
+const STAFF_PANE_PREZZI = { 'Panino Classico': 0, 'Pan Pizza': 1.00, 'Tortilla': 0.50 };
+const STAFF_SENZA_GLUTINE = 4.00; // solo Pizza
+const STAFF_FORMATI_FRITTI = {
+  'Patatine con Buccia': { 'Piccola': 3.00, 'Media': 5.00 },
+  'Anelli di Cipolla': { '12 Pezzi': 3.00, '20 Pezzi': 4.50 },
+  'Mozzarelline Impanate': { '15 Pezzi': 3.50, '30 Pezzi': 7.00 },
+  'Bocconcini Pollo Amadori Impanato Piccante': { '7 Pezzi': 3.50, '12 Pezzi': 5.50 },
+  'Vaschetta di Kebab': { 'Piccola': 3.00, 'Media': 5.00 }
+};
+const listaTesti = (a, max = 20) => (Array.isArray(a) ? a : []).slice(0, max).map(x => String(x).slice(0, 60)).filter(Boolean);
+
 // pulisce le righe mandate dall'app e mette il prezzo giusto preso dal listino del server
 function normalizzaRighe(righe){
   if (!Array.isArray(righe)) return [];
   return righe.slice(0, 300).map(r => {
     const chiave = String(r.chiave || '');
     const listino = getCurrentPrice(chiave);
-    const base = listino != null ? listino : Math.max(0, Number(r.prezzoBase ?? r.prezzo) || 0); // voci libere: prezzo scritto dallo staff
+    const cat = String(r.cat || '').slice(0, 80);
+    const nome = String(r.nome || '').slice(0, 120);
+    const o = r.opzioni || {};
+    const formati = STAFF_FORMATI_FRITTI[nome];
+    const formato = formati && formati[o.formato] !== undefined ? o.formato : '';
+    const max = cat === 'Pizza' && !!o.max;
+    const glutine = cat === 'Pizza' && !!o.glutine;
+    const opzioni = {
+      senza: listaTesti(o.senza), cottura: String(o.cottura || '').slice(0, 30),
+      max, glutine, formato, rifinitura: listaTesti(o.rifinitura, 5), salse: listaTesti(o.salse, 12)
+    };
+    let base = listino != null ? listino : Math.max(0, Number(r.prezzoBase ?? r.prezzo) || 0); // voci libere: prezzo scritto dallo staff
+    if (formato) base = formati[formato];
+    if (max) base = base * 2;
     // ingredienti extra: prezzo sempre dal listino del server
     const extra = (Array.isArray(r.extra) ? r.extra : []).slice(0, 30).map(e => {
       const k = String(e.chiave || '');
       const p = getCurrentPrice(k);
       return p == null ? null : { chiave: k, nome: String(e.nome || k.split('|')[1] || '').slice(0, 60), prezzo: round2(p) };
     }).filter(Boolean);
+    const pane = STAFF_PANE_PREZZI[r.pane] !== undefined ? r.pane : '';
+    const extraTot = extra.reduce((t, e) => t + e.prezzo, 0) * (max ? 2 : 1); // con la Max anche gli extra raddoppiano
+    const prezzoListino = base + extraTot + (glutine ? STAFF_SENZA_GLUTINE : 0) + (pane ? STAFF_PANE_PREZZI[pane] : 0);
+    // prezzo deciso a mano dallo staff per questo piatto (sconto, offerta, piatto speciale)
+    const manuale = r.prezzoManuale === null || r.prezzoManuale === undefined || r.prezzoManuale === '' ? null : Number(r.prezzoManuale);
+    const prezzoManuale = Number.isFinite(manuale) && manuale >= 0 && manuale <= 999 ? round2(manuale) : null;
+    const prezzo = prezzoManuale !== null ? prezzoManuale : prezzoListino;
     return {
       rid: String(r.rid || crypto.randomUUID()),
-      chiave,
-      nome: String(r.nome || '').slice(0, 120),
-      cat: String(r.cat || '').slice(0, 80),
+      chiave, nome, cat,
       qty: Math.max(0, Math.min(99, parseInt(r.qty, 10) || 0)),
       note: String(r.note || '').slice(0, 200),
-      pane: String(r.pane || '').slice(0, 40),
-      extra,
-      prezzoBase: round2(base),
-      prezzo: round2(base + extra.reduce((t, e) => t + e.prezzo, 0)) // prezzo di un pezzo, extra compresi
+      pane, extra, opzioni, prezzoManuale,
+      prezzoBase: round2(listino != null ? listino : Math.max(0, Number(r.prezzoBase ?? r.prezzo) || 0)),
+      prezzo: round2(prezzo) // prezzo di un pezzo, varianti comprese
     };
   }).filter(r => r.nome && r.qty > 0);
 }
@@ -1835,13 +1916,23 @@ function totaleComanda(c){
 
 // "firma" delle varianti: se cambia su un piatto già in cucina, va ristampato come modificato
 function firmaRiga(r){
-  return `${r.note || ''}|${r.pane || ''}|${(r.extra || []).map(e => e.chiave).sort().join(',')}`;
+  const o = r.opzioni || {};
+  return JSON.stringify([r.note || '', r.pane || '', (r.extra || []).map(e => e.chiave).sort(),
+    [...(o.senza || [])].sort(), o.cottura || '', !!o.max, !!o.glutine, o.formato || '',
+    [...(o.rifinitura || [])].sort(), [...(o.salse || [])].sort()]);
 }
 // righe di stampa per un piatto: nome, pane, extra, nota
 function righeStampa(r, prefisso){
-  const out = [`${prefisso}${r.qty}x ${r.nome}`];
+  const o = r.opzioni || {};
+  const out = [`${prefisso}${r.qty}x ${r.nome}${o.max ? ' MAX' : ''}`];
+  if (o.formato) out.push(`   formato: ${o.formato}`);
   if (r.pane) out.push(`   pane: ${r.pane}`);
+  if (o.cottura && o.cottura !== 'Normale') out.push(`   cottura: ${o.cottura}`);
+  if (o.glutine) out.push('   *** SENZA GLUTINE ***');
+  if (o.senza && o.senza.length) out.push(`   SENZA: ${o.senza.join(', ')}`);
   if (r.extra && r.extra.length) out.push(`   + ${r.extra.map(e => e.nome).join(', + ')}`);
+  if (o.rifinitura && o.rifinitura.length) out.push(`   con: ${o.rifinitura.join(', ')}`);
+  if (o.salse && o.salse.length) out.push(`   salse: ${o.salse.join(', ')}`);
   if (r.note) out.push(`   >> ${r.note}`);
   return out;
 }
@@ -1902,8 +1993,11 @@ function testoConto(c){
   L.push('PRECONTO (non fiscale)');
   L.push('--------------------------------');
   (c.righe || []).forEach(r => {
-    L.push(`${r.qty}x ${r.nome}  ${money(r.prezzo * r.qty)}`);
-    (r.extra || []).forEach(e => L.push(`   + ${e.nome} ${money(e.prezzo)}`));
+    const o = r.opzioni || {};
+    L.push(`${r.qty}x ${r.nome}${o.max ? ' MAX' : ''}${o.formato ? ' ' + o.formato : ''}  ${money(r.prezzo * r.qty)}`);
+    (r.extra || []).forEach(e => L.push(`   + ${e.nome}`));
+    if (o.glutine) L.push('   senza glutine');
+    if (r.pane && STAFF_PANE_PREZZI[r.pane]) L.push(`   pane: ${r.pane}`);
   });
   L.push('--------------------------------');
   if (c.spese) L.push(`Consegna: ${money(c.spese)}`);
@@ -2057,7 +2151,8 @@ app.get('/api/staff/menu', (req, res) => {
     extra: String(g.keyPrefix).startsWith('EXTRA_'),
     items: g.items.map(nome => {
       const chiave = `${g.keyPrefix}|${nome}`;
-      return { nome, chiave, prezzo: getCurrentPrice(chiave), esaurito: soldOutCache.has(chiave) };
+      const custom = customMenuItemsCache.find(i => i.cat === g.cat && i.nome === nome);
+      return { nome, chiave, prezzo: getCurrentPrice(chiave), esaurito: soldOutCache.has(chiave), soloSala: soloSalaCache.has(chiave), desc: custom ? custom.descrizione || '' : undefined };
     })
   })));
 });
