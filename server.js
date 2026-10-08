@@ -1879,8 +1879,7 @@ function normalizzaRighe(righe){
     const formati = STAFF_FORMATI_FRITTI[nome];
     const formato = formati && formati[o.formato] !== undefined ? o.formato : '';
     const max = cat === 'Pizza' && !!o.max;
-    const mezzaMax = cat === 'Pizza' && !max && !!o.mezzaMax; // mezza Max: metà del prezzo Max = prezzo normale (+ extra)
-    const kMax = max ? 2 : 1;
+    const mezzaMax = cat === 'Pizza' && !max && !!o.mezzaMax; // mezza Max = metà della Max: prezzo normale
     const glutine = cat === 'Pizza' && !!o.glutine;
     const opzioni = {
       senza: listaTesti(o.senza), cottura: String(o.cottura || '').slice(0, 30),
@@ -1888,7 +1887,7 @@ function normalizzaRighe(righe){
     };
     let base = listino != null ? listino : Math.max(0, Number(r.prezzoBase ?? r.prezzo) || 0); // voci libere: prezzo scritto dallo staff
     if (formato) base = formati[formato];
-    if (kMax !== 1) base = base * kMax;
+    if (max) base = base * 2;
     // ingredienti extra: prezzo sempre dal listino del server
     const extra = (Array.isArray(r.extra) ? r.extra : []).slice(0, 30).map(e => {
       const k = String(e.chiave || '');
@@ -1896,7 +1895,7 @@ function normalizzaRighe(righe){
       return p == null ? null : { chiave: k, nome: String(e.nome || k.split('|')[1] || '').slice(0, 60), prezzo: round2(p) };
     }).filter(Boolean);
     const pane = STAFF_PANE_PREZZI[r.pane] !== undefined ? r.pane : '';
-    const extraTot = extra.reduce((t, e) => t + e.prezzo, 0) * kMax; // con la Max gli extra raddoppiano, con la mezza Max restano normali
+    const extraTot = extra.reduce((t, e) => t + e.prezzo, 0) * (max ? 2 : 1); // con la Max anche gli extra raddoppiano
     const prezzoListino = base + extraTot + (glutine ? STAFF_SENZA_GLUTINE : 0) + (pane ? STAFF_PANE_PREZZI[pane] : 0);
     // prezzo deciso a mano dallo staff per questo piatto (sconto, offerta, piatto speciale)
     const manuale = r.prezzoManuale === null || r.prezzoManuale === undefined || r.prezzoManuale === '' ? null : Number(r.prezzoManuale);
@@ -1928,9 +1927,9 @@ function firmaRiga(r){
 // righe di stampa per un piatto: nome, pane, extra, nota
 function righeStampa(r, prefisso){
   const o = r.opzioni || {};
-  const out = [`${prefisso}${r.qty}x ${r.nome}${o.max ? ' MAX' : (o.mezzaMax ? ' MEZZA MAX' : '')}`];
+  const out = [`${prefisso}${r.qty}x ${r.nome}${o.max ? ' MAX' : o.mezzaMax ? ' MEZZA MAX' : ''}`];
   if (o.formato) out.push(`   formato: ${o.formato}`);
-  if (r.pane && STAFF_PANE_PREZZI[r.pane]) out.push(`   pane: ${r.pane}`); // Panino Classico è il default: non si stampa
+  if (r.pane) out.push(`   pane: ${r.pane}`);
   if (o.cottura && o.cottura !== 'Normale') out.push(`   cottura: ${o.cottura}`);
   if (o.glutine) out.push('   *** SENZA GLUTINE ***');
   if (o.senza && o.senza.length) out.push(`   SENZA: ${o.senza.join(', ')}`);
@@ -1998,7 +1997,7 @@ function testoConto(c){
   L.push('--------------------------------');
   (c.righe || []).forEach(r => {
     const o = r.opzioni || {};
-    L.push(`${r.qty}x ${r.nome}${o.max ? ' MAX' : (o.mezzaMax ? ' MEZZA MAX' : '')}${o.formato ? ' ' + o.formato : ''}  ${money(r.prezzo * r.qty)}`);
+    L.push(`${r.qty}x ${r.nome}${o.max ? ' MAX' : o.mezzaMax ? ' MEZZA MAX' : ''}${o.formato ? ' ' + o.formato : ''}  ${money(r.prezzo * r.qty)}`);
     (r.extra || []).forEach(e => L.push(`   + ${e.nome}`));
     if (o.glutine) L.push('   senza glutine');
     if (r.pane && STAFF_PANE_PREZZI[r.pane]) L.push(`   pane: ${r.pane}`);
