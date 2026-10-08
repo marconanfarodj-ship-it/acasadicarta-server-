@@ -79,6 +79,9 @@ let blockedPhonesCache = new Set(); // riserva in memoria, usata se il database 
 let ordersPaused = false; // interruttore manuale: se true, il sito rifiuta ogni nuovo ordine
 // calendario deciso dal titolare dal pannello: giorni di chiusura in più e martedì eccezionalmente aperti
 let calendario = { chiusi: [], aperti: [] }; // date "YYYY-MM-DD"
+// grandezza dei caratteri in stampa, scelta dal titolare: 'piccola' | 'media' | 'grande'
+const DIMENSIONI_STAMPA = ['piccola', 'media', 'grande'];
+let dimensioneStampa = 'media';
 let settingsCollection = null;
 let soloSalaCache = new Set();  // piatti ordinabili solo in sala (nascosti nel sito clienti)
 let comandeCollection = null;   // comande dell'app staff (sala, banco, telefono)
@@ -138,6 +141,8 @@ async function connectDB(){
     if (salaDoc && Array.isArray(salaDoc.value)) soloSalaCache = new Set(salaDoc.value);
     const calDoc = await settingsCollection.findOne({ _id: 'calendario' });
     if (calDoc && calDoc.value) calendario = { chiusi: calDoc.value.chiusi || [], aperti: calDoc.value.aperti || [] };
+    const dimDoc = await settingsCollection.findOne({ _id: 'dimensioneStampa' });
+    if (dimDoc && DIMENSIONI_STAMPA.includes(dimDoc.value)) dimensioneStampa = dimDoc.value;
     productPhotosCollection = db.collection('productPhotos');
     const photoDocs = await productPhotosCollection.find({}, { projection: { data: 0 } }).toArray();
     // all'avvio carichiamo solo l'elenco delle chiavi con foto (leggero); l'immagine vera si scarica
@@ -741,6 +746,24 @@ setInterval(() => {
 // ---------- Storico ordini in memoria (si azzera se il server si riavvia) ----------
 let orderHistory = [];
 const MAX_HISTORY = 100;
+// cerca un ordine: prima in memoria, poi nel database (dopo un riavvio del server la memoria è vuota)
+async function trovaOrdine(numeroOrdine){
+  let order = orderHistory.find(o => o.numeroOrdine === numeroOrdine);
+  if (order || !ordersCollection || !numeroOrdine) return order || null;
+  try {
+    const doc = await ordersCollection.findOne({ numeroOrdine });
+    if (!doc) return null;
+    delete doc._id;
+    order = orderHistory.find(o => o.numeroOrdine === numeroOrdine); // nel frattempo potrebbe essere arrivato
+    if (order) return order;
+    orderHistory.push(doc);
+    if (orderHistory.length > MAX_HISTORY * 2) orderHistory.splice(MAX_HISTORY * 2);
+    return doc;
+  } catch (err) {
+    console.error('Errore ricerca ordine nel database:', err);
+    return null;
+  }
+}
 let orderCounter = 1000;
 
 // ---------- Endpoint: disponibilità slot di consegna per una data ----------
@@ -1301,9 +1324,9 @@ app.get('/api/driver-location', (req, res) => {
 
 // info minime e pubbliche su un ordine, usate dalla pagina di tracciamento del cliente
 // (nessun dato sensibile: solo ciò che serve per mostrare la mappa)
-app.get('/api/orders/:numeroOrdine/pubblico', (req, res) => {
+app.get('/api/orders/:numeroOrdine/pubblico', async (req, res) => {
   const numeroOrdine = Number(req.params.numeroOrdine);
-  const order = orderHistory.find(o => o.numeroOrdine === numeroOrdine);
+  const order = await trovaOrdine(numeroOrdine);
   if (!order) return res.status(404).json({ ok: false, error: 'Ordine non trovato' });
   res.json({
     ok: true,
@@ -1315,9 +1338,9 @@ app.get('/api/orders/:numeroOrdine/pubblico', (req, res) => {
 });
 
 // ---------- Endpoint: il pannello di stampa segna qui un ordine come pronto ----------
-app.post('/api/orders/:numeroOrdine/pronto', (req, res) => {
+app.post('/api/orders/:numeroOrdine/pronto', async (req, res) => {
   const numeroOrdine = Number(req.params.numeroOrdine);
-  const order = orderHistory.find(o => o.numeroOrdine === numeroOrdine);
+  const order = await trovaOrdine(numeroOrdine);
   if (!order) return res.status(404).json({ ok: false, error: 'Ordine non trovato' });
 
   order.stato = 'pronto';
@@ -1346,13 +1369,13 @@ app.post('/api/orders/:numeroOrdine/pronto', (req, res) => {
 });
 
 // ---------- Endpoint: il pannello di stampa registra qui come ha pagato il cliente (contanti/bancomat) ----------
-app.post('/api/orders/:numeroOrdine/pagamento', (req, res) => {
+app.post('/api/orders/:numeroOrdine/pagamento', async (req, res) => {
   const numeroOrdine = Number(req.params.numeroOrdine);
   const { metodo } = req.body || {};
   if (metodo !== 'contanti' && metodo !== 'bancomat') {
     return res.status(400).json({ ok: false, error: 'Metodo non valido' });
   }
-  const order = orderHistory.find(o => o.numeroOrdine === numeroOrdine);
+  const order = await trovaOrdine(numeroOrdine);
   if (!order) return res.status(404).json({ ok: false, error: 'Ordine non trovato' });
   if (order.pagatoOnline) return res.status(400).json({ ok: false, error: 'Questo ordine è già pagato online' });
 
@@ -1482,6 +1505,20 @@ app.post('/api/solo-sala/toggle', (req, res) => {
   if (soloSala) soloSalaCache.add(chiave); else soloSalaCache.delete(chiave);
   salvaSoloSala();
   res.json({ ok: true, soloSala: [...soloSalaCache] });
+});
+
+// ---------- Endpoint: grandezza caratteri in stampa (decisa dal titolare) ----------
+app.get('/api/stampa/dimensione', (req, res) => res.json({ ok: true, dimensione: dimensioneStampa }));
+app.post('/api/stampa/dimensione', async (req, res) => {
+  const d = String((req.body && req.body.dimensione) || '');
+  if (!DIMENSIONI_STAMPA.includes(d)) return res.status(400).json({ ok: false, error: 'dimensione_non_valida' });
+  dimensioneStampa = d;
+  if (settingsCollection) {
+    settingsCollection.updateOne({ _id: 'dimensioneStampa' }, { $set: { value: d } }, { upsert: true })
+      .catch(err => console.error('Errore salvataggio dimensione stampa:', err));
+  }
+  broadcastOrder({ evento: 'dimensione_stampa', dimensione: d }); // tutti i pannelli aperti si aggiornano subito
+  res.json({ ok: true, dimensione: d });
 });
 
 // ---------- Endpoint: calendario aperture/chiusure (deciso dal titolare dal pannello) ----------
@@ -2334,9 +2371,9 @@ app.get('/api/orders/pronti-consegna', (req, res) => {
 });
 
 // ---------- Endpoint: il fattorino segna qui un ordine come caricato/in consegna ----------
-app.post('/api/orders/:numeroOrdine/in-consegna', (req, res) => {
+app.post('/api/orders/:numeroOrdine/in-consegna', async (req, res) => {
   const numeroOrdine = Number(req.params.numeroOrdine);
-  const order = orderHistory.find(o => o.numeroOrdine === numeroOrdine);
+  const order = await trovaOrdine(numeroOrdine);
   if (!order) return res.status(404).json({ ok: false, error: 'Ordine non trovato' });
 
   order.stato = 'in_consegna';
