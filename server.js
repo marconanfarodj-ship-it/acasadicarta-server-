@@ -974,7 +974,10 @@ async function finalizeOrder(order, customerId){
   order.ricevutoAlle = new Date().toISOString();
   order.stato = 'da_preparare';
   order.metodoPagamento = order.pagatoOnline ? 'online' : null; // 'online' | 'contanti' | 'bancomat' | null (da registrare)
-  order.stampato = false; // diventa true quando un pannello lo stampa (anche in differita, vedi /api/orders/non-stampati)
+  // se un pannello di stampa è collegato riceve l'ordine adesso e lo stampa subito: lo segniamo già come stampato,
+  // così non viene ristampato quando il pannello si ricollega e Jarvis non dà falsi allarmi.
+  // Se nessun pannello è collegato resta false e il pannello lo recupera appena si riapre.
+  order.stampato = printClients.length > 0;
   order.phoneNormalized = normalizePhone(order.phone);
   order.addressNormalized = normalizeAddress(order.address);
   orderHistory.unshift(order);
