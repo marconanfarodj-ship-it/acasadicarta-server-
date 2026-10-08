@@ -112,6 +112,7 @@ let customMenuItemsCollection = null;
 async function connectDB(){
   if(!MONGODB_URI){
     console.log('MONGODB_URI non impostata: gli account cliente non funzioneranno.');
+    setTimeout(() => segnaStoricoPronto(), 0);   // senza database non c'è storico da aspettare
     return;
   }
   try{
@@ -153,8 +154,10 @@ async function connectDB(){
     customMenuItemsCollection = db.collection('customMenuItems');
     customMenuItemsCache = await customMenuItemsCollection.find({}).toArray();
     console.log('Connesso a MongoDB Atlas.');
+    riprendiStorico();
   }catch(err){
     console.error('Errore connessione MongoDB:', err);
+    setTimeout(() => segnaStoricoPronto(), 0);
   }
 }
 connectDB();
@@ -765,6 +768,29 @@ async function trovaOrdine(numeroOrdine){
   }
 }
 let orderCounter = 1000;
+// all'avvio (anche dopo che Render ha "addormentato" il server) si riprendono dal database
+// la numerazione degli ordini e gli ultimi ordini: niente più numeri ripetuti né elenco vuoto
+let segnaStoricoPronto; const storicoPronto = new Promise(r => { segnaStoricoPronto = r; });
+setTimeout(() => segnaStoricoPronto(), 20000);   // se il database non risponde, non si blocca tutto
+async function riprendiStorico(){
+  try {
+    if (!ordersCollection) return;
+    const maxDoc = await ordersCollection.find({ numeroOrdine: { $type: 'number' } }, { projection: { numeroOrdine: 1 } })
+      .sort({ numeroOrdine: -1 }).limit(1).toArray();
+    if (maxDoc[0] && maxDoc[0].numeroOrdine > orderCounter) orderCounter = maxDoc[0].numeroOrdine;
+    const ultimi = await ordersCollection.find({ numeroOrdine: { $type: 'number' } }, { projection: { _id: 0 } })
+      .sort({ ricevutoAlle: -1 }).limit(MAX_HISTORY).toArray();
+    const visti = new Set(orderHistory.map(o => o.numeroOrdine + '|' + o.ricevutoAlle));
+    for (const o of ultimi) if (!visti.has(o.numeroOrdine + '|' + o.ricevutoAlle)) orderHistory.push(o);
+    orderHistory.sort((a, b) => String(b.ricevutoAlle || '').localeCompare(String(a.ricevutoAlle || '')));
+    if (orderHistory.length > MAX_HISTORY) orderHistory.length = MAX_HISTORY;
+    console.log(`Storico ripreso: ${orderHistory.length} ordini, prossimo numero ${orderCounter + 1}`);
+  } catch (err) {
+    console.error('Errore ripresa storico ordini:', err);
+  } finally {
+    segnaStoricoPronto();
+  }
+}
 
 // ---------- Endpoint: disponibilità slot di consegna per una data ----------
 app.get('/api/delivery-slots', (req, res) => {
@@ -943,6 +969,7 @@ async function assignDeliverySlotIfNeeded(order){
 // numero ordine, storico, stampa in cucina, email. Usata sia dal checkout
 // diretto (pagamento a consegna) sia dal webhook Stripe (pagamento online).
 async function finalizeOrder(order, customerId){
+  await storicoPronto;   // il numero d'ordine si assegna solo dopo aver ripreso la numerazione
   order.numeroOrdine = ++orderCounter;
   order.ricevutoAlle = new Date().toISOString();
   order.stato = 'da_preparare';
@@ -1299,6 +1326,26 @@ app.get('/api/orders/stream', (req, res) => {
 // ---------- Endpoint: storico ordini (utile per controlli/debug) ----------
 app.get('/api/orders', (req, res) => {
   res.json(orderHistory);
+});
+
+// ricerca per nome o telefono tra gli ordini salvati nel database (ultimi 90 giorni), usata da Jarvis
+app.get('/api/orders/cerca', async (req, res) => {
+  const q = String(req.query.q || '').trim().slice(0, 60);
+  if (q.length < 2) return res.json([]);
+  const esc = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const cifre = q.replace(/\D/g, '');
+  const da = new Date(Date.now() - 90 * 86400000).toISOString();
+  const filtro = { ricevutoAlle: { $gte: da }, $or: [{ name: { $regex: esc, $options: 'i' } }, { nome: { $regex: esc, $options: 'i' } }, { cognome: { $regex: esc, $options: 'i' } }] };
+  if (cifre.length >= 6) filtro.$or.push({ phoneNormalized: { $regex: cifre.slice(-9) } });
+  if (/^\d{3,6}$/.test(q)) filtro.$or.push({ numeroOrdine: Number(q) });   // anche per numero d'ordine
+  try {
+    if (!ordersCollection) return res.json(orderHistory.filter(o => new RegExp(esc, 'i').test(`${o.name || ''} ${o.nome || ''} ${o.cognome || ''}`)).slice(0, 10));
+    const trovati = await ordersCollection.find(filtro, { projection: { _id: 0 } }).sort({ ricevutoAlle: -1 }).limit(10).toArray();
+    res.json(trovati);
+  } catch (err) {
+    console.error('Errore ricerca ordini:', err);
+    res.status(500).json({ ok: false, error: 'ricerca non riuscita' });
+  }
 });
 
 // ---------- Tracciamento consegna in tempo reale ----------
@@ -2397,6 +2444,158 @@ app.post('/api/orders/:numeroOrdine/in-consegna', async (req, res) => {
   }
 
   res.json({ ok: true });
+});
+
+// =====================================================================
+//  JARVIS / PERSONALE: ristampa comande e ordini presi a voce (telefono, banco, tavolo)
+// =====================================================================
+// Facoltativo: impostando STAFF_KEY su Render, questi endpoint accettano solo chi manda
+// l'intestazione x-staff-key uguale (Jarvis la manda se ha la stessa chiave).
+const STAFF_KEY = process.env.STAFF_KEY || '';
+function staffOk(req){ return !STAFF_KEY || req.get('x-staff-key') === STAFF_KEY; }
+
+// Ristampa: il pannello di stampa riceve l'ordine e lo ristampa (non lo aggiunge di nuovo alla lista)
+app.post('/api/orders/:numeroOrdine/ristampa', async (req, res) => {
+  if (!staffOk(req)) return res.status(403).json({ ok: false, error: 'non autorizzato' });
+  const numeroOrdine = Number(req.params.numeroOrdine);
+  const order = await trovaOrdine(numeroOrdine);
+  if (!order) return res.status(404).json({ ok: false, error: 'Ordine non trovato' });
+  if (!order.testoStampa) return res.status(400).json({ ok: false, error: 'Comanda senza testo da stampare' });
+  stampaStaff('*** RISTAMPA ***\n' + order.testoStampa, `Ristampa ordine #${numeroOrdine}`);
+  res.json({ ok: true, numeroOrdine, pannelli: printClients.length });
+});
+
+// ---------- ricerca delle voci del menu per nome (come le dice una persona) ----------
+const normNome = s => String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+  .replace(/&/g, ' e ').replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim()
+  .replace(/\bquattro\b/g, '4').replace(/\bsette\b/g, '7').replace(/\bdieci\b/g, '10').replace(/\bwurstel\b/g, 'wurstel');
+function vociMenu(){
+  const out = [];
+  MENU_CATALOG.forEach(g => g.items.forEach(nome => out.push({ chiave: `${g.keyPrefix}|${nome}`, nome, cat: g.cat, prefisso: g.keyPrefix })));
+  customMenuItemsCache.forEach(i => out.push({ chiave: `${i.cat}|${i.nome}`, nome: i.nome, cat: i.cat, prefisso: i.cat, prezzoCustom: i.prezzo }));
+  return out;
+}
+function trovaVoce(nome, categoria, prefissoExtra){
+  const q = normNome(nome);
+  if (!q) return null;
+  let voci = vociMenu().filter(v => prefissoExtra ? v.prefisso === prefissoExtra : !String(v.prefisso).startsWith('EXTRA_'));
+  const qc = normNome(categoria);
+  if (qc) { const f = voci.filter(v => normNome(v.cat).includes(qc) || qc.includes(normNome(v.prefisso))); if (f.length) voci = f; }
+  const n = v => normNome(v.nome);
+  const senzaPizza = q.replace(/^pizza /, '');
+  return voci.find(v => n(v) === q) || voci.find(v => n(v) === senzaPizza) || voci.find(v => n(v) === 'pizza ' + senzaPizza)
+    || voci.find(v => n(v).startsWith(q)) || voci.find(v => n(v).split(' ').includes(senzaPizza))
+    || voci.find(v => n(v).includes(q)) || voci.find(v => n(v).length > 3 && q.includes(n(v)))
+    || voci.find(v => { const t = n(v).split(' '); return senzaPizza.split(' ').filter(w => w.length > 1 && w !== 'e' && w !== 'di').every(w => t.some(x => x.startsWith(w))); })
+    || null;
+}
+function prezzoVoce(v){
+  const p = getCurrentPrice(v.chiave);
+  return p !== null && p !== undefined && Number.isFinite(Number(p)) ? Number(p) : (Number(v.prezzoCustom) || 0);
+}
+
+// Ordine interno (telefono, banco, tavolo): i prezzi li calcola il server dal menu.
+// Senza "conferma: true" restituisce solo l'anteprima (nulla viene creato né stampato).
+app.post('/api/orders/interno', async (req, res) => {
+  if (!staffOk(req)) return res.status(403).json({ ok: false, error: 'non autorizzato' });
+  const b = req.body || {};
+  const righe = Array.isArray(b.articoli) ? b.articoli.slice(0, 60) : [];
+  if (!righe.length) return res.status(400).json({ ok: false, error: 'Nessun articolo' });
+
+  const nonTrovati = [], esauriti = [], articoli = [];
+  let subtotale = 0;
+  for (const r of righe) {
+    const voce = trovaVoce(r.nome, r.categoria);
+    if (!voce) { nonTrovati.push(String(r.nome || '')); continue; }
+    const qty = Math.max(1, Math.min(50, parseInt(r.qty, 10) || 1));
+    let unit = prezzoVoce(voce);
+    const dettagli = [];
+    const prefExtra = /pizza|focacc/i.test(voce.prefisso + ' ' + voce.cat) ? 'EXTRA_PIZZA' : 'EXTRA_PANINO';
+    for (const e of (Array.isArray(r.aggiunte) ? r.aggiunte : [])) {
+      const ve = trovaVoce(e, '', prefExtra);
+      if (!ve) { nonTrovati.push(`aggiunta «${e}» per ${voce.nome}`); continue; }
+      const pe = prezzoVoce(ve); unit += pe;
+      dettagli.push(`+ ${ve.nome} (${money(pe)})`);
+    }
+    for (const s of (Array.isArray(r.senza) ? r.senza : [])) dettagli.push(`Senza: ${s}`);
+    if (r.pane) dettagli.push(`Pane: ${String(r.pane).slice(0, 40)}`);
+    if (r.note) dettagli.push(String(r.note).slice(0, 120));
+    if (soldOutCache.has(voce.chiave)) esauriti.push(voce.nome);
+    const prezzo = round2(unit * qty);
+    subtotale += prezzo;
+    articoli.push({ qty, nome: voce.nome, prezzo, dettagli, chiave: voce.chiave });
+  }
+  if (nonTrovati.length) {
+    return res.status(422).json({ ok: false, error: 'voci_non_trovate', non_trovati: nonTrovati,
+      message: 'Non trovo nel menu: ' + nonTrovati.join(', ') });
+  }
+
+  const modalita = ['consegna', 'tavolo'].includes(b.modalita) ? b.modalita : 'ritiro';
+  subtotale = round2(subtotale);
+  // spese di consegna: calcolate dalla distanza come per il sito (si possono forzare con speseConsegna)
+  let spese = 0, zonaInfo = null;
+  if (modalita === 'consegna' && b.indirizzo) {
+    if (b.speseConsegna != null && b.speseConsegna !== '') spese = round2(Number(b.speseConsegna) || 0);
+    else {
+      zonaInfo = await calcolaZonaConsegna({ address: String(b.indirizzo), zonaDichiarata: b.fuoriPaese === true ? 'fuori' : b.fuoriPaese === false ? 'paese' : null });
+      if (!zonaInfo.ok) return res.status(400).json(zonaInfo);
+      spese = round2(Number(zonaInfo.spese) || 0);
+    }
+  }
+  const orario = /^\d{1,2}:\d{2}$/.test(String(b.orario || '')) ? String(b.orario).padStart(5, '0') : '';
+  const nome = String(b.nome || (modalita === 'tavolo' ? `Tavolo ${b.tavolo || ''}` : 'Cliente')).slice(0, 60);
+  const fonte = String(b.fonte || 'jarvis').slice(0, 20);
+  const etichettaFonte = modalita === 'tavolo' ? 'TAVOLO' : fonte === 'banco' ? 'BANCO' : 'TELEFONO';
+
+  if (modalita === 'consegna' && !b.indirizzo) return res.status(400).json({ ok: false, error: 'manca_indirizzo', message: "Per la consegna serve l'indirizzo." });
+
+  const anteprima = {
+    modalita, nome, tavolo: modalita === 'tavolo' ? String(b.tavolo || '') : '', orario: orario || 'il prima possibile',
+    articoli: articoli.map(a => ({ qty: a.qty, nome: a.nome, prezzo: a.prezzo, dettagli: a.dettagli })),
+    subtotale, speseConsegna: spese, totale: round2(subtotale + spese), esauriti,
+    zona: zonaInfo ? { distanzaKm: zonaInfo.distanzaKm ?? null, fuoriPaese: !!zonaInfo.fuoriPaese, daVerificare: !!zonaInfo.daVerificare, chiediZona: !!zonaInfo.chiediZona } : null,
+  };
+  if (!b.conferma) return res.json({ ok: true, anteprima: true, ...anteprima });
+
+  const sep = '------------------------------';
+  let testo = `ORDINE ${etichettaFonte} — LA CASA DI CARTA\n${sep}\n`;
+  testo += `Modalità: ${modalita === 'consegna' ? 'Consegna a domicilio' : modalita === 'tavolo' ? 'Al tavolo ' + (b.tavolo || '') : 'Ritiro in sede'}\n`;
+  testo += `Orario richiesto: ${orario ? 'Alle ' + orario : (modalita === 'tavolo' ? 'Subito' : 'Il prima possibile')}\n`;
+  testo += `Nome: ${nome}\n`;
+  if (b.telefono) testo += `Telefono: ${b.telefono}\n`;
+  if (modalita === 'consegna') {
+    testo += `Indirizzo: ${b.indirizzo}\n`;
+    if (zonaInfo && zonaInfo.distanzaKm != null) testo += `Distanza: ${String(zonaInfo.distanzaKm).replace('.', ',')} km${zonaInfo.fuoriPaese ? ' (fuori paese)' : ''}\n`;
+    if (zonaInfo && zonaInfo.daVerificare) testo += `⚠️ ZONA DA VERIFICARE: indirizzo non trovato sulla mappa\n`;
+  }
+  testo += `${sep}\n`;
+  articoli.forEach(a => { testo += `${a.qty}x ${a.nome}  ${money(a.prezzo)}\n`; a.dettagli.forEach(d => { testo += `   ${d}\n`; }); });
+  testo += `${sep}\nSubtotale: ${money(subtotale)}\n`;
+  if (spese) testo += `Spese di consegna: ${money(spese)}\n`;
+  testo += `Totale: ${money(subtotale + spese)}\n`;
+  if (b.note) testo += `Note: ${b.note}\n`;
+
+  const order = {
+    fonte, interno: true, modalita, numeroTavolo: modalita === 'tavolo' ? String(b.tavolo || '') : undefined,
+    nome, name: nome, phone: String(b.telefono || ''), address: modalita === 'consegna' ? String(b.indirizzo) : '',
+    note: String(b.note || '').slice(0, 300), articoli, subtotaleBase: subtotale, scontoPrimoOrdine: 0, subtotale,
+    speseConsegna: spese, grandTotal: round2(subtotale + spese), pagamento: b.pagamento === 'carta' ? 'carta' : 'contanti',
+    timing: orario ? 'orario' : 'prima', orarioRichiesto: orario || undefined, testoStampa: testo,
+    oggettoEmail: `Nuovo ordine (${etichettaFonte.toLowerCase()}) — ${nome}`,
+    distanzaKm: zonaInfo ? zonaInfo.distanzaKm : undefined, fuoriPaese: zonaInfo ? !!zonaInfo.fuoriPaese : undefined,
+    zonaDaVerificare: zonaInfo ? !!zonaInfo.daVerificare : undefined,
+  };
+
+  if (modalita === 'consegna' && !b.forza) {
+    const slot = await assignDeliverySlotIfNeeded(order);
+    if (!slot.ok) return res.status(409).json(slot);
+  } else {
+    order.orarioLabel = modalita === 'tavolo' ? (orario ? `Tavolo ${b.tavolo || ''} · alle ${orario}` : `Tavolo ${b.tavolo || ''}`) : orario ? `Alle ${orario}` : 'Il prima possibile';
+  }
+
+  order.pagatoOnline = false;
+  await finalizeOrder(order, null);
+  res.json({ ok: true, numeroOrdine: order.numeroOrdine, totale: order.grandTotal, orario: order.orarioLabel, pannelli: printClients.length, esauriti });
 });
 
 // ---------- Resoconto giornaliero via email (ogni giorno alle 23:30, ora italiana) ----------
