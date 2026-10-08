@@ -729,6 +729,9 @@ function isValidRequestDate(dateStr){
 
 // ---------- Elenco dei "client" del pannello di stampa in ascolto (SSE) ----------
 let printClients = [];
+// Chi ascolta solo per avvisare (Jarvis, con ?solo_avvisi=1) riceve gli ordini ma NON conta come pannello di stampa:
+// altrimenti con Jarvis aperto e la cucina spenta un ordine verrebbe segnato "stampato" senza esserlo.
+const pannelliStampa = () => printClients.filter(r => !r.soloAvvisi).length;
 
 function broadcastOrder(order) {
   const payload = `data: ${JSON.stringify(order)}\n\n`;
@@ -977,7 +980,7 @@ async function finalizeOrder(order, customerId){
   // se un pannello di stampa è collegato riceve l'ordine adesso e lo stampa subito: lo segniamo già come stampato,
   // così non viene ristampato quando il pannello si ricollega e Jarvis non dà falsi allarmi.
   // Se nessun pannello è collegato resta false e il pannello lo recupera appena si riapre.
-  order.stampato = printClients.length > 0;
+  order.stampato = pannelliStampa() > 0;
   order.phoneNormalized = normalizePhone(order.phone);
   order.addressNormalized = normalizeAddress(order.address);
   orderHistory.unshift(order);
@@ -1319,6 +1322,7 @@ app.get('/api/orders/stream', (req, res) => {
   res.flushHeaders();
   res.write('retry: 3000\n\n');
 
+  res.soloAvvisi = req.query.solo_avvisi === '1';
   printClients.push(res);
 
   req.on('close', () => {
@@ -2465,7 +2469,7 @@ app.post('/api/orders/:numeroOrdine/ristampa', async (req, res) => {
   if (!order) return res.status(404).json({ ok: false, error: 'Ordine non trovato' });
   if (!order.testoStampa) return res.status(400).json({ ok: false, error: 'Comanda senza testo da stampare' });
   stampaStaff('*** RISTAMPA ***\n' + order.testoStampa, `Ristampa ordine #${numeroOrdine}`);
-  res.json({ ok: true, numeroOrdine, pannelli: printClients.length });
+  res.json({ ok: true, numeroOrdine, pannelli: pannelliStampa() });
 });
 
 // ---------- ricerca delle voci del menu per nome (come le dice una persona) ----------
@@ -2598,7 +2602,7 @@ app.post('/api/orders/interno', async (req, res) => {
 
   order.pagatoOnline = false;
   await finalizeOrder(order, null);
-  res.json({ ok: true, numeroOrdine: order.numeroOrdine, totale: order.grandTotal, orario: order.orarioLabel, pannelli: printClients.length, esauriti });
+  res.json({ ok: true, numeroOrdine: order.numeroOrdine, totale: order.grandTotal, orario: order.orarioLabel, pannelli: pannelliStampa(), esauriti });
 });
 
 // ---------- Resoconto giornaliero via email (ogni giorno alle 23:30, ora italiana) ----------
@@ -2737,7 +2741,7 @@ app.get('/', (req, res) => {
   res.send(`
     <h2>Server ordini La Casa di Carta — attivo ✅</h2>
     <p>Ordini ricevuti in totale: ${orderHistory.length}</p>
-    <p>Pannelli di stampa collegati ora: ${printClients.length}</p>
+    <p>Pannelli di stampa collegati ora: ${pannelliStampa()}</p>
   `);
 });
 
