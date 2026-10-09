@@ -753,11 +753,16 @@ setInterval(() => {
 let orderHistory = [];
 const MAX_HISTORY = 100;
 // cerca un ordine: prima in memoria, poi nel database (dopo un riavvio del server la memoria è vuota)
+// filtro per aggiornare nel database proprio QUESTO ordine: i numeri vecchi si ripetevano
+// (prima la numerazione ripartiva da 1001 a ogni riavvio), quindi conta anche l'ora di arrivo
+function filtroOrdine(order){
+  return order && order.ricevutoAlle ? { numeroOrdine: order.numeroOrdine, ricevutoAlle: order.ricevutoAlle } : { numeroOrdine: order.numeroOrdine };
+}
 async function trovaOrdine(numeroOrdine){
   let order = orderHistory.find(o => o.numeroOrdine === numeroOrdine);
   if (order || !ordersCollection || !numeroOrdine) return order || null;
   try {
-    const doc = await ordersCollection.findOne({ numeroOrdine });
+    const doc = await ordersCollection.findOne({ numeroOrdine }, { sort: { ricevutoAlle: -1 } }); // il più recente con quel numero
     if (!doc) return null;
     delete doc._id;
     order = orderHistory.find(o => o.numeroOrdine === numeroOrdine); // nel frattempo potrebbe essere arrivato
@@ -1401,7 +1406,7 @@ app.post('/api/orders/:numeroOrdine/pronto', async (req, res) => {
   order.prontoAlle = new Date().toISOString();
 
   if (ordersCollection) {
-    ordersCollection.updateOne({ numeroOrdine }, { $set: { stato: 'pronto', prontoAlle: order.prontoAlle } }).catch(err => {
+    ordersCollection.updateOne(filtroOrdine(order), { $set: { stato: 'pronto', prontoAlle: order.prontoAlle } }).catch(err => {
       console.error('Errore aggiornamento stato ordine nel database:', err);
     });
   }
@@ -1436,7 +1441,7 @@ app.post('/api/orders/:numeroOrdine/pagamento', async (req, res) => {
   order.metodoPagamento = metodo;
 
   if (ordersCollection) {
-    ordersCollection.updateOne({ numeroOrdine }, { $set: { metodoPagamento: metodo } }).catch(err => {
+    ordersCollection.updateOne(filtroOrdine(order), { $set: { metodoPagamento: metodo } }).catch(err => {
       console.error('Errore salvataggio metodo di pagamento:', err);
     });
   }
@@ -1704,7 +1709,10 @@ app.post('/api/orders/segna-stampato', async (req, res) => {
   if (inMemoria) inMemoria.stampato = true;
 
   if (ordersCollection) {
-    try { await ordersCollection.updateOne({ numeroOrdine }, { $set: { stampato: true } }); }
+    try {
+      const filtro = inMemoria ? filtroOrdine(inMemoria) : { numeroOrdine, ricevutoAlle: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString() } };
+      await ordersCollection.updateOne(filtro, { $set: { stampato: true } });
+    }
     catch (err) { console.error('Errore salvataggio stampato:', err); }
   }
   res.json({ ok: true });
@@ -2434,7 +2442,7 @@ app.post('/api/orders/:numeroOrdine/in-consegna', async (req, res) => {
   order.inConsegnaAlle = new Date().toISOString();
 
   if (ordersCollection) {
-    ordersCollection.updateOne({ numeroOrdine }, { $set: { stato: 'in_consegna', inConsegnaAlle: order.inConsegnaAlle } }).catch(err => {
+    ordersCollection.updateOne(filtroOrdine(order), { $set: { stato: 'in_consegna', inConsegnaAlle: order.inConsegnaAlle } }).catch(err => {
       console.error('Errore aggiornamento stato ordine nel database:', err);
     });
   }
