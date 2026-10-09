@@ -2028,7 +2028,7 @@ function righeStampa(r, prefisso){
   const o = r.opzioni || {};
   const out = [`${prefisso}${r.qty}x ${r.nome}${o.max ? ' MAX' : o.mezzaMax ? ' MEZZA MAX' : ''}`];
   if (o.formato) out.push(`   formato: ${o.formato}`);
-  if (r.pane) out.push(`   pane: ${r.pane}`);
+  if (r.pane && r.pane !== 'Panino Classico') out.push(`   pane: ${r.pane}`); // il pane classico è il normale: si scrive solo Tortilla / Pan Pizza
   if (o.cottura && o.cottura !== 'Normale') out.push(`   cottura: ${o.cottura}`);
   if (o.glutine) out.push('   *** SENZA GLUTINE ***');
   if (o.senza && o.senza.length) out.push(`   SENZA: ${o.senza.join(', ')}`);
@@ -2069,17 +2069,17 @@ function testoComandaCucina(c, diff, primaVolta){
   L.push('================================');
   if (diff.aggiunte.length){
     if (!primaVolta) L.push('AGGIUNGERE:');
-    diff.aggiunte.forEach(r => L.push(...righeStampa(r, primaVolta ? '' : '+ ')));
+    diff.aggiunte.forEach((r, i) => { if (i) L.push(''); L.push(...righeStampa(r, primaVolta ? '' : '+ ')); }); // riga vuota tra un prodotto e l'altro
   }
   if (diff.tolte.length){
     if (diff.aggiunte.length) L.push('');
     L.push('TOGLIERE:');
-    diff.tolte.forEach(r => L.push(`- ${r.qty}x ${r.nome}`));
+    diff.tolte.forEach((r, i) => { if (i) L.push(''); L.push(`- ${r.qty}x ${r.nome}`); });
   }
   if (diff.note.length){
     if (diff.aggiunte.length || diff.tolte.length) L.push('');
     L.push('CAMBIARE COSI\':');
-    diff.note.forEach(r => L.push(...righeStampa(r, '* ')));
+    diff.note.forEach((r, i) => { if (i) L.push(''); L.push(...righeStampa(r, '* ')); });
   }
   if (primaVolta && c.noteComanda) { L.push(''); L.push(`NOTE: ${c.noteComanda}`); }
   L.push('================================');
