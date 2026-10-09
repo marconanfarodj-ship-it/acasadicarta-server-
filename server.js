@@ -74,6 +74,8 @@ let ordersCollection = null;
 let pendingOrdersCollection = null;
 let soldOutCollection = null;
 let soldOutCache = new Set();
+// fino a quale giorno (compreso) un prodotto resta esaurito: 'YYYY-MM-DD', oppure null = finché non lo riattivo
+let soldOutFino = new Map();
 let blacklistCollection = null;
 let blockedPhonesCache = new Set(); // riserva in memoria, usata se il database non è raggiungibile
 let ordersPaused = false; // interruttore manuale: se true, il sito rifiuta ogni nuovo ordine
@@ -92,6 +94,7 @@ let comandeMemoria = {};        // riserva in memoria se il database non è disp
 // priceOverridesCache e ha sempre la precedenza su questi valori di base.
 const DEFAULT_PRICES = {"Pizza|Faccia Di Vecchia": 3, "Pizza|Rossa": 4, "Pizza|Biancaneve": 5, "Pizza|Marinara": 4.5, "Pizza|Margherita": 5, "Pizza|Patapizza": 6.5, "Pizza|Bufala": 7, "Pizza|Diavola": 6, "Pizza|Pizza Regina": 7, "Pizza|Tonno & Cipolla": 7, "Pizza|Napoli": 6.5, "Pizza|Oslo": 6.5, "Pizza|Norma": 6.5, "Pizza|Berlino": 7, "Pizza|Tropea": 8.5, "Pizza|Helsinki": 9, "Pizza|Sfiziosa": 9, "Pizza|Nairobi": 9, "Pizza|Mosca": 9, "Pizza|Rio": 8.5, "Pizza|Tutti I Gusti": 9, "Pizza|Ripiegata": 8.5, "Pizza|4 Formaggi": 8, "Pizza|007": 8, "Pizza|La Casa Di Carta": 8.5, "Pizza|Parmigiana": 8, "Pizza|4 Stagioni": 8, "Pizza|Bella Ciao": 8, "Pizza|Marsiglia": 8.5, "Pizza|Ai Porcini": 9, "Pizza|Vegetariana": 8, "Pizza|Pizza Kebab": 9, "Pizza|Gustosa": 9, "Pizza|Tokio": 8.5, "Pizza|Bogotà": 11, "Pizza|Frutti Di Mare": 11, "Pizza|Cincinnati": 10, "Pizza|Suprema": 13, "Pizza|Denver": 8, "Pizza|Capricciosa": 8, "Pizza Dolce|Nutella": 5, "Pizza Dolce|Kinder Bueno": 7, "Pizza Dolce|Dubai": 7, "Panini|Panino Patatine, Wurstel": 3, "Panini|Panino con Patatine": 2.5, "Panini|Panino Crocchette di Patate & Patatine": 3, "Panini|Panino Patatine, Wurstel in Salsa Rosa": 3.5, "Panini|Panino Pollo al Curry & Patatine": 5, "Panini|Panino Pollo ai Funghi & Patatine": 5.5, "Panini|Panino Pollo Impanato & Patatine": 5, "Panini|Panino Pollo Messicano & Patatine": 5, "Panini|Panino Pollo al Barbecue & Patatine": 5, "Panini|Panino Petto di Pollo alla Griglia & Patatine": 5, "Panini|Panino Arrosto di Pollo & Patatine": 5, "Panini|Panino Petto di Pollo Sfilettato & Patatine": 5, "Panini|Panino Porchettata & Patatine": 4, "Panini|Panino Salame Piccante e Mozzarella & Patatine": 4, "Panini|Panino Salame Piccante e Svizzero & Patatine": 4, "Panini|Panino Bella Ciao & Patatine": 5.5, "Panini|Panino 4 Formaggi & Patatine": 4.5, "Panini|Panino Prosciutto Mozzarella & Patatine": 4, "Panini|Cocktail Di Tonno & Patatine": 5, "Panini|Panino Kebab & Patatine": 5, "Panini|Panino Polpette di Cavallo & Patatine": 6, "Panini|Panino Cavallo & Patatine": 6, "Panini|Panino Salsiccia & Patatine": 5, "Panini|Panino in Cocktail di Gamberi in Salsa Rosa & Patatine": 6.5, "Panini|Hamburger di Scottona & Patatine": 6, "Panini|Hamburger di Angus & Patatine": 6, "Panini|Panino Porchetta Artigianale e Patatine": 6, "Panini|Panino con Salsiccia di Cavallo & Patatine": 6, "Hamburger|Brooklyn": 5, "Hamburger|Bronx": 8, "Hamburger|Spicy": 8, "Hamburger|Manathan": 9, "Hamburger|Queens": 5, "Focacce|Focaccia Vuota Da Condire": 3, "Focacce|Casareccia": 4.5, "Focacce|Focaccia Prosciutto": 6.5, "Focacce|Focaccia Caprese": 6.5, "Focacce|Focaccia Del Pirata": 6.5, "Focacce|Focaccia Mista": 7, "Focacce|Deliziosa": 7, "Focacce|Focaccia 4 Formaggi": 7.5, "Focacce|Bella Ciao": 8, "Focacce|Focaccia Nairobi": 9, "Fritture|Vaschetta Piccola — Patatine": 2, "Fritture|Vaschetta Media — Patatine": 3, "Fritture|Patatine con Buccia": 3, "Fritture|Vaschetta Piccola — 4 Würstel & Patatine": 2, "Fritture|Vaschetta — 8 Würstel": 2, "Fritture|Vaschetta — Crocchette di Patate": 2, "Fritture|Vaschetta di Kebab": 3, "Fritture|Anelli di Cipolla": 3, "Fritture|Panzerotti Fritti Mignon Pomodoro e Mozzarella": 3, "Fritture|Mozzarelline Impanate": 3.5, "Fritture|Bocconcini Pollo Amadori Impanato Piccante": 3.5, "Fritture|Arancini Mignon al Ragù": 3, "Fritture|Nuggets 10 Pezzi": 5, "Bevande|Gassosa": 1, "Bevande|Acqua Naturale Piccola": 1, "Bevande|Acqua Frizzante": 1, "Bevande|Coca Cola 33": 2, "Bevande|Coca Cola Zero": 2, "Bevande|Birra Moretti": 2, "Bevande|Birra Peroni": 2, "Bevande|Coca Cola Vetro cl 33": 2.5, "Bevande|Estathe Pesca": 2.5, "Bevande|Estathe Limone": 2.5, "Bevande|Nastro Azzurro": 3, "Bevande|Ceres": 3.5, "Bevande|Coca Cola Bottiglia Grande": 4, "Bevande|Birra Messina Grande": 5, "Bevande|Birra Nastro Azzurro Grande": 5, "Bevande|Peroni Chill Lemon": 2.5, "Extra|Bustina Maionese": 0.25, "Extra|Bustina Ketchup": 0.25, "EXTRA_PIZZA|Extra Mozzarella": 1.5, "EXTRA_PIZZA|Scaglie di Grana Padano DOP": 1, "EXTRA_PIZZA|Patatine": 1.5, "EXTRA_PIZZA|Gorgonzola": 1, "EXTRA_PIZZA|Formaggio Svizzero": 0.5, "EXTRA_PIZZA|Prosciutto Crudo Ferrarini": 1.5, "EXTRA_PIZZA|Olive": 0.5, "EXTRA_PIZZA|Rucola": 0.5, "EXTRA_PIZZA|Ciliegino": 0.5, "EXTRA_PIZZA|Piselli": 0.5, "EXTRA_PIZZA|Funghi": 1, "EXTRA_PIZZA|Speck": 1, "EXTRA_PIZZA|Funghi Porcini": 2.5, "EXTRA_PIZZA|Lattuga": 0.5, "EXTRA_PIZZA|Spinaci": 0.5, "EXTRA_PIZZA|Cipolla": 0.5, "EXTRA_PIZZA|Carciofi in Spicchi": 1, "EXTRA_PIZZA|Prosciutto Cotto": 1, "EXTRA_PIZZA|Uovo": 0.5, "EXTRA_PIZZA|Wurstel": 0.5, "EXTRA_PIZZA|Granella di Pistacchio": 2, "EXTRA_PIZZA|Crocchette Patate": 1, "EXTRA_PIZZA|Crema di Pistacchio": 2, "EXTRA_PIZZA|Acciughe": 1, "EXTRA_PIZZA|Tonno": 1.5, "EXTRA_PIZZA|Salame Piccante": 1, "EXTRA_PIZZA|Bresaola": 2.5, "EXTRA_PIZZA|Polpette di Cavallo": 3, "EXTRA_PIZZA|Bacon": 1, "EXTRA_PIZZA|Mozzarella di Bufala": 2, "EXTRA_PIZZA|Salmone": 2.5, "EXTRA_PIZZA|Patate della Nonna": 1, "EXTRA_PIZZA|Salsiccia di Maiale": 1.5, "EXTRA_PIZZA|Fettina di Pollo alla Griglia": 3.5, "EXTRA_PIZZA|Pollo Sfilettato": 3.5, "EXTRA_PIZZA|Pollo al Curry": 3.5, "EXTRA_PIZZA|Fettina di Cavallo": 4, "EXTRA_PIZZA|Melanzana Fritta": 1, "EXTRA_PIZZA|Stracciatella di Bufala": 2, "EXTRA_PIZZA|Capuliato": 0.5, "EXTRA_PIZZA|Kebab": 3.5, "EXTRA_PIZZA|Pollo Impanato": 4, "EXTRA_PIZZA|Cipolla Croccante": 0.5, "EXTRA_PANINO|Lattuga": 0.5, "EXTRA_PANINO|Ciliegino": 0.5, "EXTRA_PANINO|Cipolla": 0.5, "EXTRA_PANINO|Mozzarella": 0.5, "EXTRA_PANINO|Gorgonzola": 0.5, "EXTRA_PANINO|Würstel": 0.5, "EXTRA_PANINO|Grana Padano DOP": 0.5, "EXTRA_PANINO|Formaggio Svizzero": 0.5, "EXTRA_PANINO|Prosciutto Crudo": 1.5, "EXTRA_PANINO|Speck": 0.5, "EXTRA_PANINO|Prosciutto Cotto": 1, "EXTRA_PANINO|Crocchette di Patate": 1, "EXTRA_PANINO|Salame Piccante": 1, "EXTRA_PANINO|Funghi Freschi": 1, "EXTRA_PANINO|Mozzarella di Bufala": 2, "EXTRA_PANINO|Granella di Pistacchio": 1, "EXTRA_PANINO|Crema di Pistacchio": 1, "EXTRA_PANINO|Würstel in Salsa Rosa": 1.5, "EXTRA_PANINO|Bresaola": 2, "EXTRA_PANINO|Rucola": 0.5, "EXTRA_PANINO|Salmone 50g": 3, "EXTRA_PANINO|Funghi Piccanti": 1, "EXTRA_PANINO|Cipolla Croccante": 0.5};
 let priceOverridesCollection = null;
+let priceOverridesCache = {}; // prezzi cambiati dal titolare (riempito dal database all'avvio)
 
 function getCurrentPrice(chiave){
   if (priceOverridesCache[chiave] !== undefined) return priceOverridesCache[chiave];
@@ -129,6 +132,9 @@ async function connectDB(){
     await pendingOrdersCollection.createIndex({ createdAt: 1 }, { expireAfterSeconds: 60 * 60 * 24 });
     const soldOutDocs = await soldOutCollection.find({}).toArray();
     soldOutCache = new Set(soldOutDocs.map(d => d._id));
+    // quelli segnati prima di questa funzione non avevano una scadenza: valgono per la giornata di oggi
+    soldOutFino = new Map(soldOutDocs.map(d => [d._id, d.fino === undefined ? giornoServizio() : d.fino]));
+    scadenzaEsauriti();
     const blockedDocs = await blacklistCollection.find({}).toArray();
     blockedPhonesCache = new Set(blockedDocs.map(d => d._id));
     priceOverridesCollection = db.collection('priceOverrides');
@@ -1516,9 +1522,43 @@ app.post('/api/custom-menu-items/delete', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- Esauriti a tempo ----------
+// La "giornata di lavoro" finisce alle 5 di mattina: un esaurito di stasera vale anche dopo mezzanotte
+function giornoServizio(d){
+  return dateKey(new Date((d ? d.getTime() : Date.now()) - 5 * 60 * 60 * 1000));
+}
+function esauritiDettagli(){
+  const out = {};
+  soldOutCache.forEach(k => { out[k] = soldOutFino.has(k) ? soldOutFino.get(k) : null; });
+  return out;
+}
+function avvisaEsauriti(){
+  broadcastOrder({ evento: 'esauriti_aggiornati', esauriti: [...soldOutCache], fino: esauritiDettagli() });
+}
+// toglie gli esauriti scaduti (il giorno dopo tornano disponibili da soli)
+function scadenzaEsauriti(){
+  const oggi = giornoServizio();
+  const scaduti = [...soldOutCache].filter(k => { const f = soldOutFino.get(k); return f && f < oggi; });
+  if (!scaduti.length) return false;
+  scaduti.forEach(k => { soldOutCache.delete(k); soldOutFino.delete(k); });
+  if (soldOutCollection) {
+    soldOutCollection.deleteMany({ _id: { $in: scaduti } }).catch(err => console.error('Errore scadenza esauriti:', err));
+  }
+  console.log(`Di nuovo disponibili: ${scaduti.join(', ')}`);
+  avvisaEsauriti();
+  return true;
+}
+setInterval(scadenzaEsauriti, 60 * 1000);
+
 // ---------- Endpoint: elenco prodotti attualmente esauriti ----------
 app.get('/api/sold-out', (req, res) => {
+  scadenzaEsauriti();
   res.json([...soldOutCache]);
+});
+// stesso elenco con la scadenza di ognuno (per il pannello)
+app.get('/api/sold-out/dettagli', (req, res) => {
+  scadenzaEsauriti();
+  res.json({ ok: true, oggi: giornoServizio(), fino: esauritiDettagli() });
 });
 
 // ---------- Endpoint: interruttore "sospendi ordini" (usato dal pannello di stampa) ----------
@@ -2012,6 +2052,30 @@ function normalizzaRighe(righe){
   }).filter(r => r.nome && r.qty > 0);
 }
 
+// ---------- pagamenti separati: un cliente paga i suoi piatti, il resto rimane nella comanda ----------
+function pagatoComanda(c){
+  return round2((c.pagamenti || []).reduce((t, p) => t + (Number(p.importo) || 0), 0));
+}
+function residuoComanda(c){
+  const piatti = (c.righe || []).reduce((t, r) => t + r.prezzo * Math.max(0, r.qty - (r.pagate || 0)), 0);
+  return round2(piatti + (c.stato === 'chiusa' ? 0 : (c.spese || 0))); // la consegna si paga alla chiusura
+}
+function conTotali(c){
+  return { ...c, totale: totaleComanda(c), pagato: pagatoComanda(c), residuo: residuoComanda(c) };
+}
+// quando l'app salva le righe, i pezzi già pagati non si possono perdere né togliere
+function mantieniPagate(vecchie, nuove){
+  const prima = new Map((vecchie || []).map(r => [r.rid, r]));
+  nuove.forEach(r => {
+    const p = prima.get(r.rid);
+    r.pagate = p ? Math.min(p.pagate || 0, 99) : 0;
+    if (r.qty < r.pagate) r.qty = r.pagate;
+    if (!r.pagate) delete r.pagate;
+  });
+  (vecchie || []).forEach(p => { if ((p.pagate || 0) > 0 && !nuove.some(r => r.rid === p.rid)) nuove.push({ ...p, qty: p.pagate }); });
+  return nuove;
+}
+
 function totaleComanda(c){
   return round2((c.righe || []).reduce((t, r) => t + r.prezzo * r.qty, 0));
 }
@@ -2024,6 +2088,12 @@ function firmaRiga(r){
     [...(o.rifinitura || [])].sort(), [...(o.salse || [])].sort()]);
 }
 // righe di stampa per un piatto: nome, pane, extra, nota
+// extra uguali messi più volte (doppio prosciutto...): "2x Prosciutto"
+function nomiExtra(list){
+  const m = new Map();
+  (list || []).forEach(e => { const k = e.chiave || e.nome; const x = m.get(k); if (x) x.n++; else m.set(k, { nome: e.nome, n: 1 }); });
+  return [...m.values()].map(x => (x.n > 1 ? `${x.n}x ` : '') + x.nome);
+}
 function righeStampa(r, prefisso){
   const o = r.opzioni || {};
   const out = [`${prefisso}${r.qty}x ${r.nome}${o.max ? ' MAX' : o.mezzaMax ? ' MEZZA MAX' : ''}`];
@@ -2032,7 +2102,7 @@ function righeStampa(r, prefisso){
   if (o.cottura && o.cottura !== 'Normale') out.push(`   cottura: ${o.cottura}`);
   if (o.glutine) out.push('   *** SENZA GLUTINE ***');
   if (o.senza && o.senza.length) out.push(`   SENZA: ${o.senza.join(', ')}`);
-  if (r.extra && r.extra.length) out.push(`   + ${r.extra.map(e => e.nome).join(', + ')}`);
+  if (r.extra && r.extra.length) out.push(`   + ${nomiExtra(r.extra).join(', + ')}`);
   if (o.rifinitura && o.rifinitura.length) out.push(`   con: ${o.rifinitura.join(', ')}`);
   if (o.salse && o.salse.length) out.push(`   salse: ${o.salse.join(', ')}`);
   if (r.note) out.push(`   >> ${r.note}`);
@@ -2086,25 +2156,46 @@ function testoComandaCucina(c, diff, primaVolta){
   return L.join('\n');
 }
 
-function testoConto(c){
+// selezione: [{rid, qty}] = conto parziale solo di quei pezzi; senza selezione = tutto quello che resta da pagare
+function testoConto(c, selezione){
   const L = [];
   L.push('PIZZERIA LA CASA DI CARTA');
   L.push('Via XX Settembre 192 - Niscemi');
   L.push('--------------------------------');
   L.push(`${etichettaComanda(c)} - ${oraIT()}`);
-  L.push('PRECONTO (non fiscale)');
+  L.push(selezione ? 'CONTO PARZIALE (non fiscale)' : 'PRECONTO (non fiscale)');
   L.push('--------------------------------');
+  const sel = selezione ? new Map(selezione.map(v => [v.rid, v.qty])) : null;
+  let tot = 0;
   (c.righe || []).forEach(r => {
+    const n = sel ? (sel.get(r.rid) || 0) : Math.max(0, r.qty - (r.pagate || 0));
+    if (!n) return;
     const o = r.opzioni || {};
-    L.push(`${r.qty}x ${r.nome}${o.max ? ' MAX' : o.mezzaMax ? ' MEZZA MAX' : ''}${o.formato ? ' ' + o.formato : ''}  ${money(r.prezzo * r.qty)}`);
-    (r.extra || []).forEach(e => L.push(`   + ${e.nome}`));
+    tot += r.prezzo * n;
+    L.push(`${n}x ${r.nome}${o.max ? ' MAX' : o.mezzaMax ? ' MEZZA MAX' : ''}${o.formato ? ' ' + o.formato : ''}  ${money(r.prezzo * n)}`);
+    nomiExtra(r.extra).forEach(x => L.push(`   + ${x}`));
     if (o.glutine) L.push('   senza glutine');
     if (r.pane && STAFF_PANE_PREZZI[r.pane]) L.push(`   pane: ${r.pane}`);
   });
   L.push('--------------------------------');
-  if (c.spese) L.push(`Consegna: ${money(c.spese)}`);
-  L.push(`TOTALE: ${money(totaleComanda(c) + (c.spese || 0))}`);
+  if (!sel && c.spese) { L.push(`Consegna: ${money(c.spese)}`); tot += c.spese; }
+  const pagato = pagatoComanda(c);
+  if (!sel && pagato > 0) L.push(`Gia' pagato: ${money(pagato)}`);
+  L.push(`${sel ? 'DA PAGARE' : pagato > 0 ? 'RESTA DA PAGARE' : 'TOTALE'}: ${money(tot)}`);
   return L.join('\n');
+}
+function selezioneValida(c, voci){
+  if (!Array.isArray(voci)) return { errore: 'Scegli almeno un prodotto' };
+  const out = [];
+  for (const v of voci.slice(0, 300)) {
+    const r = (c.righe || []).find(x => x.rid === String(v.rid || ''));
+    const n = parseInt(v.qty, 10) || 0;
+    if (!r || n <= 0) continue;
+    const resta = r.qty - (r.pagate || 0);
+    if (n > resta) return { errore: `${r.nome}: ne restano da pagare solo ${resta}` };
+    out.push({ rid: r.rid, qty: n });
+  }
+  return out.length ? out : { errore: 'Scegli almeno un prodotto' };
 }
 
 function stampaStaff(testo, rif){
@@ -2131,14 +2222,14 @@ app.get('/api/staff/comande', async (req, res) => {
     const stato = req.query.stato === 'chiusa' ? 'chiusa' : 'aperta';
     const filtro = stato === 'aperta' ? { stato: 'aperta' } : { stato: 'chiusa', giorno: dateKey(new Date()) };
     const lista = await comandeList(filtro);
-    res.json(lista.map(c => ({ ...c, totale: totaleComanda(c) })));
+    res.json(lista.map(c => (conTotali(c))));
   } catch (err) { console.error(err); res.status(500).json({ ok: false, error: 'Errore server' }); }
 });
 
 app.get('/api/staff/comande/:id', async (req, res) => {
   const c = await comandaGet(req.params.id);
   if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
-  res.json({ ...c, totale: totaleComanda(c) });
+  res.json(conTotali(c));
 });
 
 // nuova comanda
@@ -2148,7 +2239,7 @@ app.post('/api/staff/comande', async (req, res) => {
     if (info.tipo === 'tavolo' && !info.tavolo) return res.status(400).json({ ok: false, error: 'Scrivi il numero del tavolo' });
     if (info.tipo === 'tavolo') {
       const giaAperta = (await comandeList({ stato: 'aperta' })).find(c => c.tipo === 'tavolo' && c.tavolo === info.tavolo);
-      if (giaAperta) return res.json({ ok: true, esistente: true, comanda: { ...giaAperta, totale: totaleComanda(giaAperta) } });
+      if (giaAperta) return res.json({ ok: true, esistente: true, comanda: conTotali(giaAperta) });
     }
     const giorno = dateKey(new Date());
     const diOggi = await comandeList({ giorno });
@@ -2159,7 +2250,7 @@ app.post('/api/staff/comande', async (req, res) => {
       creataAlle: new Date().toISOString()
     };
     await comandaSave(c);
-    res.json({ ok: true, comanda: { ...c, totale: 0 } });
+    res.json({ ok: true, comanda: conTotali(c) });
   } catch (err) { console.error(err); res.status(500).json({ ok: false, error: 'Errore server' }); }
 });
 
@@ -2168,7 +2259,7 @@ app.put('/api/staff/comande/:id', async (req, res) => {
   const c = await comandaGet(req.params.id);
   if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
   const b = req.body || {};
-  if (Array.isArray(b.righe)) c.righe = normalizzaRighe(b.righe);
+  if (Array.isArray(b.righe)) c.righe = mantieniPagate(c.righe, normalizzaRighe(b.righe));
   if (b.info) {
     const info = infoComandaDaBody(b.info, c);
     if (info.tipo === 'tavolo' && info.tavolo !== c.tavolo) {
@@ -2178,17 +2269,17 @@ app.put('/api/staff/comande/:id', async (req, res) => {
     Object.assign(c, info);
   }
   await comandaSave(c);
-  res.json({ ok: true, comanda: { ...c, totale: totaleComanda(c) } });
+  res.json({ ok: true, comanda: conTotali(c) });
 });
 
 // manda in cucina: stampa solo le differenze rispetto all'ultimo invio
 app.post('/api/staff/comande/:id/invia', async (req, res) => {
   const c = await comandaGet(req.params.id);
   if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
-  if (Array.isArray((req.body || {}).righe)) c.righe = normalizzaRighe(req.body.righe);
+  if (Array.isArray((req.body || {}).righe)) c.righe = mantieniPagate(c.righe, normalizzaRighe(req.body.righe));
   const diff = diffComanda(c.inviate, c.righe);
   if (!diff.aggiunte.length && !diff.tolte.length && !diff.note.length) {
-    return res.json({ ok: true, nienteDaInviare: true, comanda: { ...c, totale: totaleComanda(c) } });
+    return res.json({ ok: true, nienteDaInviare: true, comanda: conTotali(c) });
   }
   const primaVolta = c.invii === 0;
   c.invii += 1;
@@ -2196,7 +2287,7 @@ app.post('/api/staff/comande/:id/invia', async (req, res) => {
   c.inviate = c.righe.map(r => ({ ...r }));
   c.ultimoInvio = new Date().toISOString();
   await comandaSave(c);
-  res.json({ ok: true, comanda: { ...c, totale: totaleComanda(c) } });
+  res.json({ ok: true, comanda: conTotali(c) });
 });
 
 app.post('/api/staff/comande/:id/ristampa', async (req, res) => {
@@ -2212,17 +2303,62 @@ app.post('/api/staff/comande/:id/ristampa', async (req, res) => {
 app.post('/api/staff/comande/:id/conto', async (req, res) => {
   const c = await comandaGet(req.params.id);
   if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
-  stampaStaff(testoConto(c), `Conto ${etichettaComanda(c)}`);
+  const voci = (req.body || {}).voci;
+  if (Array.isArray(voci)) {
+    const sel = selezioneValida(c, voci);
+    if (sel.errore) return res.status(400).json({ ok: false, error: sel.errore });
+    stampaStaff(testoConto(c, sel), `Conto parziale ${etichettaComanda(c)}`);
+  } else {
+    stampaStaff(testoConto(c), `Conto ${etichettaComanda(c)}`);
+  }
   res.json({ ok: true });
+});
+
+// paga solo alcuni pezzi: restano nella comanda segnati come pagati, il resto si paga dopo
+app.post('/api/staff/comande/:id/paga-parte', async (req, res) => {
+  const c = await comandaGet(req.params.id);
+  if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
+  if (c.stato !== 'aperta') return res.status(400).json({ ok: false, error: 'La comanda non è aperta' });
+  const b = req.body || {};
+  if (Array.isArray(b.righe)) c.righe = mantieniPagate(c.righe, normalizzaRighe(b.righe)); // ultime modifiche non ancora salvate
+  const sel = selezioneValida(c, b.voci);
+  if (sel.errore) return res.status(400).json({ ok: false, error: sel.errore });
+  const metodo = b.pagamento === 'carta' ? 'carta' : 'contanti';
+  let importo = 0;
+  const voci = sel.map(v => {
+    const r = c.righe.find(x => x.rid === v.rid);
+    r.pagate = (r.pagate || 0) + v.qty;
+    importo += r.prezzo * v.qty;
+    return { rid: r.rid, nome: r.nome, qty: v.qty, prezzo: r.prezzo };
+  });
+  c.pagamenti = c.pagamenti || [];
+  c.pagamenti.push({ importo: round2(importo), metodo, voci, alle: new Date().toISOString() });
+  let chiusa = false;
+  if (!c.spese && residuoComanda(c) <= 0.004) { // pagato tutto: la comanda si chiude da sola
+    c.stato = 'chiusa';
+    c.totaleIncassato = pagatoComanda(c);
+    c.pagamento = c.pagamenti.every(p => p.metodo === 'carta') ? 'carta' : c.pagamenti.every(p => p.metodo === 'contanti') ? 'contanti' : 'misto';
+    c.chiusaAlle = new Date().toISOString();
+    chiusa = true;
+  }
+  await comandaSave(c);
+  res.json({ ok: true, importo: round2(importo), chiusa, comanda: conTotali(c) });
 });
 
 app.post('/api/staff/comande/:id/chiudi', async (req, res) => {
   const c = await comandaGet(req.params.id);
   if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
   const pagamento = ['contanti', 'carta'].includes((req.body || {}).pagamento) ? req.body.pagamento : 'contanti';
+  // quello che resta da pagare si incassa adesso; i pagamenti separati fatti prima restano
+  const resto = residuoComanda(c);
+  c.pagamenti = c.pagamenti || [];
+  if (resto > 0) {
+    c.pagamenti.push({ importo: resto, metodo: pagamento, chiusura: true, alle: new Date().toISOString() });
+    c.righe.forEach(r => { r.pagate = r.qty; });
+  }
   c.stato = 'chiusa';
-  c.pagamento = pagamento;
-  c.totaleIncassato = round2(totaleComanda(c) + (c.spese || 0));
+  c.pagamento = c.pagamenti.length && c.pagamenti.every(p => p.metodo === pagamento) ? pagamento : (c.pagamenti.length ? 'misto' : pagamento);
+  c.totaleIncassato = pagatoComanda(c);
   c.chiusaAlle = new Date().toISOString();
   await comandaSave(c);
   res.json({ ok: true });
@@ -2232,9 +2368,17 @@ app.post('/api/staff/comande/:id/riapri', async (req, res) => {
   const c = await comandaGet(req.params.id);
   if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
   c.stato = 'aperta';
+  // tolgo l'incasso della chiusura (i pagamenti separati fatti prima restano validi)
+  const chiusura = (c.pagamenti || []).find(p => p.chiusura);
+  if (chiusura) {
+    c.pagamenti = c.pagamenti.filter(p => p !== chiusura);
+    const pagatiPrima = new Map();
+    c.pagamenti.forEach(p => (p.voci || []).forEach(v => pagatiPrima.set(v.rid, (pagatiPrima.get(v.rid) || 0) + v.qty)));
+    (c.righe || []).forEach(r => { r.pagate = Math.min(r.qty, pagatiPrima.get(r.rid) || 0); if (!r.pagate) delete r.pagate; });
+  }
   delete c.pagamento; delete c.totaleIncassato; delete c.chiusaAlle;
   await comandaSave(c);
-  res.json({ ok: true, comanda: { ...c, totale: totaleComanda(c) } });
+  res.json({ ok: true, comanda: conTotali(c) });
 });
 
 // annulla: se qualcosa era già in cucina, stampa l'avviso di annullamento
@@ -2305,7 +2449,9 @@ app.get('/api/staff/stats', soloTitolare, async (req, res) => {
       if (c.giorno >= inizioMese) dove.push(per.mese);
       dove.forEach(a => {
         a.incasso += imp; a.comande++;
-        if (c.pagamento === 'carta') a.carta += imp; else a.contanti += imp;
+        if (Array.isArray(c.pagamenti) && c.pagamenti.length) {
+          c.pagamenti.forEach(p => { if (p.metodo === 'carta') a.carta += Number(p.importo) || 0; else a.contanti += Number(p.importo) || 0; });
+        } else if (c.pagamento === 'carta') a.carta += imp; else a.contanti += imp;
         if (c.tipo === 'tavolo') a.tavoli++; else a.asporto++;
         (c.righe || []).forEach(r => {
           if (!a.piatti[r.nome]) a.piatti[r.nome] = { qty: 0, incasso: 0 };
@@ -2328,7 +2474,7 @@ app.get('/api/staff/stats', soloTitolare, async (req, res) => {
     const aperte = await comandeList({ stato: 'aperta' });
     res.json({
       oggi: fine(per.oggi), settimana: fine(per.settimana), mese: fine(per.mese), ultimi14,
-      aperte: { numero: aperte.length, totale: round2(aperte.reduce((t, c) => t + totaleComanda(c) + (c.spese || 0), 0)) }
+      aperte: { numero: aperte.length, totale: round2(aperte.reduce((t, c) => t + residuoComanda(c), 0)) }
     });
   } catch (err) { console.error('Errore statistiche staff:', err); res.status(500).json({ ok: false, error: 'Errore server' }); }
 });
@@ -2386,12 +2532,13 @@ app.post('/api/blacklist/remove', async (req, res) => {
 // ---------- Endpoint: segna tutti i prodotti come disponibili (azzera l'elenco esauriti) ----------
 app.post('/api/sold-out/reset-all', async (req, res) => {
   soldOutCache = new Set();
+  soldOutFino = new Map();
   if (soldOutCollection) {
     await soldOutCollection.deleteMany({}).catch(err => {
       console.error('Errore azzeramento esauriti:', err);
     });
   }
-  broadcastOrder({ evento: 'esauriti_aggiornati', esauriti: [] });
+  avvisaEsauriti();
   res.json({ ok: true });
 });
 
@@ -2401,14 +2548,22 @@ app.post('/api/sold-out/toggle', async (req, res) => {
   if (!chiave) return res.status(400).json({ ok: false, error: 'Manca la chiave del prodotto' });
 
   if (esaurito) {
+    // fino: 'oggi' (predefinito: domani torna disponibile), una data 'YYYY-MM-DD', oppure 'sempre'
+    const richiesto = String((req.body && req.body.fino) || 'oggi');
+    const oggi = giornoServizio();
+    let fino = oggi;
+    if (richiesto === 'sempre') fino = null;
+    else if (/^\d{4}-\d{2}-\d{2}$/.test(richiesto) && richiesto >= oggi) fino = richiesto;
     soldOutCache.add(chiave);
+    soldOutFino.set(chiave, fino);
     if (soldOutCollection) {
-      await soldOutCollection.updateOne({ _id: chiave }, { $set: { _id: chiave } }, { upsert: true }).catch(err => {
+      await soldOutCollection.updateOne({ _id: chiave }, { $set: { _id: chiave, fino } }, { upsert: true }).catch(err => {
         console.error('Errore salvataggio esaurito:', err);
       });
     }
   } else {
     soldOutCache.delete(chiave);
+    soldOutFino.delete(chiave);
     if (soldOutCollection) {
       await soldOutCollection.deleteOne({ _id: chiave }).catch(err => {
         console.error('Errore rimozione esaurito:', err);
@@ -2416,8 +2571,8 @@ app.post('/api/sold-out/toggle', async (req, res) => {
     }
   }
 
-  broadcastOrder({ evento: 'esauriti_aggiornati', esauriti: [...soldOutCache] });
-  res.json({ ok: true, esauriti: [...soldOutCache] });
+  avvisaEsauriti();
+  res.json({ ok: true, esauriti: [...soldOutCache], fino: esauritiDettagli(), oggi: giornoServizio() });
 });
 
 app.get('/api/orders/pronti-consegna', (req, res) => {
