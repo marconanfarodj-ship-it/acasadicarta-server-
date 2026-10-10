@@ -2094,9 +2094,14 @@ function nomiExtra(list){
   (list || []).forEach(e => { const k = e.chiave || e.nome; const x = m.get(k); if (x) x.n++; else m.set(k, { nome: e.nome, n: 1 }); });
   return [...m.values()].map(x => (x.n > 1 ? `${x.n}x ` : '') + x.nome);
 }
+// riga con il prezzo a destra (32 caratteri = larghezza dello scontrino)
+function rigaPrezzo(sx, prezzo){
+  const dx = (prezzo < 0 ? '-' : '') + money(Math.abs(prezzo));
+  return sx.length + dx.length + 2 <= 32 ? sx + ' '.repeat(32 - sx.length - dx.length) + dx : `${sx}  ${dx}`;
+}
 function righeStampa(r, prefisso){
   const o = r.opzioni || {};
-  const out = [`${prefisso}${r.qty}x ${r.nome}${o.max ? ' MAX' : o.mezzaMax ? ' MEZZA MAX' : ''}`];
+  const out = [rigaPrezzo(`${prefisso}${r.qty}x ${r.nome}${o.max ? ' MAX' : o.mezzaMax ? ' MEZZA MAX' : ''}`, (Number(r.prezzo) || 0) * r.qty)];
   if (o.formato) out.push(`   formato: ${o.formato}`);
   if (r.pane && r.pane !== 'Panino Classico') out.push(`   pane: ${r.pane}`); // il pane classico è il normale: si scrive solo Tortilla / Pan Pizza
   if (o.cottura && o.cottura !== 'Normale') out.push(`   cottura: ${o.cottura}`);
@@ -2144,7 +2149,7 @@ function testoComandaCucina(c, diff, primaVolta){
   if (diff.tolte.length){
     if (diff.aggiunte.length) L.push('');
     L.push('TOGLIERE:');
-    diff.tolte.forEach((r, i) => { if (i) L.push(''); L.push(`- ${r.qty}x ${r.nome}`); });
+    diff.tolte.forEach((r, i) => { if (i) L.push(''); L.push(rigaPrezzo(`- ${r.qty}x ${r.nome}`, -(Number(r.prezzo) || 0) * r.qty)); });
   }
   if (diff.note.length){
     if (diff.aggiunte.length || diff.tolte.length) L.push('');
@@ -2152,6 +2157,9 @@ function testoComandaCucina(c, diff, primaVolta){
     diff.note.forEach((r, i) => { if (i) L.push(''); L.push(...righeStampa(r, '* ')); });
   }
   if (primaVolta && c.noteComanda) { L.push(''); L.push(`NOTE: ${c.noteComanda}`); }
+  L.push('--------------------------------');
+  if (c.spese) L.push(rigaPrezzo('Consegna', c.spese));
+  L.push(rigaPrezzo(primaVolta ? 'TOTALE' : 'TOTALE COMANDA', totaleComanda(c) + (c.spese || 0)));
   L.push('================================');
   return L.join('\n');
 }
@@ -2164,6 +2172,13 @@ function testoConto(c, selezione){
   L.push('--------------------------------');
   L.push(`${etichettaComanda(c)} - ${oraIT()}`);
   L.push(selezione ? 'CONTO PARZIALE (non fiscale)' : 'PRECONTO (non fiscale)');
+  // asporto e domicilio: dati del cliente (serve al fattorino che porta il conto)
+  if (c.tipo !== 'tavolo') {
+    if (c.nome) L.push(`Cliente: ${c.nome}`);
+    if (c.telefono) L.push(`Tel: ${c.telefono}`);
+    if (c.tipo === 'consegna') L.push(`Indirizzo: ${c.indirizzo || '(manca indirizzo)'}`);
+    if (c.orario) L.push(`Per le ore: ${c.orario}`);
+  }
   L.push('--------------------------------');
   const sel = selezione ? new Map(selezione.map(v => [v.rid, v.qty])) : null;
   let tot = 0;
@@ -2172,16 +2187,16 @@ function testoConto(c, selezione){
     if (!n) return;
     const o = r.opzioni || {};
     tot += r.prezzo * n;
-    L.push(`${n}x ${r.nome}${o.max ? ' MAX' : o.mezzaMax ? ' MEZZA MAX' : ''}${o.formato ? ' ' + o.formato : ''}  ${money(r.prezzo * n)}`);
+    L.push(rigaPrezzo(`${n}x ${r.nome}${o.max ? ' MAX' : o.mezzaMax ? ' MEZZA MAX' : ''}${o.formato ? ' ' + o.formato : ''}`, r.prezzo * n));
     nomiExtra(r.extra).forEach(x => L.push(`   + ${x}`));
     if (o.glutine) L.push('   senza glutine');
     if (r.pane && STAFF_PANE_PREZZI[r.pane]) L.push(`   pane: ${r.pane}`);
   });
   L.push('--------------------------------');
-  if (!sel && c.spese) { L.push(`Consegna: ${money(c.spese)}`); tot += c.spese; }
+  if (!sel && c.spese) { L.push(rigaPrezzo('Consegna', c.spese)); tot += c.spese; }
   const pagato = pagatoComanda(c);
-  if (!sel && pagato > 0) L.push(`Gia' pagato: ${money(pagato)}`);
-  L.push(`${sel ? 'DA PAGARE' : pagato > 0 ? 'RESTA DA PAGARE' : 'TOTALE'}: ${money(tot)}`);
+  if (!sel && pagato > 0) L.push(rigaPrezzo("Gia' pagato", pagato));
+  L.push(rigaPrezzo(sel ? 'DA PAGARE' : pagato > 0 ? 'RESTA DA PAGARE' : 'TOTALE', tot));
   return L.join('\n');
 }
 function selezioneValida(c, voci){
