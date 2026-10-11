@@ -146,6 +146,10 @@ async function connectDB(){
     ordersPaused = !!(pausedDoc && pausedDoc.value);
     const salaDoc = await settingsCollection.findOne({ _id: 'soloSala' });
     if (salaDoc && Array.isArray(salaDoc.value)) soloSalaCache = new Set(salaDoc.value);
+    const cfgDoc = await settingsCollection.findOne({ _id: 'config' });
+    if (cfgDoc && cfgDoc.value) impostaConfig(cfgDoc.value);
+    const pwDoc = await settingsCollection.findOne({ _id: 'titolarePassword' });
+    if (pwDoc && pwDoc.hash) titolarePwHash = pwDoc.hash;
     const calDoc = await settingsCollection.findOne({ _id: 'calendario' });
     if (calDoc && calDoc.value) calendario = { chiusi: calDoc.value.chiusi || [], aperti: calDoc.value.aperti || [] };
     const dimDoc = await settingsCollection.findOne({ _id: 'dimensioneStampa' });
@@ -466,13 +470,13 @@ function buildCustomerConfirmationHtml(order) {
 
 // ---------- Slot di consegna: max 3 ordini ogni 15 minuti ----------
 const SLOT_MINUTES = 15;
-const MAX_PER_SLOT = 3;
-const MIN_DELIVERY_ORDER = 10.00;
-const OPEN_FROM_HOUR = 19;
-const OPEN_TO_HOUR = 23;
-const CLOSED_WEEKDAY = 2; // 0=domenica, 1=lunedì, 2=martedì...
-const MAX_DAYS_AHEAD = 3; // si può ordinare/prenotare da oggi fino a 3 giorni dopo
-const ASAP_DISABLED_WEEKDAYS_CONSEGNA = [0, 6]; // 0=domenica, 6=sabato: niente "il prima possibile" per le consegne
+let MAX_PER_SLOT = 3;
+let MIN_DELIVERY_ORDER = 10.00;
+let OPEN_FROM_HOUR = 19;
+let OPEN_TO_HOUR = 23;
+let CLOSED_WEEKDAY = 2; // 0=domenica, 1=lunedì, 2=martedì...
+let MAX_DAYS_AHEAD = 3; // si può ordinare/prenotare da oggi fino a 3 giorni dopo
+let ASAP_DISABLED_WEEKDAYS_CONSEGNA = [0, 6]; // 0=domenica, 6=sabato: niente "il prima possibile" per le consegne
 
 // catalogo di categorie e nomi articoli (usato dal pannello di stampa per segnare i prodotti esauriti)
 const MENU_CATALOG = [{"cat": "Pizza", "items": ["Faccia Di Vecchia", "Rossa", "Biancaneve", "Marinara", "Margherita", "Patapizza", "Bufala", "Diavola", "Pizza Regina", "Tonno & Cipolla", "Napoli", "Oslo", "Norma", "Berlino", "Tropea", "Helsinki", "Sfiziosa", "Nairobi", "Mosca", "Rio", "Tutti I Gusti", "Ripiegata", "4 Formaggi", "007", "La Casa Di Carta", "Parmigiana", "4 Stagioni", "Bella Ciao", "Marsiglia", "Ai Porcini", "Vegetariana", "Pizza Kebab", "Gustosa", "Tokio", "Bogotà", "Frutti Di Mare", "Cincinnati", "Suprema", "Denver", "Capricciosa"], "keyPrefix": "Pizza"}, {"cat": "Pizza Dolce", "items": ["Nutella", "Kinder Bueno", "Dubai"], "keyPrefix": "Pizza Dolce"}, {"cat": "Panini", "items": ["Panino Patatine, Wurstel", "Panino con Patatine", "Panino Crocchette di Patate & Patatine", "Panino Patatine, Wurstel in Salsa Rosa", "Panino Pollo al Curry & Patatine", "Panino Pollo ai Funghi & Patatine", "Panino Pollo Impanato & Patatine", "Panino Pollo Messicano & Patatine", "Panino Pollo al Barbecue & Patatine", "Panino Petto di Pollo alla Griglia & Patatine", "Panino Arrosto di Pollo & Patatine", "Panino Petto di Pollo Sfilettato & Patatine", "Panino Porchettata & Patatine", "Panino Salame Piccante e Mozzarella & Patatine", "Panino Salame Piccante e Svizzero & Patatine", "Panino Bella Ciao & Patatine", "Panino 4 Formaggi & Patatine", "Panino Prosciutto Mozzarella & Patatine", "Cocktail Di Tonno & Patatine", "Panino Kebab & Patatine", "Panino Polpette di Cavallo & Patatine", "Panino Cavallo & Patatine", "Panino Salsiccia & Patatine", "Panino in Cocktail di Gamberi in Salsa Rosa & Patatine", "Hamburger di Scottona & Patatine", "Hamburger di Angus & Patatine", "Panino Porchetta Artigianale e Patatine", "Panino con Salsiccia di Cavallo & Patatine"], "keyPrefix": "Panini"}, {"cat": "Hamburger", "items": ["Brooklyn", "Bronx", "Spicy", "Manathan", "Queens"], "keyPrefix": "Hamburger"}, {"cat": "Focacce", "items": ["Focaccia Vuota Da Condire", "Casareccia", "Focaccia Prosciutto", "Focaccia Caprese", "Focaccia Del Pirata", "Focaccia Mista", "Deliziosa", "Focaccia 4 Formaggi", "Bella Ciao", "Focaccia Nairobi"], "keyPrefix": "Focacce"}, {"cat": "Fritture", "items": ["Vaschetta Piccola — Patatine", "Vaschetta Media — Patatine", "Patatine con Buccia", "Vaschetta Piccola — 4 Würstel & Patatine", "Vaschetta — 8 Würstel", "Vaschetta — Crocchette di Patate", "Vaschetta di Kebab", "Anelli di Cipolla", "Panzerotti Fritti Mignon Pomodoro e Mozzarella", "Mozzarelline Impanate", "Bocconcini Pollo Amadori Impanato Piccante", "Arancini Mignon al Ragù", "Nuggets 10 Pezzi"], "keyPrefix": "Fritture"}, {"cat": "Bevande", "items": ["Gassosa", "Acqua Naturale Piccola", "Acqua Frizzante", "Coca Cola 33", "Coca Cola Zero", "Birra Moretti", "Birra Peroni", "Coca Cola Vetro cl 33", "Estathe Pesca", "Estathe Limone", "Nastro Azzurro", "Ceres", "Coca Cola Bottiglia Grande", "Birra Messina Grande", "Birra Nastro Azzurro Grande", "Peroni Chill Lemon"], "keyPrefix": "Bevande"}, {"cat": "Extra", "items": ["Bustina Maionese", "Bustina Ketchup"], "keyPrefix": "Extra"}, {"cat": "🧀 Extra ingredienti — Pizza/Focacce", "items": ["Extra Mozzarella", "Scaglie di Grana Padano DOP", "Patatine", "Gorgonzola", "Formaggio Svizzero", "Prosciutto Crudo Ferrarini", "Olive", "Rucola", "Ciliegino", "Piselli", "Funghi", "Speck", "Funghi Porcini", "Lattuga", "Spinaci", "Cipolla", "Carciofi in Spicchi", "Prosciutto Cotto", "Uovo", "Wurstel", "Granella di Pistacchio", "Crocchette Patate", "Crema di Pistacchio", "Acciughe", "Tonno", "Salame Piccante", "Bresaola", "Polpette di Cavallo", "Bacon", "Mozzarella di Bufala", "Salmone", "Patate della Nonna", "Salsiccia di Maiale", "Fettina di Pollo alla Griglia", "Pollo Sfilettato", "Pollo al Curry", "Fettina di Cavallo", "Melanzana Fritta", "Stracciatella di Bufala", "Capuliato", "Kebab", "Pollo Impanato", "Cipolla Croccante"], "keyPrefix": "EXTRA_PIZZA"}, {"cat": "🧀 Extra ingredienti — Panini/Hamburger/Fritture", "items": ["Lattuga", "Ciliegino", "Cipolla", "Mozzarella", "Gorgonzola", "Würstel", "Grana Padano DOP", "Formaggio Svizzero", "Prosciutto Crudo", "Speck", "Prosciutto Cotto", "Crocchette di Patate", "Salame Piccante", "Funghi Freschi", "Mozzarella di Bufala", "Granella di Pistacchio", "Crema di Pistacchio", "Würstel in Salsa Rosa", "Bresaola", "Rucola", "Salmone 50g", "Funghi Piccanti", "Cipolla Croccante"], "keyPrefix": "EXTRA_PANINO"}];
@@ -500,7 +504,7 @@ function normalizeAddress(address){
     .trim();
 }
 
-const SCONTO_PRIMO_ORDINE = 0.10; // 10%, solo sui piatti (mai sulle spese di consegna)
+let SCONTO_PRIMO_ORDINE = 0.10; // 10%, solo sui piatti (mai sulle spese di consegna)
 
 async function isFirstOrderForPhone(phone, address){
   if(!ordersCollection) return false;
@@ -527,10 +531,86 @@ function round2(n){ return Math.round(n * 100) / 100; }
 // Fino a 2,5 km (tutto il paese) spese normali; da 2,5 a 8 km (contrade/campagna) +3€;
 // oltre 8 km niente consegna. Distanza calcolata "in linea d'aria" dalla pizzeria.
 const PIZZERIA_POS = { lat: 37.1484812, lng: 14.3868172 }; // Via XX Settembre 192, Niscemi
-const SPESE_CONSEGNA_BASE = 1.50;
-const RAGGIO_PAESE_KM = 2.5;
-const SOVRAPPREZZO_FUORI_PAESE = 3.00;
-const RAGGIO_MAX_KM = 8;
+let SPESE_CONSEGNA_BASE = 1.50;
+let RAGGIO_PAESE_KM = 2.5;
+let SOVRAPPREZZO_FUORI_PAESE = 3.00;
+let RAGGIO_MAX_KM = 8;
+
+// =====================================================================
+//  IMPOSTAZIONI DEL TITOLARE (scheda ⚙️ dell'app Titolare)
+//  Salvate nel database (settings _id 'config'); questi sono i valori di partenza.
+// =====================================================================
+const CONFIG_BASE = {
+  consegna: { speseBase: 1.50, raggioPaeseKm: 2.5, sovrapprezzoFuori: 3.00, raggioMaxKm: 8, ordineMinimo: 10 },
+  orari: { dalle: 19, alle: 23, giornoChiusura: 2, ordiniPerQuarto: 3, giorniAnticipo: 3, noSubitoConsegna: [0, 6] },
+  sito: { avvisoAttivo: false, avvisoTesto: '', scontoPrimoOrdine: 10, pagamenti: { contanti: true, carta: true, online: true } },
+  sala: { sale: [{ nome: 'Sala', tavoli: 40 }] },
+  stampa: { prezziComanda: true, totaleComanda: true, spazioTraProdotti: true, logo: true,
+    intestazioneConto: 'PIZZERIA LA CASA DI CARTA\nVia XX Settembre 192 - Niscemi', piedeConto: 'Grazie e arrivederci!' }
+};
+let CONFIG = JSON.parse(JSON.stringify(CONFIG_BASE));
+function cfgNum(v, min, max, def, intero){
+  const n = Number(String(v ?? '').replace(',', '.'));
+  if (v === '' || v === null || v === undefined || !Number.isFinite(n)) return def;
+  const x = Math.min(max, Math.max(min, n));
+  return intero ? Math.round(x) : Math.round(x * 100) / 100;
+}
+function cfgBool(v, def){ return typeof v === 'boolean' ? v : def; }
+function cfgTesto(v, max, def){ return typeof v === 'string' ? v.replace(/\r/g, '').slice(0, max) : def; }
+// unisce le modifiche arrivate dall'app ai valori attuali, controllando che siano sensate
+function pulisciConfig(inp, attuale){
+  const c = JSON.parse(JSON.stringify(attuale));
+  const i = inp || {};
+  if (i.consegna) {
+    const x = i.consegna, d = c.consegna;
+    d.speseBase = cfgNum(x.speseBase, 0, 30, d.speseBase);
+    d.raggioPaeseKm = cfgNum(x.raggioPaeseKm, 0.5, 30, d.raggioPaeseKm);
+    d.sovrapprezzoFuori = cfgNum(x.sovrapprezzoFuori, 0, 30, d.sovrapprezzoFuori);
+    d.raggioMaxKm = Math.max(d.raggioPaeseKm, cfgNum(x.raggioMaxKm, 0.5, 60, d.raggioMaxKm));
+    d.ordineMinimo = cfgNum(x.ordineMinimo, 0, 300, d.ordineMinimo);
+  }
+  if (i.orari) {
+    const x = i.orari, d = c.orari;
+    d.dalle = cfgNum(x.dalle, 0, 23, d.dalle, true);
+    d.alle = cfgNum(x.alle, 1, 24, d.alle, true);
+    if (d.alle <= d.dalle) d.alle = Math.min(24, d.dalle + 1);
+    d.giornoChiusura = cfgNum(x.giornoChiusura, -1, 6, d.giornoChiusura, true);
+    d.ordiniPerQuarto = cfgNum(x.ordiniPerQuarto, 1, 50, d.ordiniPerQuarto, true);
+    d.giorniAnticipo = cfgNum(x.giorniAnticipo, 0, 14, d.giorniAnticipo, true);
+    if (Array.isArray(x.noSubitoConsegna)) d.noSubitoConsegna = [...new Set(x.noSubitoConsegna.map(Number).filter(n => Number.isInteger(n) && n >= 0 && n <= 6))].sort();
+  }
+  if (i.sito) {
+    const x = i.sito, d = c.sito;
+    d.avvisoAttivo = cfgBool(x.avvisoAttivo, d.avvisoAttivo);
+    d.avvisoTesto = cfgTesto(x.avvisoTesto, 300, d.avvisoTesto);
+    d.scontoPrimoOrdine = cfgNum(x.scontoPrimoOrdine, 0, 50, d.scontoPrimoOrdine, true);
+    if (x.pagamenti) ['contanti', 'carta', 'online'].forEach(k => { d.pagamenti[k] = cfgBool(x.pagamenti[k], d.pagamenti[k]); });
+    if (!d.pagamenti.contanti && !d.pagamenti.carta && !d.pagamenti.online) d.pagamenti.contanti = true; // almeno un modo di pagare
+  }
+  if (i.sala && Array.isArray(i.sala.sale)) {
+    const sale = i.sala.sale.slice(0, 8).map((x, k) => ({
+      nome: cfgTesto(x && x.nome, 30, '').trim() || `Sala ${k + 1}`,
+      tavoli: cfgNum(x && x.tavoli, 1, 150, 10, true)
+    }));
+    if (sale.length) c.sala.sale = sale;
+  }
+  if (i.stampa) {
+    const x = i.stampa, d = c.stampa;
+    ['prezziComanda', 'totaleComanda', 'spazioTraProdotti', 'logo'].forEach(k => { d[k] = cfgBool(x[k], d[k]); });
+    d.intestazioneConto = cfgTesto(x.intestazioneConto, 200, d.intestazioneConto);
+    d.piedeConto = cfgTesto(x.piedeConto, 200, d.piedeConto);
+  }
+  return c;
+}
+function impostaConfig(inp){
+  CONFIG = pulisciConfig(inp, CONFIG);
+  const k = CONFIG.consegna, o = CONFIG.orari;
+  SPESE_CONSEGNA_BASE = k.speseBase; RAGGIO_PAESE_KM = k.raggioPaeseKm; SOVRAPPREZZO_FUORI_PAESE = k.sovrapprezzoFuori;
+  RAGGIO_MAX_KM = k.raggioMaxKm; MIN_DELIVERY_ORDER = k.ordineMinimo;
+  OPEN_FROM_HOUR = o.dalle; OPEN_TO_HOUR = o.alle; CLOSED_WEEKDAY = o.giornoChiusura;
+  MAX_PER_SLOT = o.ordiniPerQuarto; MAX_DAYS_AHEAD = o.giorniAnticipo; ASAP_DISABLED_WEEKDAYS_CONSEGNA = o.noSubitoConsegna;
+  SCONTO_PRIMO_ORDINE = CONFIG.sito.scontoPrimoOrdine / 100;
+}
 
 function distanzaKm(a, b){
   const R = 6371;
@@ -632,7 +712,7 @@ async function applyDeliveryZone(order){
 async function applyFirstOrderDiscount(order){
   const subtotaleBase = round2(Number(order.subtotaleBase != null ? order.subtotaleBase : order.subtotale) || 0);
   const eligible = await isFirstOrderForPhone(order.phone, order.address);
-  const sconto = eligible ? round2(subtotaleBase * SCONTO_PRIMO_ORDINE) : 0;
+  const sconto = eligible && SCONTO_PRIMO_ORDINE > 0 ? round2(subtotaleBase * SCONTO_PRIMO_ORDINE) : 0;
 
   order.subtotaleBase = subtotaleBase;
   order.scontoPrimoOrdine = sconto;
@@ -646,7 +726,7 @@ async function applyFirstOrderDiscount(order){
     if (sconto > 0) {
       order.testoStampa = order.testoStampa.replace(
         /\n(-{5,}\nTOTALE:)/,
-        `\n🎉 Sconto primo ordine (20%): -${money(sconto)}\n$1`
+        `\n🎉 Sconto primo ordine (${Math.round(SCONTO_PRIMO_ORDINE * 100)}%): -${money(sconto)}\n$1`
       );
     }
     order.testoStampa = order.testoStampa.replace(/TOTALE: [^\n]*/, `TOTALE: ${money(order.grandTotal)}`);
@@ -1099,6 +1179,10 @@ app.post('/api/orders', async (req, res) => {
   }
 
   order.ipCliente = req.ip || null;
+  // metodi di pagamento accettati (impostazioni del titolare)
+  if (!(order.pagamento === 'carta' ? CONFIG.sito.pagamenti.carta : CONFIG.sito.pagamenti.contanti)) {
+    return res.status(400).json({ ok: false, error: 'pagamento_non_disponibile', message: 'Questo metodo di pagamento al momento non è disponibile: scegline un altro.' });
+  }
 
   const subtotaleForMinimo = Number(order.subtotaleBase != null ? order.subtotaleBase : order.subtotale) || 0;
   if (order.modalita === 'consegna' && subtotaleForMinimo < MIN_DELIVERY_ORDER) {
@@ -1172,6 +1256,9 @@ app.post('/api/checkout/create-session', async (req, res) => {
   }
 
   order.ipCliente = req.ip || null;
+  if (!CONFIG.sito.pagamenti.online) {
+    return res.status(400).json({ ok: false, error: 'pagamento_non_disponibile', message: 'Il pagamento online al momento non è disponibile: scegli contanti o carta alla consegna.' });
+  }
 
   const subtotaleForMinimo = Number(order.subtotaleBase != null ? order.subtotaleBase : order.subtotale) || 0;
   if (order.modalita === 'consegna' && subtotaleForMinimo < MIN_DELIVERY_ORDER) {
@@ -1948,7 +2035,7 @@ app.post('/api/product-photos/delete', async (req, res) => {
 
 // ---------- Endpoint: controlla se questo numero ha diritto allo sconto primo ordine ----------
 app.get('/api/check-first-order-discount', async (req, res) => {
-  const eligible = await isFirstOrderForPhone(req.query.phone, req.query.address);
+  const eligible = SCONTO_PRIMO_ORDINE > 0 && await isFirstOrderForPhone(req.query.phone, req.query.address);
   res.json({ eligible, percentuale: eligible ? Math.round(SCONTO_PRIMO_ORDINE * 100) : 0 });
 });
 
@@ -1977,10 +2064,10 @@ async function comandaSave(c){
   else comandeMemoria[c._id] = c;
   return c;
 }
-async function comandeList(filtro){
-  if (comandeCollection) return await comandeCollection.find(filtro).sort({ creataAlle: -1 }).limit(200).toArray();
+async function comandeList(filtro, limite = 200){
+  if (comandeCollection) return await comandeCollection.find(filtro).sort({ creataAlle: -1 }).limit(limite).toArray();
   return Object.values(comandeMemoria).filter(c => Object.entries(filtro).every(([k, v]) => {
-    if (v && typeof v === 'object' && v.$gte) return c[k] >= v.$gte;
+    if (v && typeof v === 'object' && (v.$gte || v.$lte)) return (!v.$gte || c[k] >= v.$gte) && (!v.$lte || c[k] <= v.$lte);
     return c[k] === v;
   })).sort((a, b) => b.creataAlle.localeCompare(a.creataAlle));
 }
@@ -2101,7 +2188,8 @@ function rigaPrezzo(sx, prezzo){
 }
 function righeStampa(r, prefisso){
   const o = r.opzioni || {};
-  const out = [rigaPrezzo(`${prefisso}${r.qty}x ${r.nome}${o.max ? ' MAX' : o.mezzaMax ? ' MEZZA MAX' : ''}`, (Number(r.prezzo) || 0) * r.qty)];
+  const testa = `${prefisso}${r.qty}x ${r.nome}${o.max ? ' MAX' : o.mezzaMax ? ' MEZZA MAX' : ''}`;
+  const out = [CONFIG.stampa.prezziComanda ? rigaPrezzo(testa, (Number(r.prezzo) || 0) * r.qty) : testa];
   if (o.formato) out.push(`   formato: ${o.formato}`);
   if (r.pane && r.pane !== 'Panino Classico') out.push(`   pane: ${r.pane}`); // il pane classico è il normale: si scrive solo Tortilla / Pan Pizza
   if (o.cottura && o.cottura !== 'Normale') out.push(`   cottura: ${o.cottura}`);
@@ -2144,22 +2232,24 @@ function testoComandaCucina(c, diff, primaVolta){
   L.push('================================');
   if (diff.aggiunte.length){
     if (!primaVolta) L.push('AGGIUNGERE:');
-    diff.aggiunte.forEach((r, i) => { if (i) L.push(''); L.push(...righeStampa(r, primaVolta ? '' : '+ ')); }); // riga vuota tra un prodotto e l'altro
+    diff.aggiunte.forEach((r, i) => { if (i && CONFIG.stampa.spazioTraProdotti) L.push(''); L.push(...righeStampa(r, primaVolta ? '' : '+ ')); }); // riga vuota tra un prodotto e l'altro
   }
   if (diff.tolte.length){
     if (diff.aggiunte.length) L.push('');
     L.push('TOGLIERE:');
-    diff.tolte.forEach((r, i) => { if (i) L.push(''); L.push(rigaPrezzo(`- ${r.qty}x ${r.nome}`, -(Number(r.prezzo) || 0) * r.qty)); });
+    diff.tolte.forEach((r, i) => { if (i && CONFIG.stampa.spazioTraProdotti) L.push(''); L.push(CONFIG.stampa.prezziComanda ? rigaPrezzo(`- ${r.qty}x ${r.nome}`, -(Number(r.prezzo) || 0) * r.qty) : `- ${r.qty}x ${r.nome}`); });
   }
   if (diff.note.length){
     if (diff.aggiunte.length || diff.tolte.length) L.push('');
     L.push('CAMBIARE COSI\':');
-    diff.note.forEach((r, i) => { if (i) L.push(''); L.push(...righeStampa(r, '* ')); });
+    diff.note.forEach((r, i) => { if (i && CONFIG.stampa.spazioTraProdotti) L.push(''); L.push(...righeStampa(r, '* ')); });
   }
   if (primaVolta && c.noteComanda) { L.push(''); L.push(`NOTE: ${c.noteComanda}`); }
-  L.push('--------------------------------');
-  if (c.spese) L.push(rigaPrezzo('Consegna', c.spese));
-  L.push(rigaPrezzo(primaVolta ? 'TOTALE' : 'TOTALE COMANDA', totaleComanda(c) + (c.spese || 0)));
+  if (CONFIG.stampa.totaleComanda) {
+    L.push('--------------------------------');
+    if (c.spese) L.push(rigaPrezzo('Consegna', c.spese));
+    L.push(rigaPrezzo(primaVolta ? 'TOTALE' : 'TOTALE COMANDA', totaleComanda(c) + (c.spese || 0)));
+  }
   L.push('================================');
   return L.join('\n');
 }
@@ -2167,8 +2257,7 @@ function testoComandaCucina(c, diff, primaVolta){
 // selezione: [{rid, qty}] = conto parziale solo di quei pezzi; senza selezione = tutto quello che resta da pagare
 function testoConto(c, selezione){
   const L = [];
-  L.push('PIZZERIA LA CASA DI CARTA');
-  L.push('Via XX Settembre 192 - Niscemi');
+  String(CONFIG.stampa.intestazioneConto || '').split('\n').filter(x => x.trim()).forEach(x => L.push(x));
   L.push('--------------------------------');
   L.push(`${etichettaComanda(c)} - ${oraIT()}`);
   L.push(selezione ? 'CONTO PARZIALE (non fiscale)' : 'PRECONTO (non fiscale)');
@@ -2197,6 +2286,7 @@ function testoConto(c, selezione){
   const pagato = pagatoComanda(c);
   if (!sel && pagato > 0) L.push(rigaPrezzo("Gia' pagato", pagato));
   L.push(rigaPrezzo(sel ? 'DA PAGARE' : pagato > 0 ? 'RESTA DA PAGARE' : 'TOTALE', tot));
+  if (CONFIG.stampa.piedeConto && CONFIG.stampa.piedeConto.trim()) { L.push(''); String(CONFIG.stampa.piedeConto).split('\n').forEach(x => L.push(x)); }
   return L.join('\n');
 }
 function selezioneValida(c, voci){
@@ -2410,28 +2500,33 @@ app.post('/api/staff/comande/:id/annulla', async (req, res) => {
 
 // ---------- Accesso Titolare: password controllata dal server ----------
 const cryptoTit = require('crypto');
+// password: quella su Render (TITOLARE_PASSWORD) ha la precedenza; altrimenti quella scelta dall'app Titolare
+let titolarePwHash = '';
+function passwordAttiva(){ return TITOLARE_PASSWORD || titolarePwHash; }
 function tokenTitolare(){
-  // il "pass" dura finché non cambi la password su Render: cambiandola, tutti i telefoni devono rientrare
-  return cryptoTit.createHmac('sha256', JWT_SECRET).update('titolare:' + TITOLARE_PASSWORD).digest('hex');
+  // il "pass" dura finché non cambi la password: cambiandola, tutti i telefoni devono rientrare
+  return cryptoTit.createHmac('sha256', JWT_SECRET).update('titolare:' + passwordAttiva()).digest('hex');
 }
 function uguali(a, b){
   const x = Buffer.from(String(a)), y = Buffer.from(String(b));
   return x.length === y.length && cryptoTit.timingSafeEqual(x, y);
 }
 function soloTitolare(req, res, next){
-  if (!TITOLARE_PASSWORD) return next(); // nessuna password impostata su Render: accesso libero
+  if (!passwordAttiva()) return next(); // nessuna password impostata: accesso libero
   const t = req.get('x-titolare-token') || '';
   if (!t || !uguali(t, tokenTitolare())) return res.status(401).json({ ok: false, error: 'accesso_negato' });
   next();
 }
 const tentativiLogin = new Map(); // ip -> { n, dal }
 app.post('/api/titolare/login', (req, res) => {
-  if (!TITOLARE_PASSWORD) return res.status(503).json({ ok: false, error: 'La password non è ancora impostata sul server (TITOLARE_PASSWORD su Render).' });
+  if (!passwordAttiva()) return res.status(503).json({ ok: false, error: 'La password non è ancora impostata.' });
   const ip = req.ip || 'x';
   const t = tentativiLogin.get(ip) || { n: 0, dal: Date.now() };
   if (Date.now() - t.dal > 10 * 60 * 1000) { t.n = 0; t.dal = Date.now(); }
   if (t.n >= 5) return res.status(429).json({ ok: false, error: 'Troppi tentativi. Riprova tra 10 minuti.' });
-  if (!uguali((req.body || {}).password || '', TITOLARE_PASSWORD)) {
+  const pw = String((req.body || {}).password || '');
+  const giusta = TITOLARE_PASSWORD ? uguali(pw, TITOLARE_PASSWORD) : (() => { try { return bcrypt.compareSync(pw, titolarePwHash); } catch (e) { return false; } })();
+  if (!giusta) {
     t.n++; tentativiLogin.set(ip, t);
     return res.status(401).json({ ok: false, error: 'Password sbagliata' });
   }
@@ -2450,7 +2545,7 @@ app.get('/api/staff/stats', soloTitolare, async (req, res) => {
     const inizioMese = dateKey(new Date(now.getFullYear(), now.getMonth(), 1));
     const da14 = dateKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 13));
     const daQuando = da14 < inizioMese ? da14 : inizioMese;
-    const chiuse = await comandeList({ stato: 'chiusa', giorno: { $gte: daQuando } });
+    const chiuse = await comandeList({ stato: 'chiusa', giorno: { $gte: daQuando } }, 20000);
 
     const vuoto = () => ({ incasso: 0, comande: 0, contanti: 0, carta: 0, tavoli: 0, asporto: 0, piatti: {} });
     const per = { oggi: vuoto(), settimana: vuoto(), mese: vuoto() };
@@ -2924,6 +3019,76 @@ app.get('/', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+// ---------- Impostazioni del titolare ----------
+app.get('/api/config', (req, res) => res.json({ ok: true, config: CONFIG }));
+app.post('/api/config', soloTitolare, async (req, res) => {
+  const nuova = (req.body || {}).config;
+  if (!nuova || typeof nuova !== 'object') return res.status(400).json({ ok: false, error: 'Nessuna impostazione ricevuta' });
+  impostaConfig(nuova);
+  if (settingsCollection) {
+    try { await settingsCollection.updateOne({ _id: 'config' }, { $set: { value: CONFIG, aggiornataAlle: new Date().toISOString() } }, { upsert: true }); }
+    catch (err) { console.error('Errore salvataggio impostazioni:', err); return res.status(500).json({ ok: false, error: 'Non riesco a salvare nel database' }); }
+  }
+  broadcastOrder({ evento: 'config_aggiornata', config: CONFIG }); // sito, staff e pannello si aggiornano da soli
+  res.json({ ok: true, config: CONFIG });
+});
+
+// ---------- Password dell'app Titolare (scelta dall'app, senza toccare Render) ----------
+app.get('/api/titolare/password', soloTitolare, (req, res) => {
+  res.json({ ok: true, attiva: !!passwordAttiva(), daRender: !!TITOLARE_PASSWORD });
+});
+app.post('/api/titolare/password', soloTitolare, async (req, res) => {
+  if (TITOLARE_PASSWORD) return res.status(400).json({ ok: false, error: 'La password è impostata su Render (TITOLARE_PASSWORD): cambiala da lì.' });
+  const nuova = String((req.body || {}).nuova || '').trim();
+  if (nuova && nuova.length < 4) return res.status(400).json({ ok: false, error: 'La password deve avere almeno 4 caratteri' });
+  if (nuova.length > 100) return res.status(400).json({ ok: false, error: 'Password troppo lunga' });
+  titolarePwHash = nuova ? bcrypt.hashSync(nuova, 10) : '';
+  if (settingsCollection) {
+    if (titolarePwHash) await settingsCollection.updateOne({ _id: 'titolarePassword' }, { $set: { hash: titolarePwHash } }, { upsert: true });
+    else await settingsCollection.deleteOne({ _id: 'titolarePassword' });
+  }
+  res.json({ ok: true, attiva: !!titolarePwHash, token: titolarePwHash ? tokenTitolare() : '' });
+});
+
+// ---------- Storico incassi giorno per giorno (sala/banco + ordini online), per il Titolare ----------
+app.get('/api/titolare/storico', soloTitolare, async (req, res) => {
+  try {
+    const re = /^\d{4}-\d{2}-\d{2}$/;
+    const oggi = dateKey(new Date());
+    let a = re.test(req.query.a || '') ? req.query.a : oggi;
+    let da = re.test(req.query.da || '') ? req.query.da : dateKey(new Date(Date.now() - 30 * 86400000));
+    if (da > a) [da, a] = [a, da];
+    if ((new Date(a) - new Date(da)) / 86400000 > 400) da = dateKey(new Date(new Date(a + 'T12:00:00').getTime() - 400 * 86400000));
+    const giorni = {};
+    const g = k => giorni[k] || (giorni[k] = { data: k,
+      sala: { incasso: 0, conti: 0, contanti: 0, carta: 0 },
+      online: { incasso: 0, ordini: 0, online: 0, contanti: 0, bancomat: 0, nonRegistrato: 0 } });
+    const chiuse = await comandeList({ stato: 'chiusa', giorno: { $gte: da, $lte: a } }, 50000);
+    chiuse.forEach(c => {
+      const x = g(c.giorno).sala, imp = Number(c.totaleIncassato) || 0;
+      x.incasso += imp; x.conti++;
+      if (Array.isArray(c.pagamenti) && c.pagamenti.length) c.pagamenti.forEach(p => { if (p.metodo === 'carta') x.carta += Number(p.importo) || 0; else x.contanti += Number(p.importo) || 0; });
+      else if (c.pagamento === 'carta') x.carta += imp; else x.contanti += imp;
+    });
+    if (ordersCollection) {
+      const dal = new Date(da + 'T00:00:00').toISOString(), al = new Date(a + 'T23:59:59.999').toISOString();
+      const ordini = await ordersCollection.find({ ricevutoAlle: { $gte: dal, $lte: al } }, { projection: { ricevutoAlle: 1, grandTotal: 1, subtotale: 1, metodoPagamento: 1 } }).toArray();
+      ordini.forEach(o => {
+        const x = g(dateKey(new Date(o.ricevutoAlle))).online, imp = Number(o.grandTotal != null ? o.grandTotal : o.subtotale) || 0;
+        x.incasso += imp; x.ordini++;
+        const m = ['online', 'contanti', 'bancomat'].includes(o.metodoPagamento) ? o.metodoPagamento : 'nonRegistrato';
+        x[m] += imp;
+      });
+    }
+    const lista = Object.values(giorni).sort((x, y) => y.data.localeCompare(x.data)).map(x => {
+      Object.keys(x.sala).forEach(k => { if (k !== 'conti') x.sala[k] = round2(x.sala[k]); });
+      Object.keys(x.online).forEach(k => { if (k !== 'ordini') x.online[k] = round2(x.online[k]); });
+      return { ...x, totale: round2(x.sala.incasso + x.online.incasso) };
+    });
+    res.json({ ok: true, da, a, giorni: lista, totale: round2(lista.reduce((t, x) => t + x.totale, 0)) });
+  } catch (err) { console.error('Errore storico:', err); res.status(500).json({ ok: false, error: 'Errore server' }); }
+});
+
 // =====================================================================
 //  COPIA DI SICUREZZA DEL DATABASE (ogni settimana, per email al titolare)
 // =====================================================================
