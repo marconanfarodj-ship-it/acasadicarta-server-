@@ -146,6 +146,8 @@ async function connectDB(){
     ordersPaused = !!(pausedDoc && pausedDoc.value);
     const salaDoc = await settingsCollection.findOne({ _id: 'soloSala' });
     if (salaDoc && Array.isArray(salaDoc.value)) soloSalaCache = new Set(salaDoc.value);
+    const costiDoc = await settingsCollection.findOne({ _id: 'costi' });
+    if (costiDoc && costiDoc.value) COSTO_INGREDIENTI = costiDoc.value;
     const cfgDoc = await settingsCollection.findOne({ _id: 'config' });
     if (cfgDoc && cfgDoc.value) impostaConfig(cfgDoc.value);
     const pwDoc = await settingsCollection.findOne({ _id: 'titolarePassword' });
@@ -544,7 +546,12 @@ const CONFIG_BASE = {
   consegna: { speseBase: 1.50, raggioPaeseKm: 2.5, sovrapprezzoFuori: 3.00, raggioMaxKm: 8, ordineMinimo: 10 },
   orari: { dalle: 19, alle: 23, giornoChiusura: 2, ordiniPerQuarto: 3, giorniAnticipo: 3, noSubitoConsegna: [0, 6] },
   sito: { avvisoAttivo: false, avvisoTesto: '', scontoPrimoOrdine: 10, pagamenti: { contanti: true, carta: true, online: true } },
-  sala: { sale: [{ nome: 'Sala', tavoli: 40 }] },
+  sala: { sale: [{ nome: 'Sala', tavoli: 40 }], qrAttivo: true },
+  camerieri: [],   // [{ nome, pin }] — il pin non esce mai dal server
+  avvisi: { attivi: true, ritardoMinuti: 10, tavoloMinuti: 120, nonMandatiMinuti: 5, ordineGrande: 60 },
+  offerte: [],     // [{ id, nome, attiva, tipo: 'percento'|'euro', valore, codice, giorni: [], minimo, scadenza }]
+  fedelta: { attiva: false, ogni: 10, premio: 'Una pizza Margherita in omaggio' },
+  recensioni: { attiva: false, link: '', dopoOre: 18 },
   stampa: { prezziComanda: true, totaleComanda: true, spazioTraProdotti: true, logo: true,
     intestazioneConto: 'PIZZERIA LA CASA DI CARTA\nVia XX Settembre 192 - Niscemi', piedeConto: 'Grazie e arrivederci!' }
 };
@@ -586,6 +593,58 @@ function pulisciConfig(inp, attuale){
     d.scontoPrimoOrdine = cfgNum(x.scontoPrimoOrdine, 0, 50, d.scontoPrimoOrdine, true);
     if (x.pagamenti) ['contanti', 'carta', 'online'].forEach(k => { d.pagamenti[k] = cfgBool(x.pagamenti[k], d.pagamenti[k]); });
     if (!d.pagamenti.contanti && !d.pagamenti.carta && !d.pagamenti.online) d.pagamenti.contanti = true; // almeno un modo di pagare
+  }
+  if (i.sala && typeof i.sala.qrAttivo === 'boolean') c.sala.qrAttivo = i.sala.qrAttivo;
+  if (Array.isArray(i.camerieri)) {
+    const visti = new Set();
+    c.camerieri = i.camerieri.slice(0, 30).map(x => {
+      const nome = cfgTesto(x && x.nome, 30, '').trim();
+      // pin: 4 cifre; se arriva "***" teniamo quello già salvato
+      const vecchio = (attuale.camerieri || []).find(v => v.nome === nome);
+      let pin = String((x && x.pin) || '').trim();
+      if (pin === '***') pin = vecchio ? vecchio.pin : '';
+      if (pin && !/^\d{4}$/.test(pin)) pin = vecchio ? vecchio.pin : '';
+      return { nome, pin };
+    }).filter(x => x.nome && !visti.has(x.nome.toLowerCase()) && visti.add(x.nome.toLowerCase()));
+  }
+  if (Array.isArray(i.offerte)) {
+    c.offerte = i.offerte.slice(0, 20).map((x, k) => {
+      x = x || {};
+      const vecchia = (attuale.offerte || []).find(v => v.id === x.id);
+      let codice = cfgTesto(x.codice, 20, '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+      if (x.codice === '***' && vecchia) codice = vecchia.codice;
+      return {
+        id: cfgTesto(x.id, 20, '') || Math.random().toString(36).slice(2, 10),
+        nome: cfgTesto(x.nome, 60, '').trim() || `Offerta ${k + 1}`,
+        attiva: cfgBool(x.attiva, true),
+        tipo: x.tipo === 'euro' ? 'euro' : 'percento',
+        valore: cfgNum(x.valore, 0, x.tipo === 'euro' ? 200 : 90, 10),
+        codice,
+        giorni: Array.isArray(x.giorni) ? [...new Set(x.giorni.map(Number).filter(n => Number.isInteger(n) && n >= 0 && n <= 6))].sort() : [],
+        minimo: cfgNum(x.minimo, 0, 500, 0),
+        scadenza: /^\d{4}-\d{2}-\d{2}$/.test(x.scadenza || '') ? x.scadenza : ''
+      };
+    });
+  }
+  if (i.fedelta) {
+    const x = i.fedelta, d = c.fedelta;
+    d.attiva = cfgBool(x.attiva, d.attiva);
+    d.ogni = cfgNum(x.ogni, 2, 100, d.ogni, true);
+    d.premio = cfgTesto(x.premio, 80, d.premio);
+  }
+  if (i.recensioni) {
+    const x = i.recensioni, d = c.recensioni;
+    d.attiva = cfgBool(x.attiva, d.attiva);
+    d.link = /^https:\/\/[^\s"<>]{6,300}$/.test(String(x.link || '').trim()) ? String(x.link).trim() : (x.link === '' ? '' : d.link);
+    d.dopoOre = cfgNum(x.dopoOre, 1, 72, d.dopoOre, true);
+  }
+  if (i.avvisi) {
+    const x = i.avvisi, d = c.avvisi;
+    d.attivi = cfgBool(x.attivi, d.attivi);
+    d.ritardoMinuti = cfgNum(x.ritardoMinuti, 1, 120, d.ritardoMinuti, true);
+    d.tavoloMinuti = cfgNum(x.tavoloMinuti, 10, 600, d.tavoloMinuti, true);
+    d.nonMandatiMinuti = cfgNum(x.nonMandatiMinuti, 1, 60, d.nonMandatiMinuti, true);
+    d.ordineGrande = cfgNum(x.ordineGrande, 0, 1000, d.ordineGrande);
   }
   if (i.sala && Array.isArray(i.sala.sale)) {
     const sale = i.sala.sale.slice(0, 8).map((x, k) => ({
@@ -709,24 +768,47 @@ async function applyDeliveryZone(order){
 
 // Ricalcola sconto/subtotale/totale in modo autorevole: non ci fidiamo mai dei valori
 // mandati dal sito, li ricalcoliamo sempre qui prima di stampare/salvare/far pagare.
+// offerte del titolare: automatiche (senza codice) o con codice sconto. Torna la migliore valida adesso.
+function offertaMigliore(subtotale, codice){
+  const oggi = giornoServizio(), dow = new Date(oggi + 'T12:00:00').getDay();
+  const cod = String(codice || '').trim().toUpperCase();
+  let migliore = null;
+  (CONFIG.offerte || []).forEach(o => {
+    if (!o.attiva) return;
+    if (o.codice && o.codice !== cod) return;
+    if (o.giorni && o.giorni.length && !o.giorni.includes(dow)) return;
+    if (o.scadenza && o.scadenza < oggi) return;
+    if (subtotale < (o.minimo || 0)) return;
+    const sconto = round2(o.tipo === 'euro' ? Math.min(o.valore, subtotale) : subtotale * o.valore / 100);
+    if (sconto > 0 && (!migliore || sconto > migliore.sconto)) migliore = { nome: o.nome, sconto, conCodice: !!o.codice };
+  });
+  return migliore;
+}
 async function applyFirstOrderDiscount(order){
   const subtotaleBase = round2(Number(order.subtotaleBase != null ? order.subtotaleBase : order.subtotale) || 0);
-  const eligible = await isFirstOrderForPhone(order.phone, order.address);
-  const sconto = eligible && SCONTO_PRIMO_ORDINE > 0 ? round2(subtotaleBase * SCONTO_PRIMO_ORDINE) : 0;
+  const eligible = SCONTO_PRIMO_ORDINE > 0 && await isFirstOrderForPhone(order.phone, order.address);
+  const scontoPrimo = eligible ? round2(subtotaleBase * SCONTO_PRIMO_ORDINE) : 0;
+  // vale lo sconto più alto tra primo ordine e offerta (non si sommano)
+  const off = offertaMigliore(subtotaleBase, order.codiceSconto);
+  let sconto = scontoPrimo, riga = `🎉 Sconto primo ordine (${Math.round(SCONTO_PRIMO_ORDINE * 100)}%)`;
+  order.scontoPrimoOrdine = scontoPrimo; order.scontoOfferta = 0; order.offerta = null;
+  if (off && off.sconto > scontoPrimo) {
+    sconto = off.sconto; riga = `🎁 ${off.nome}`;
+    order.scontoPrimoOrdine = 0; order.scontoOfferta = off.sconto; order.offerta = off.nome;
+  }
 
   order.subtotaleBase = subtotaleBase;
-  order.scontoPrimoOrdine = sconto;
   order.subtotale = round2(subtotaleBase - sconto);
   order.grandTotal = round2(order.subtotale + (Number(order.speseConsegna) || 0));
 
   if (order.testoStampa) {
-    // togliamo un'eventuale riga sconto scritta dal sito (potrebbe essere sbagliata/vecchia) e la
+    // togliamo le righe sconto scritte dal sito (potrebbero essere sbagliate/vecchie) e le
     // riscriviamo noi, insieme al totale finale, in base al calcolo vero appena fatto qui sopra
-    order.testoStampa = order.testoStampa.replace(/\n🎉 Sconto primo ordine \([^)]*\): -[^\n]*\n/, '\n');
+    order.testoStampa = order.testoStampa.replace(/\n(?:🎉 Sconto primo ordine|🎁 )[^\n]*\n/g, '\n');
     if (sconto > 0) {
       order.testoStampa = order.testoStampa.replace(
         /\n(-{5,}\nTOTALE:)/,
-        `\n🎉 Sconto primo ordine (${Math.round(SCONTO_PRIMO_ORDINE * 100)}%): -${money(sconto)}\n$1`
+        `\n${riga}: -${money(sconto)}\n$1`
       );
     }
     order.testoStampa = order.testoStampa.replace(/TOTALE: [^\n]*/, `TOTALE: ${money(order.grandTotal)}`);
@@ -1074,6 +1156,9 @@ async function finalizeOrder(order, customerId){
   order.stampato = pannelliStampa() > 0;
   order.phoneNormalized = normalizePhone(order.phone);
   order.addressNormalized = normalizeAddress(order.address);
+  if (CONFIG.fedelta.attiva && order.phoneNormalized) {
+    try { order.fedelta = await statoFedelta(order.phoneNormalized, pizzeIn(order.articoli)); } catch (e) { console.error('Errore punti fedeltà:', e); }
+  }
   orderHistory.unshift(order);
   if (orderHistory.length > MAX_HISTORY) orderHistory.pop();
 
@@ -1126,6 +1211,11 @@ app.post('/api/reservations', async (req, res) => {
   };
 
   broadcastOrder(reservation);
+  try {
+    await prenotazioniArch.save({ _id: crypto.randomUUID(), numero: reservationCounter, fonte: 'sito', stato: 'nuova', tavolo: '',
+      ...pulisciPrenotazione({ nome, telefono, data, ora, persone, note }), ricevutoAlle });
+    broadcastOrder({ evento: 'prenotazioni_aggiornate' });
+  } catch (err) { console.error('Errore salvataggio prenotazione:', err); }
   sendEmail(
     ORDER_EMAIL,
     `Nuova prenotazione tavolo — ${nome} (${persone} persone, ${dataLeggibile} ore ${ora})`,
@@ -1739,7 +1829,8 @@ app.post('/api/calendario/giorno', async (req, res) => {
 // ---------- Endpoint: statistiche per la dashboard (incassi e numero ordini) ----------
 // Costo ingredienti noto solo per questi piatti (vedi food-cost.md): finché non censiamo gli
 // altri piatti, il "guadagno netto" nella dashboard resta calcolato solo su questi.
-const COSTO_INGREDIENTI = {
+// costo ingredienti per piatto (nome -> euro): si modifica dal Titolare (⚙️ → Costo ingredienti)
+let COSTO_INGREDIENTI = {
   'Capricciosa': 2.24,
 };
 
@@ -2325,7 +2416,7 @@ function infoComandaDaBody(b, c){
 app.get('/api/staff/comande', async (req, res) => {
   try {
     const stato = req.query.stato === 'chiusa' ? 'chiusa' : 'aperta';
-    const filtro = stato === 'aperta' ? { stato: 'aperta' } : { stato: 'chiusa', giorno: dateKey(new Date()) };
+    const filtro = stato === 'aperta' ? { stato: 'aperta' } : { stato: 'chiusa', giorno: giornoServizio() }; // la serata finisce alle 5 di mattina
     const lista = await comandeList(filtro);
     res.json(lista.map(c => (conTotali(c))));
   } catch (err) { console.error(err); res.status(500).json({ ok: false, error: 'Errore server' }); }
@@ -2346,11 +2437,11 @@ app.post('/api/staff/comande', async (req, res) => {
       const giaAperta = (await comandeList({ stato: 'aperta' })).find(c => c.tipo === 'tavolo' && c.tavolo === info.tavolo);
       if (giaAperta) return res.json({ ok: true, esistente: true, comanda: conTotali(giaAperta) });
     }
-    const giorno = dateKey(new Date());
+    const giorno = giornoServizio(); // dopo mezzanotte resta la stessa serata
     const diOggi = await comandeList({ giorno });
     const numero = diOggi.reduce((m, c) => Math.max(m, c.numero || 0), 0) + 1;
     const c = {
-      _id: crypto.randomUUID(), numero, giorno, ...info,
+      _id: crypto.randomUUID(), numero, giorno, ...info, cameriere: String((req.body || {}).cameriere || '').slice(0, 30),
       righe: [], inviate: [], invii: 0, stato: 'aperta',
       creataAlle: new Date().toISOString()
     };
@@ -2388,6 +2479,7 @@ app.post('/api/staff/comande/:id/invia', async (req, res) => {
   }
   const primaVolta = c.invii === 0;
   c.invii += 1;
+  if ((req.body || {}).cameriere) { c.ultimoCameriere = String(req.body.cameriere).slice(0, 30); if (!c.cameriere) c.cameriere = c.ultimoCameriere; }
   stampaStaff(testoComandaCucina(c, diff, primaVolta), `${etichettaComanda(c)} #${c.invii}`);
   c.inviate = c.righe.map(r => ({ ...r }));
   c.ultimoInvio = new Date().toISOString();
@@ -2462,6 +2554,7 @@ app.post('/api/staff/comande/:id/chiudi', async (req, res) => {
     c.righe.forEach(r => { r.pagate = r.qty; });
   }
   c.stato = 'chiusa';
+  if ((req.body || {}).cameriere) c.chiusaDa = String(req.body.cameriere).slice(0, 30);
   c.pagamento = c.pagamenti.length && c.pagamenti.every(p => p.metodo === pagamento) ? pagamento : (c.pagamenti.length ? 'misto' : pagamento);
   c.totaleIncassato = pagatoComanda(c);
   c.chiusaAlle = new Date().toISOString();
@@ -2537,7 +2630,7 @@ app.post('/api/titolare/login', (req, res) => {
 // statistiche delle comande dello staff (sala, banco, telefono) per la dashboard dell'app titolare
 app.get('/api/staff/stats', soloTitolare, async (req, res) => {
   try {
-    const now = new Date();
+    const now = new Date(Date.now() - 5 * 60 * 60 * 1000); // la serata finisce alle 5 di mattina
     const oggi = dateKey(now);
     const dow = now.getDay();
     const lunedi = new Date(now.getFullYear(), now.getMonth(), now.getDate() - (dow === 0 ? 6 : dow - 1));
@@ -2547,7 +2640,7 @@ app.get('/api/staff/stats', soloTitolare, async (req, res) => {
     const daQuando = da14 < inizioMese ? da14 : inizioMese;
     const chiuse = await comandeList({ stato: 'chiusa', giorno: { $gte: daQuando } }, 20000);
 
-    const vuoto = () => ({ incasso: 0, comande: 0, contanti: 0, carta: 0, tavoli: 0, asporto: 0, piatti: {} });
+    const vuoto = () => ({ incasso: 0, comande: 0, contanti: 0, carta: 0, tavoli: 0, asporto: 0, piatti: {}, pezzi: 0, pezziNoti: 0, ricavoNoto: 0, costo: 0, camerieri: {} });
     const per = { oggi: vuoto(), settimana: vuoto(), mese: vuoto() };
     const giorni = {};
     chiuse.forEach(c => {
@@ -2563,16 +2656,24 @@ app.get('/api/staff/stats', soloTitolare, async (req, res) => {
           c.pagamenti.forEach(p => { if (p.metodo === 'carta') a.carta += Number(p.importo) || 0; else a.contanti += Number(p.importo) || 0; });
         } else if (c.pagamento === 'carta') a.carta += imp; else a.contanti += imp;
         if (c.tipo === 'tavolo') a.tavoli++; else a.asporto++;
+        const cam = c.cameriere || 'Senza nome';
+        if (!a.camerieri[cam]) a.camerieri[cam] = { conti: 0, incasso: 0 };
+        a.camerieri[cam].conti++; a.camerieri[cam].incasso += imp;
         (c.righe || []).forEach(r => {
           if (!a.piatti[r.nome]) a.piatti[r.nome] = { qty: 0, incasso: 0 };
           a.piatti[r.nome].qty += r.qty;
           a.piatti[r.nome].incasso += r.prezzo * r.qty;
+          a.pezzi += r.qty;
+          const costo = COSTO_INGREDIENTI[r.nome];
+          if (costo != null) { a.pezziNoti += r.qty; a.ricavoNoto += r.prezzo * r.qty; a.costo += costo * r.qty; }
         });
       });
     });
     const fine = a => ({
       incasso: round2(a.incasso), comande: a.comande, contanti: round2(a.contanti), carta: round2(a.carta),
       tavoli: a.tavoli, asporto: a.asporto, medio: a.comande ? round2(a.incasso / a.comande) : 0,
+      pezzi: a.pezzi, pezziNoti: a.pezziNoti, ricavoNoto: round2(a.ricavoNoto), costo: round2(a.costo),
+      camerieri: Object.entries(a.camerieri).map(([nome, v]) => ({ nome, conti: v.conti, incasso: round2(v.incasso) })).sort((x, y) => y.incasso - x.incasso),
       top: Object.entries(a.piatti).map(([nome, v]) => ({ nome, qty: v.qty, incasso: round2(v.incasso) }))
         .sort((x, y) => y.qty - x.qty).slice(0, 8)
     });
@@ -3019,8 +3120,500 @@ app.get('/', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+// ===== archivi semplici: database, oppure memoria se il database non c'è =====
+const memArchivi = {};
+function archivio(nome){
+  const mem = memArchivi[nome] || (memArchivi[nome] = {});
+  const coll = () => db ? db.collection(nome) : null;
+  const ok = (d, f) => Object.entries(f || {}).every(([k, v]) => {
+    if (v && typeof v === 'object' && !Array.isArray(v)) return (v.$gte === undefined || d[k] >= v.$gte) && (v.$lte === undefined || d[k] <= v.$lte) && (v.$ne === undefined || d[k] !== v.$ne) && (v.$in === undefined || v.$in.includes(d[k]));
+    return d[k] === v;
+  });
+  return {
+    async get(id){ const c = coll(); return c ? c.findOne({ _id: id }) : (mem[id] ? JSON.parse(JSON.stringify(mem[id])) : null); },
+    async save(doc){ const c = coll(); if (c) await c.replaceOne({ _id: doc._id }, doc, { upsert: true }); else mem[doc._id] = JSON.parse(JSON.stringify(doc)); return doc; },
+    async list(f = {}, ordina = null, limite = 1000){
+      const c = coll();
+      if (c) { let q = c.find(f); if (ordina) q = q.sort(ordina); return q.limit(limite).toArray(); }
+      let r = Object.values(mem).filter(d => ok(d, f)).map(d => JSON.parse(JSON.stringify(d)));
+      if (ordina) { const keys = Object.entries(ordina); r.sort((a, b) => { for (const [k, dir] of keys) { if (a[k] > b[k]) return dir; if (a[k] < b[k]) return -dir; } return 0; }); }
+      return r.slice(0, limite);
+    },
+    async del(id){ const c = coll(); if (c) await c.deleteOne({ _id: id }); else delete mem[id]; }
+  };
+}
+function giornoAggiunto(giorno, n){ const d = new Date(giorno + 'T12:00:00'); d.setDate(d.getDate() + n); return dateKey(d); }
+
+// ===== PRENOTAZIONI TAVOLI (dal sito o prese al telefono), visibili nella Sala dell'app staff =====
+const prenotazioniArch = archivio('prenotazioni');
+const STATI_PRENOTAZIONE = ['nuova', 'confermata', 'arrivata', 'annullata'];
+function pulisciPrenotazione(b, p = {}){
+  const out = {};
+  if (b.nome !== undefined) out.nome = String(b.nome || '').slice(0, 80);
+  if (b.telefono !== undefined) out.telefono = String(b.telefono || '').slice(0, 30);
+  if (b.data !== undefined && /^\d{4}-\d{2}-\d{2}$/.test(b.data)) out.data = b.data;
+  if (b.ora !== undefined && /^\d{1,2}:\d{2}$/.test(b.ora)) out.ora = String(b.ora).padStart(5, '0');
+  if (b.persone !== undefined) out.persone = Math.max(1, Math.min(99, parseInt(b.persone, 10) || 1));
+  if (b.note !== undefined) out.note = String(b.note || '').slice(0, 300);
+  if (b.tavolo !== undefined) out.tavolo = String(b.tavolo || '').slice(0, 10);
+  if (b.stato !== undefined && STATI_PRENOTAZIONE.includes(b.stato)) out.stato = b.stato;
+  return { ...p, ...out };
+}
+app.get('/api/prenotazioni', async (req, res) => {
+  try {
+    const re = /^\d{4}-\d{2}-\d{2}$/;
+    const da = re.test(req.query.da || '') ? req.query.da : giornoServizio();
+    const a = re.test(req.query.a || '') ? req.query.a : giornoAggiunto(da, 30);
+    const lista = await prenotazioniArch.list({ data: { $gte: da, $lte: a } }, { data: 1, ora: 1 }, 500);
+    res.json({ ok: true, prenotazioni: lista });
+  } catch (err) { console.error(err); res.status(500).json({ ok: false, error: 'Errore server' }); }
+});
+// prenotazione presa al telefono dallo staff
+app.post('/api/prenotazioni', async (req, res) => {
+  const p = pulisciPrenotazione(req.body || {});
+  if (!p.nome || !p.data || !p.ora) return res.status(400).json({ ok: false, error: 'Servono nome, giorno e ora' });
+  const tutte = await prenotazioniArch.list({}, null, 100000);
+  const doc = { _id: crypto.randomUUID(), numero: tutte.length + 1, fonte: 'telefono', stato: 'confermata', tavolo: '', persone: 2, telefono: '', note: '', ...p, ricevutoAlle: new Date().toISOString() };
+  await prenotazioniArch.save(doc);
+  broadcastOrder({ evento: 'prenotazioni_aggiornate' });
+  res.json({ ok: true, prenotazione: doc });
+});
+app.put('/api/prenotazioni/:id', async (req, res) => {
+  const p = await prenotazioniArch.get(req.params.id);
+  if (!p) return res.status(404).json({ ok: false, error: 'Prenotazione non trovata' });
+  const nuova = pulisciPrenotazione(req.body || {}, p);
+  nuova.aggiornataAlle = new Date().toISOString();
+  await prenotazioniArch.save(nuova);
+  broadcastOrder({ evento: 'prenotazioni_aggiornate' });
+  res.json({ ok: true, prenotazione: nuova });
+});
+
+// ===== CAMERIERI: chi usa l'app staff (con PIN facoltativo) =====
+const tentativiPin = new Map();
+app.post('/api/staff/cameriere', (req, res) => {
+  const nome = String((req.body || {}).nome || '');
+  const c = (CONFIG.camerieri || []).find(x => x.nome === nome);
+  if (!c) return res.status(404).json({ ok: false, error: 'Cameriere non trovato' });
+  if (!c.pin) return res.json({ ok: true, nome });
+  const ip = req.ip || 'x';
+  const t = tentativiPin.get(ip) || { n: 0, dal: Date.now() };
+  if (Date.now() - t.dal > 10 * 60 * 1000) { t.n = 0; t.dal = Date.now(); }
+  if (t.n >= 10) return res.status(429).json({ ok: false, error: 'Troppi tentativi, riprova tra qualche minuto' });
+  if (String((req.body || {}).pin || '') !== c.pin) { t.n++; tentativiPin.set(ip, t); return res.status(401).json({ ok: false, error: 'PIN sbagliato' }); }
+  tentativiPin.delete(ip);
+  res.json({ ok: true, nome });
+});
+
+// ===== ORDINE DAL TAVOLO CON IL QR: il cliente ordina, lo staff accetta =====
+const richiesteArch = archivio('richiesteTavolo');
+const tentativiQr = new Map();
+app.post('/api/tavolo/richiesta', async (req, res) => {
+  if (!CONFIG.sala.qrAttivo) return res.status(403).json({ ok: false, error: 'Gli ordini dal tavolo sono spenti: chiama il cameriere.' });
+  const b = req.body || {};
+  const tavolo = String(b.tavolo || '').trim().slice(0, 10);
+  if (!tavolo) return res.status(400).json({ ok: false, error: 'Tavolo mancante' });
+  const ip = req.ip || 'x';
+  const t = tentativiQr.get(ip) || { n: 0, dal: Date.now() };
+  if (Date.now() - t.dal > 10 * 60 * 1000) { t.n = 0; t.dal = Date.now(); }
+  if (t.n >= 8) return res.status(429).json({ ok: false, error: 'Troppi ordini di seguito: chiama il cameriere.' });
+  const grezze = (Array.isArray(b.righe) ? b.righe : []).slice(0, 40)
+    .filter(r => r && getCurrentPrice(String(r.chiave || '')) != null && !soldOutCache.has(String(r.chiave)) && !String(r.chiave).startsWith('EXTRA_'))
+    .map(r => ({ chiave: String(r.chiave), nome: String(r.nome || String(r.chiave).split('|')[1] || ''), cat: String(r.cat || String(r.chiave).split('|')[0] || ''), qty: Math.min(20, Math.max(1, parseInt(r.qty, 10) || 1)), note: String(r.note || '').slice(0, 120) }));
+  const righe = normalizzaRighe(grezze);
+  if (!righe.length) return res.status(400).json({ ok: false, error: 'Il carrello è vuoto o i piatti non sono più disponibili' });
+  t.n++; tentativiQr.set(ip, t);
+  const r = { _id: crypto.randomUUID(), tavolo, righe, nome: String(b.nome || '').slice(0, 40), nota: String(b.nota || '').slice(0, 200),
+    stato: 'attesa', totale: round2(righe.reduce((x, y) => x + y.prezzo * y.qty, 0)), creataAlle: new Date().toISOString() };
+  await richiesteArch.save(r);
+  broadcastOrder({ evento: 'richiesta_tavolo', tavolo, id: r._id });
+  res.json({ ok: true, id: r._id });
+});
+app.get('/api/tavolo/richiesta/:id', async (req, res) => {
+  const r = await richiesteArch.get(req.params.id);
+  if (!r) return res.status(404).json({ ok: false, error: 'Non trovata' });
+  res.json({ ok: true, stato: r.stato, tavolo: r.tavolo, totale: r.totale, righe: r.righe.map(x => ({ nome: x.nome, qty: x.qty })) });
+});
+app.get('/api/tavolo/richieste', async (req, res) => {
+  const da = new Date(Date.now() - 12 * 3600 * 1000).toISOString();
+  const lista = await richiesteArch.list({ stato: 'attesa', creataAlle: { $gte: da } }, { creataAlle: 1 }, 100);
+  res.json({ ok: true, richieste: lista });
+});
+app.post('/api/tavolo/richieste/:id/:azione', async (req, res) => {
+  const r = await richiesteArch.get(req.params.id);
+  if (!r) return res.status(404).json({ ok: false, error: 'Richiesta non trovata' });
+  if (r.stato !== 'attesa') return res.status(409).json({ ok: false, error: 'Già gestita da un altro dispositivo' });
+  if (req.params.azione === 'rifiuta') {
+    r.stato = 'rifiutata'; r.gestitaAlle = new Date().toISOString();
+    await richiesteArch.save(r);
+    broadcastOrder({ evento: 'richiesta_tavolo', tavolo: r.tavolo, id: r._id });
+    return res.json({ ok: true });
+  }
+  if (req.params.azione !== 'accetta') return res.status(400).json({ ok: false, error: 'Azione sconosciuta' });
+  // aggiungo i piatti alla comanda aperta di quel tavolo (o ne apro una nuova): NON vanno in cucina da soli
+  let c = (await comandeList({ stato: 'aperta' })).find(x => x.tipo === 'tavolo' && x.tavolo === r.tavolo);
+  if (!c) {
+    const giorno = giornoServizio();
+    const numero = (await comandeList({ giorno })).reduce((m, x) => Math.max(m, x.numero || 0), 0) + 1;
+    c = { _id: crypto.randomUUID(), numero, giorno, tipo: 'tavolo', tavolo: r.tavolo, nome: '', telefono: '', indirizzo: '', orario: '', noteComanda: '', spese: 0,
+      cameriere: String((req.body || {}).cameriere || '').slice(0, 30), righe: [], inviate: [], invii: 0, stato: 'aperta', creataAlle: new Date().toISOString() };
+  }
+  r.righe.forEach(x => c.righe.push({ ...x, rid: crypto.randomUUID() }));
+  if (r.nota) c.noteComanda = [c.noteComanda, r.nota].filter(Boolean).join(' · ');
+  await comandaSave(c);
+  r.stato = 'accettata'; r.gestitaAlle = new Date().toISOString(); r.comanda = c._id;
+  await richiesteArch.save(r);
+  broadcastOrder({ evento: 'richiesta_tavolo', tavolo: r.tavolo, id: r._id });
+  res.json({ ok: true, comanda: conTotali(c) });
+});
+
+// ===== OFFERTE: verifica di un codice sconto dal sito =====
+const tentativiCodice = new Map();
+app.get('/api/offerte/verifica', (req, res) => {
+  const ip = req.ip || 'x';
+  const t = tentativiCodice.get(ip) || { n: 0, dal: Date.now() };
+  if (Date.now() - t.dal > 10 * 60 * 1000) { t.n = 0; t.dal = Date.now(); }
+  t.n++; tentativiCodice.set(ip, t);
+  if (t.n > 30) return res.status(429).json({ ok: false, error: 'Troppi tentativi, riprova tra qualche minuto' });
+  const codice = String(req.query.codice || '').trim().toUpperCase();
+  const subtotale = Math.max(0, Number(req.query.subtotale) || 0);
+  const o = (CONFIG.offerte || []).find(x => x.attiva && x.codice && x.codice === codice);
+  if (!o) return res.json({ ok: true, valido: false, messaggio: 'Codice non valido' });
+  const oggi = giornoServizio(), dow = new Date(oggi + 'T12:00:00').getDay();
+  if (o.scadenza && o.scadenza < oggi) return res.json({ ok: true, valido: false, messaggio: 'Codice scaduto' });
+  if (o.giorni && o.giorni.length && !o.giorni.includes(dow)) return res.json({ ok: true, valido: false, messaggio: 'Codice non valido oggi' });
+  if (subtotale < (o.minimo || 0)) return res.json({ ok: true, valido: false, messaggio: `Valido con una spesa di almeno ${money(o.minimo)}` });
+  const sconto = round2(o.tipo === 'euro' ? Math.min(o.valore, subtotale) : subtotale * o.valore / 100);
+  res.json({ ok: true, valido: true, nome: o.nome, sconto, tipo: o.tipo, valore: o.valore });
+});
+
+// ===== PUNTI FEDELTÀ (contati sul numero di telefono: tot pizze = premio) =====
+const fedeltaArch = archivio('fedelta');
+function nomiPizze(){
+  const s = new Set();
+  MENU_CATALOG.filter(g => g.cat === 'Pizza').forEach(g => g.items.forEach(n => s.add(n)));
+  customMenuItemsCache.filter(i => i.cat === 'Pizza').forEach(i => s.add(i.nome));
+  return s;
+}
+function pizzeIn(articoli){ const s = nomiPizze(); return (articoli || []).reduce((t, a) => t + (s.has(a.nome) ? (Number(a.qty) || 0) : 0), 0); }
+async function statoFedelta(tel, extra = 0){
+  const f = CONFIG.fedelta;
+  let pizze = extra;
+  if (ordersCollection) {
+    const ord = await ordersCollection.find({ phoneNormalized: tel }, { projection: { articoli: 1 } }).toArray();
+    ord.forEach(o => { pizze += pizzeIn(o.articoli); });
+  } else orderHistory.filter(o => o.phoneNormalized === tel).forEach(o => { pizze += pizzeIn(o.articoli); });
+  (await comandeList({ stato: 'chiusa' }, 50000)).filter(c => c.telefono && normalizePhone(c.telefono) === tel)
+    .forEach(c => (c.righe || []).forEach(r => { if (r.cat === 'Pizza') pizze += r.qty; }));
+  const doc = await fedeltaArch.get(tel);
+  const usati = doc ? doc.riscatti || 0 : 0;
+  const totPremi = Math.floor(pizze / f.ogni);
+  const disponibili = Math.max(0, totPremi - usati);
+  return { pizze, ogni: f.ogni, premio: f.premio, premi: disponibili, punti: pizze - totPremi * f.ogni, riscatti: usati };
+}
+app.get('/api/fedelta', async (req, res) => {
+  if (!CONFIG.fedelta.attiva) return res.json({ ok: true, attiva: false });
+  const tel = normalizePhone(req.query.telefono);
+  if (!tel || tel.length < 6) return res.json({ ok: true, attiva: true, pizze: 0, punti: 0, premi: 0, ogni: CONFIG.fedelta.ogni, premio: CONFIG.fedelta.premio });
+  res.json({ ok: true, attiva: true, ...(await statoFedelta(tel)) });
+});
+app.post('/api/fedelta/riscatta', async (req, res) => {
+  const tel = normalizePhone((req.body || {}).telefono);
+  if (!tel) return res.status(400).json({ ok: false, error: 'Numero mancante' });
+  const st = await statoFedelta(tel);
+  if (st.premi <= 0) return res.status(400).json({ ok: false, error: 'Nessun premio disponibile' });
+  const doc = (await fedeltaArch.get(tel)) || { _id: tel, riscatti: 0, storico: [] };
+  doc.riscatti = (doc.riscatti || 0) + 1;
+  doc.storico = [...(doc.storico || []), { alle: new Date().toISOString(), da: String((req.body || {}).cameriere || '').slice(0, 30) }].slice(-50);
+  await fedeltaArch.save(doc);
+  res.json({ ok: true, ...(await statoFedelta(tel)) });
+});
+
+// ===== SCHEDA CLIENTE: storico ordini, piatti preferiti, note (es. allergie) =====
+const clientiArch = archivio('clienti');
+async function ordiniDi(tel){
+  if (ordersCollection) return ordersCollection.find({ phoneNormalized: tel }, { projection: { _id: 0, numeroOrdine: 1, ricevutoAlle: 1, grandTotal: 1, articoli: 1, nome: 1, name: 1, cognome: 1, address: 1, modalita: 1, email: 1 } }).sort({ ricevutoAlle: -1 }).limit(300).toArray();
+  return orderHistory.filter(o => o.phoneNormalized === tel);
+}
+app.get('/api/clienti/cerca', async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim().slice(0, 40);
+    const mappa = new Map();
+    const aggiungi = (tel, nome, imp, quando) => {
+      if (!tel) return;
+      const x = mappa.get(tel) || { telefono: tel, nome: '', ordini: 0, speso: 0, ultimo: '' };
+      if (nome && !x.nome) x.nome = nome;
+      x.ordini++; x.speso += imp; if (quando > x.ultimo) x.ultimo = quando;
+      mappa.set(tel, x);
+    };
+    const da = new Date(Date.now() - 365 * 86400000).toISOString();
+    const esc = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const cifre = q.replace(/\D/g, '');
+    let ordini = [];
+    if (ordersCollection) {
+      const filtro = { ricevutoAlle: { $gte: da }, phoneNormalized: { $exists: true, $ne: '' } };
+      if (q) filtro.$or = cifre.length >= 3 ? [{ phoneNormalized: { $regex: cifre } }] : [{ name: { $regex: esc, $options: 'i' } }, { nome: { $regex: esc, $options: 'i' } }, { cognome: { $regex: esc, $options: 'i' } }];
+      ordini = await ordersCollection.find(filtro, { projection: { phoneNormalized: 1, name: 1, nome: 1, grandTotal: 1, ricevutoAlle: 1 } }).limit(5000).toArray();
+    } else ordini = orderHistory.filter(o => o.phoneNormalized);
+    ordini.forEach(o => { if (!q || cifre.length >= 3 ? (!q || o.phoneNormalized.includes(cifre)) : new RegExp(esc, 'i').test(`${o.name || ''} ${o.nome || ''}`)) aggiungi(o.phoneNormalized, o.name || o.nome, Number(o.grandTotal) || 0, o.ricevutoAlle); });
+    (await comandeList({ stato: 'chiusa' }, 50000)).filter(c => c.telefono).forEach(c => {
+      const tel = normalizePhone(c.telefono);
+      if (q && !(cifre.length >= 3 ? tel.includes(cifre) : new RegExp(esc, 'i').test(c.nome || ''))) return;
+      aggiungi(tel, c.nome, Number(c.totaleIncassato) || 0, c.chiusaAlle || c.creataAlle);
+    });
+    const schede = await clientiArch.list({}, null, 5000);
+    schede.forEach(sc => { const x = mappa.get(sc._id); if (x) { x.nota = sc.note || ''; if (sc.nome) x.nome = sc.nome; } else if (q && (sc._id.includes(cifre || '~') || new RegExp(esc, 'i').test(sc.nome || ''))) mappa.set(sc._id, { telefono: sc._id, nome: sc.nome, ordini: 0, speso: 0, ultimo: '', nota: sc.note || '' }); });
+    const lista = [...mappa.values()].map(x => ({ ...x, speso: round2(x.speso) })).sort((a, b) => q ? b.ultimo.localeCompare(a.ultimo) : b.speso - a.speso).slice(0, 40);
+    res.json({ ok: true, clienti: lista });
+  } catch (err) { console.error('Errore ricerca clienti:', err); res.status(500).json({ ok: false, error: 'Errore server' }); }
+});
+app.get('/api/clienti/:tel', async (req, res) => {
+  try {
+    const tel = normalizePhone(req.params.tel);
+    if (!tel || tel.length < 6) return res.status(400).json({ ok: false, error: 'Numero non valido' });
+    const ordini = await ordiniDi(tel);
+    const comande = (await comandeList({ stato: 'chiusa' }, 50000)).filter(c => c.telefono && normalizePhone(c.telefono) === tel);
+    const scheda = (await clientiArch.get(tel)) || {};
+    const piatti = {};
+    ordini.forEach(o => (o.articoli || []).forEach(a => { piatti[a.nome] = (piatti[a.nome] || 0) + (Number(a.qty) || 0); }));
+    comande.forEach(c => (c.righe || []).forEach(r => { piatti[r.nome] = (piatti[r.nome] || 0) + r.qty; }));
+    const ultimoInd = (ordini.find(o => o.modalita === 'consegna' && o.address) || comande.find(c => c.indirizzo) || {});
+    const pren = await prenotazioniArch.list({}, null, 5000);
+    res.json({ ok: true, cliente: {
+      telefono: tel,
+      nome: scheda.nome || (ordini[0] && (ordini[0].name || [ordini[0].nome, ordini[0].cognome].filter(Boolean).join(' '))) || (comande[0] && comande[0].nome) || '',
+      note: scheda.note || '',
+      indirizzo: ultimoInd.address || ultimoInd.indirizzo || '',
+      email: (ordini.find(o => o.email) || {}).email || '',
+      online: { ordini: ordini.length, speso: round2(ordini.reduce((t, o) => t + (Number(o.grandTotal) || 0), 0)) },
+      sala: { conti: comande.length, speso: round2(comande.reduce((t, c) => t + (Number(c.totaleIncassato) || 0), 0)) },
+      prenotazioni: pren.filter(p => normalizePhone(p.telefono) === tel).length,
+      bloccato: blockedPhonesCache.has(tel),
+      preferiti: Object.entries(piatti).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([nome, qty]) => ({ nome, qty })),
+      ultimi: [...ordini.map(o => ({ quando: o.ricevutoAlle, tipo: o.modalita === 'consegna' ? 'Consegna' : 'Ritiro', totale: Number(o.grandTotal) || 0, cosa: (o.articoli || []).map(a => `${a.qty}x ${a.nome}`).join(', ') })),
+               ...comande.map(c => ({ quando: c.chiusaAlle || c.creataAlle, tipo: c.tipo === 'consegna' ? 'Consegna (tel.)' : c.tipo === 'asporto' ? 'Asporto (tel.)' : 'Sala', totale: Number(c.totaleIncassato) || 0, cosa: (c.righe || []).map(r => `${r.qty}x ${r.nome}`).join(', ') }))]
+        .sort((a, b) => String(b.quando).localeCompare(String(a.quando))).slice(0, 12),
+      fedelta: CONFIG.fedelta.attiva ? await statoFedelta(tel) : null
+    } });
+  } catch (err) { console.error('Errore scheda cliente:', err); res.status(500).json({ ok: false, error: 'Errore server' }); }
+});
+app.put('/api/clienti/:tel', async (req, res) => {
+  const tel = normalizePhone(req.params.tel);
+  if (!tel || tel.length < 6) return res.status(400).json({ ok: false, error: 'Numero non valido' });
+  const b = req.body || {};
+  const doc = (await clientiArch.get(tel)) || { _id: tel };
+  if (b.note !== undefined) doc.note = String(b.note || '').slice(0, 500);
+  if (b.nome !== undefined) doc.nome = String(b.nome || '').slice(0, 80);
+  doc.aggiornato = new Date().toISOString();
+  await clientiArch.save(doc);
+  res.json({ ok: true });
+});
+
+// ===== SCORTE DI MAGAZZINO =====
+const scorteArch = archivio('scorte');
+async function segnaEsauritiDaScorta(chiavi, finiti){
+  if (!chiavi || !chiavi.length) return;
+  for (const k of chiavi) {
+    if (finiti) { soldOutCache.add(k); soldOutFino.set(k, null); if (soldOutCollection) await soldOutCollection.updateOne({ _id: k }, { $set: { _id: k, fino: null, daScorta: true } }, { upsert: true }).catch(() => {}); }
+    else if (soldOutCache.has(k)) { soldOutCache.delete(k); soldOutFino.delete(k); if (soldOutCollection) await soldOutCollection.deleteOne({ _id: k }).catch(() => {}); }
+  }
+  avvisaEsauriti();
+}
+function pulisciScorta(b, p = {}){
+  const out = { ...p };
+  if (b.nome !== undefined) out.nome = String(b.nome || '').slice(0, 60).trim();
+  if (b.unita !== undefined) out.unita = String(b.unita || '').slice(0, 15);
+  if (b.quantita !== undefined) out.quantita = round2(Math.max(0, Number(String(b.quantita).replace(',', '.')) || 0));
+  if (b.soglia !== undefined) out.soglia = round2(Math.max(0, Number(String(b.soglia).replace(',', '.')) || 0));
+  if (Array.isArray(b.collegati)) out.collegati = b.collegati.map(String).filter(k => k.includes('|')).slice(0, 60);
+  return out;
+}
+app.get('/api/scorte', async (req, res) => res.json({ ok: true, scorte: await scorteArch.list({}, { nome: 1 }, 500) }));
+app.post('/api/scorte', async (req, res) => {
+  const b = req.body || {};
+  const vecchia = b._id ? await scorteArch.get(String(b._id)) : null;
+  const sc = pulisciScorta(b, vecchia || { _id: crypto.randomUUID(), nome: '', unita: 'pz', quantita: 0, soglia: 0, collegati: [] });
+  if (!sc.nome) return res.status(400).json({ ok: false, error: 'Scrivi il nome' });
+  sc.aggiornata = new Date().toISOString();
+  await scorteArch.save(sc);
+  const eraFinita = vecchia && vecchia.quantita <= 0, finita = sc.quantita <= 0;
+  if (finita !== eraFinita || (vecchia && JSON.stringify(vecchia.collegati) !== JSON.stringify(sc.collegati))) await segnaEsauritiDaScorta(sc.collegati, finita);
+  broadcastOrder({ evento: 'scorte_aggiornate' });
+  res.json({ ok: true, scorta: sc });
+});
+app.post('/api/scorte/:id/movimento', async (req, res) => {
+  const sc = await scorteArch.get(req.params.id);
+  if (!sc) return res.status(404).json({ ok: false, error: 'Non trovata' });
+  const prima = sc.quantita;
+  sc.quantita = round2(Math.max(0, prima + (Number((req.body || {}).delta) || 0)));
+  sc.aggiornata = new Date().toISOString();
+  await scorteArch.save(sc);
+  if ((prima <= 0) !== (sc.quantita <= 0)) await segnaEsauritiDaScorta(sc.collegati, sc.quantita <= 0);
+  broadcastOrder({ evento: 'scorte_aggiornate' });
+  res.json({ ok: true, scorta: sc });
+});
+app.delete('/api/scorte/:id', async (req, res) => {
+  await scorteArch.del(req.params.id);
+  res.json({ ok: true });
+});
+
+// ===== RICHIESTA DI RECENSIONE GOOGLE (email il giorno dopo l'ordine) =====
+const recensioniArch = archivio('recensioniChieste');
+let recensioniInCorso = false;
+async function inviaRichiesteRecensione(){
+  const r = CONFIG.recensioni;
+  if (recensioniInCorso || !r.attiva || !r.link || !ordersCollection || !RESEND_API_KEY) return;
+  recensioniInCorso = true;
+  try {
+    const al = new Date(Date.now() - r.dopoOre * 3600000).toISOString();
+    const dal = new Date(Date.now() - (r.dopoOre + 24) * 3600000).toISOString();
+    const ordini = await ordersCollection.find({ ricevutoAlle: { $gte: dal, $lte: al }, email: { $exists: true, $ne: '' }, recensioneChiesta: { $ne: true } },
+      { projection: { numeroOrdine: 1, ricevutoAlle: 1, email: 1, name: 1, nome: 1 } }).limit(50).toArray();
+    for (const o of ordini) {
+      const email = String(o.email).trim().toLowerCase();
+      const gia = await recensioniArch.get(email);
+      await ordersCollection.updateOne({ numeroOrdine: o.numeroOrdine, ricevutoAlle: o.ricevutoAlle }, { $set: { recensioneChiesta: true } });
+      if (gia && Date.now() - new Date(gia.ultima).getTime() < 90 * 86400000) continue; // al massimo una volta ogni 3 mesi
+      const nome = (o.nome || o.name || '').split(' ')[0];
+      const testo = `Ciao ${nome},\n\ngrazie per aver ordinato da La Casa di Carta! Ti è piaciuto?\nUna recensione su Google ci aiuta tantissimo: bastano 30 secondi.\n\n${r.link}\n\nGrazie di cuore,\nLa Casa di Carta`;
+      const html = `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:24px;color:#222"><h2 style="margin:0 0 12px">Ciao ${String(nome).replace(/[<>&"]/g, '')}, ti è piaciuto? 🍕</h2>
+        <p>Grazie per aver ordinato da <b>La Casa di Carta</b>! Una recensione su Google ci aiuta tantissimo: bastano 30 secondi.</p>
+        <p style="text-align:center;margin:28px 0"><a href="${r.link}" style="background:#e6432f;color:#fff;text-decoration:none;padding:14px 24px;border-radius:10px;font-weight:bold;display:inline-block">⭐ Lascia una recensione</a></p>
+        <p style="color:#777;font-size:13px">Grazie di cuore,<br>La Casa di Carta · Via XX Settembre 192, Niscemi</p></div>`;
+      await sendEmail(email, 'Com’era la tua pizza? ⭐ — La Casa di Carta', testo, html);
+      await recensioniArch.save({ _id: email, ultima: new Date().toISOString(), ordine: o.numeroOrdine });
+    }
+  } catch (err) { console.error('Errore richieste recensione:', err); }
+  finally { recensioniInCorso = false; }
+}
+setInterval(inviaRichiesteRecensione, 30 * 60 * 1000);
+setTimeout(inviaRichiesteRecensione, 3 * 60 * 1000);
+
+// ===== CHIUSURA CASSA DI FINE SERATA =====
+const chiusureArch = archivio('chiusureCassa');
+async function riepilogoGiornata(giorno){
+  const sala = { incasso: 0, conti: 0, contanti: 0, carta: 0 };
+  (await comandeList({ stato: 'chiusa', giorno }, 20000)).forEach(c => {
+    const imp = Number(c.totaleIncassato) || 0;
+    sala.incasso += imp; sala.conti++;
+    if (Array.isArray(c.pagamenti) && c.pagamenti.length) c.pagamenti.forEach(p => { if (p.metodo === 'carta') sala.carta += Number(p.importo) || 0; else sala.contanti += Number(p.importo) || 0; });
+    else if (c.pagamento === 'carta') sala.carta += imp; else sala.contanti += imp;
+  });
+  const online = { incasso: 0, ordini: 0, online: 0, contanti: 0, bancomat: 0, nonRegistrato: 0, sconti: 0 };
+  // la serata va dalle 5 del mattino alle 5 del giorno dopo
+  const dal = new Date(giorno + 'T05:00:00').toISOString(), al = new Date(giornoAggiunto(giorno, 1) + 'T05:00:00').toISOString();
+  const ordini = ordersCollection
+    ? await ordersCollection.find({ ricevutoAlle: { $gte: dal, $lt: al } }, { projection: { grandTotal: 1, subtotale: 1, metodoPagamento: 1, scontoPrimoOrdine: 1 } }).toArray()
+    : orderHistory.filter(o => o.ricevutoAlle >= dal && o.ricevutoAlle < al);
+  ordini.forEach(o => {
+    const imp = Number(o.grandTotal != null ? o.grandTotal : o.subtotale) || 0;
+    online.incasso += imp; online.ordini++;
+    online[['online', 'contanti', 'bancomat'].includes(o.metodoPagamento) ? o.metodoPagamento : 'nonRegistrato'] += imp;
+    online.sconti += Number(o.scontoPrimoOrdine) || 0;
+  });
+  const aperte = await comandeList({ stato: 'aperta' }, 2000);
+  const r2 = o => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, typeof v === 'number' && !['conti', 'ordini'].includes(k) ? round2(v) : v]));
+  return {
+    giorno, sala: r2(sala), online: r2(online),
+    aperte: { numero: aperte.length, residuo: round2(aperte.reduce((t, c) => t + residuoComanda(c), 0)) },
+    totale: round2(sala.incasso + online.incasso),
+    contantiIncassati: round2(sala.contanti + online.contanti)
+  };
+}
+function testoChiusura(r, ch){
+  const L = [];
+  L.push('================================');
+  L.push('CHIUSURA CASSA');
+  L.push(new Date(r.giorno + 'T12:00:00').toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }));
+  L.push(`Stampata alle ${oraIT()}`);
+  L.push('================================');
+  L.push(rigaPrezzo('SALA E BANCO', r.sala.incasso));
+  L.push(`   conti: ${r.sala.conti}`);
+  L.push(rigaPrezzo('   contanti', r.sala.contanti));
+  L.push(rigaPrezzo('   carta', r.sala.carta));
+  L.push('');
+  L.push(rigaPrezzo('ORDINI ONLINE', r.online.incasso));
+  L.push(`   ordini: ${r.online.ordini}`);
+  L.push(rigaPrezzo('   pagati online', r.online.online));
+  L.push(rigaPrezzo('   contanti', r.online.contanti));
+  L.push(rigaPrezzo('   bancomat', r.online.bancomat));
+  if (r.online.nonRegistrato) L.push(rigaPrezzo('   non registrato', r.online.nonRegistrato));
+  if (r.online.sconti) L.push(rigaPrezzo('   sconti primo ordine', -r.online.sconti));
+  L.push('--------------------------------');
+  L.push(rigaPrezzo('TOTALE GIORNATA', r.totale));
+  L.push('--------------------------------');
+  if (ch) {
+    L.push(rigaPrezzo('Fondo cassa', ch.fondoCassa));
+    L.push(rigaPrezzo('Contanti incassati', r.contantiIncassati));
+    L.push(rigaPrezzo('Contanti attesi', ch.attesi));
+    L.push(rigaPrezzo('Contanti contati', ch.contati));
+    L.push(rigaPrezzo(ch.differenza >= 0 ? 'AVANZANO' : 'MANCANO', Math.abs(ch.differenza)));
+    if (r.online.nonRegistrato) L.push('(ordini online "non registrato": controlla se pagati in contanti)');
+  }
+  if (r.aperte.numero) L.push(`ATTENZIONE: ${r.aperte.numero} comande ancora aperte (${money(r.aperte.residuo)})`);
+  if (ch && ch.note) { L.push(''); L.push(`Note: ${ch.note}`); }
+  L.push('================================');
+  return L.join('\n');
+}
+app.get('/api/titolare/chiusura', soloTitolare, async (req, res) => {
+  try {
+    const giorno = /^\d{4}-\d{2}-\d{2}$/.test(req.query.giorno || '') ? req.query.giorno : giornoServizio();
+    const r = await riepilogoGiornata(giorno);
+    const fatta = await chiusureArch.get(giorno);
+    const prima = (await chiusureArch.list({ giorno: { $lte: giornoAggiunto(giorno, -1) } }, { giorno: -1 }, 1))[0];
+    res.json({ ok: true, riepilogo: r, chiusura: fatta, fondoSuggerito: fatta ? fatta.fondoCassa : prima ? prima.fondoProssimo ?? prima.fondoCassa : 0 });
+  } catch (err) { console.error('Errore riepilogo cassa:', err); res.status(500).json({ ok: false, error: 'Errore server' }); }
+});
+app.post('/api/titolare/chiusura', soloTitolare, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const giorno = /^\d{4}-\d{2}-\d{2}$/.test(b.giorno || '') ? b.giorno : giornoServizio();
+    const r = await riepilogoGiornata(giorno);
+    const num = v => round2(Math.max(0, Number(String(v ?? '').replace(',', '.')) || 0));
+    const fondoCassa = num(b.fondoCassa), contati = num(b.contantiContati);
+    const attesi = round2(fondoCassa + r.contantiIncassati);
+    const ch = { _id: giorno, giorno, fondoCassa, contati, attesi, differenza: round2(contati - attesi),
+      fondoProssimo: b.fondoProssimo !== undefined && b.fondoProssimo !== '' ? num(b.fondoProssimo) : fondoCassa,
+      note: String(b.note || '').slice(0, 300), riepilogo: r, chiusaAlle: new Date().toISOString() };
+    await chiusureArch.save(ch);
+    if (b.stampa !== false) stampaStaff(testoChiusura(r, ch), `Chiusura cassa ${giorno}`);
+    res.json({ ok: true, chiusura: ch });
+  } catch (err) { console.error('Errore chiusura cassa:', err); res.status(500).json({ ok: false, error: 'Errore server' }); }
+});
+app.get('/api/titolare/chiusure', soloTitolare, async (req, res) => {
+  const lista = await chiusureArch.list({}, { giorno: -1 }, 60);
+  res.json({ ok: true, chiusure: lista.map(c => ({ giorno: c.giorno, totale: c.riepilogo && c.riepilogo.totale, differenza: c.differenza, contati: c.contati, attesi: c.attesi })) });
+});
+
+// ===== COSTO INGREDIENTI (per il margine nella dashboard) =====
+app.get('/api/costi', soloTitolare, (req, res) => {
+  const piatti = [];
+  MENU_CATALOG.forEach(g => { if (!String(g.keyPrefix).startsWith('EXTRA_') && g.cat !== 'Extra') g.items.forEach(n => piatti.push({ cat: g.cat, nome: n, prezzo: getCurrentPrice(`${g.keyPrefix}|${n}`) })); });
+  customMenuItemsCache.forEach(i => piatti.push({ cat: i.cat, nome: i.nome, prezzo: getCurrentPrice(`${i.cat}|${i.nome}`) }));
+  res.json({ ok: true, costi: COSTO_INGREDIENTI, piatti });
+});
+app.post('/api/costi', soloTitolare, async (req, res) => {
+  const inp = (req.body || {}).costi;
+  if (!inp || typeof inp !== 'object') return res.status(400).json({ ok: false, error: 'Nessun costo ricevuto' });
+  const out = {};
+  Object.entries(inp).slice(0, 1000).forEach(([nome, v]) => {
+    const n = Number(String(v ?? '').replace(',', '.'));
+    if (String(v ?? '').trim() !== '' && Number.isFinite(n) && n >= 0 && n < 500) out[String(nome).slice(0, 120)] = round2(n);
+  });
+  COSTO_INGREDIENTI = out;
+  if (settingsCollection) await settingsCollection.updateOne({ _id: 'costi' }, { $set: { value: out } }, { upsert: true });
+  res.json({ ok: true, costi: out });
+});
+
 // ---------- Impostazioni del titolare ----------
-app.get('/api/config', (req, res) => res.json({ ok: true, config: CONFIG }));
+function configPubblica(){
+  return { ...CONFIG, camerieri: (CONFIG.camerieri || []).map(x => ({ nome: x.nome, pin: !!x.pin })),
+    offerte: (CONFIG.offerte || []).filter(o => o.attiva).map(o => ({ ...o, codice: undefined, conCodice: !!o.codice })) };
+}
+function configTitolare(){
+  return { ...CONFIG, camerieri: (CONFIG.camerieri || []).map(x => ({ nome: x.nome, pin: x.pin ? '***' : '' })) };
+}
+app.get('/api/config', (req, res) => res.json({ ok: true, config: configPubblica() }));
+app.get('/api/config/completa', soloTitolare, (req, res) => res.json({ ok: true, config: configTitolare() }));
 app.post('/api/config', soloTitolare, async (req, res) => {
   const nuova = (req.body || {}).config;
   if (!nuova || typeof nuova !== 'object') return res.status(400).json({ ok: false, error: 'Nessuna impostazione ricevuta' });
@@ -3029,8 +3622,8 @@ app.post('/api/config', soloTitolare, async (req, res) => {
     try { await settingsCollection.updateOne({ _id: 'config' }, { $set: { value: CONFIG, aggiornataAlle: new Date().toISOString() } }, { upsert: true }); }
     catch (err) { console.error('Errore salvataggio impostazioni:', err); return res.status(500).json({ ok: false, error: 'Non riesco a salvare nel database' }); }
   }
-  broadcastOrder({ evento: 'config_aggiornata', config: CONFIG }); // sito, staff e pannello si aggiornano da soli
-  res.json({ ok: true, config: CONFIG });
+  broadcastOrder({ evento: 'config_aggiornata', config: configPubblica() }); // sito, staff e pannello si aggiornano da soli
+  res.json({ ok: true, config: configTitolare() });
 });
 
 // ---------- Password dell'app Titolare (scelta dall'app, senza toccare Render) ----------
