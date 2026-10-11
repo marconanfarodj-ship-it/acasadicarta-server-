@@ -2924,6 +2924,91 @@ app.get('/', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+// =====================================================================
+//  COPIA DI SICUREZZA DEL DATABASE (ogni settimana, per email al titolare)
+// =====================================================================
+// Esporta tutte le raccolte (ordini, clienti, comande, menu, prezzi, esauriti, impostazioni...)
+// in un unico file .json.gz. Formato EJSON: date e id restano identici per un eventuale ripristino.
+const zlibBackup = require('zlib');
+const BACKUP_GIORNI = 7;
+const BACKUP_MAX_BYTES = 30 * 1024 * 1024; // limite allegati email: se si supera, le foto si scaricano a parte
+function ejsonStringify(x){
+  try { const { BSON } = require('mongodb'); if (BSON && BSON.EJSON) return BSON.EJSON.stringify(x, { relaxed: false }); } catch (e) {}
+  return JSON.stringify(x);
+}
+async function creaBackup(opz = {}){
+  if (!db) throw new Error('Database non collegato');
+  const raccolte = (await db.listCollections({}, { nameOnly: true }).toArray()).map(c => c.name).sort();
+  const escludi = new Set(opz.senzaFoto ? ['productPhotos'] : []);
+  const dati = {}, conteggi = {};
+  for (const nome of raccolte) {
+    if (escludi.has(nome)) continue;
+    const docs = await db.collection(nome).find({}).toArray();
+    dati[nome] = docs; conteggi[nome] = docs.length;
+  }
+  const contenuto = { creatoIl: new Date().toISOString(), database: 'lacasadicarta', raccolte: conteggi, dati };
+  const gz = zlibBackup.gzipSync(Buffer.from(ejsonStringify(contenuto)), { level: 9 });
+  if (!opz.senzaFoto && gz.length > BACKUP_MAX_BYTES && raccolte.includes('productPhotos')) return creaBackup({ senzaFoto: true });
+  const giorno = dateKey(new Date());
+  return { nomeFile: `backup-lacasadicarta-${giorno}${opz.senzaFoto ? '-senza-foto' : ''}.json.gz`, gz, conteggi, senzaFoto: !!opz.senzaFoto };
+}
+async function inviaBackupEmail(motivo){
+  if (!RESEND_API_KEY) throw new Error('Email non configurata (RESEND_API_KEY su Render)');
+  const b = await creaBackup();
+  const righe = Object.entries(b.conteggi).map(([k, n]) => `- ${k}: ${n}`).join('\n');
+  const testo = `Copia di sicurezza ${motivo === 'manuale' ? 'richiesta dal titolare' : 'settimanale'} del database della pizzeria.\n\n` +
+    `File: ${b.nomeFile} (${(b.gz.length / 1024).toFixed(0)} KB)\n\nContenuto:\n${righe}\n\n` +
+    (b.senzaFoto ? 'Nota: le foto dei piatti non sono incluse (file troppo grande per l\'email): le foto restano sul sito.\n\n' : '') +
+    'Conserva questa email: serve solo se un giorno bisogna ripristinare i dati.';
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from: FROM_EMAIL, to: ORDER_EMAIL, subject: `💾 Copia di sicurezza La Casa di Carta — ${dateKey(new Date())}`, text: testo,
+      attachments: [{ filename: b.nomeFile, content: b.gz.toString('base64') }] })
+  });
+  if (!r.ok) throw new Error('Invio email non riuscito (' + r.status + '): ' + (await r.text()).slice(0, 200));
+  const quando = new Date().toISOString();
+  if (settingsCollection) await settingsCollection.updateOne({ _id: 'ultimoBackup' }, { $set: { value: quando, kb: Math.round(b.gz.length / 1024) } }, { upsert: true });
+  console.log(`Copia di sicurezza inviata a ${ORDER_EMAIL} (${Math.round(b.gz.length / 1024)} KB)`);
+  return { quando, kb: Math.round(b.gz.length / 1024), senzaFoto: b.senzaFoto };
+}
+// controllo ogni ora: se l'ultima copia ha più di 7 giorni, ne manda una (funziona anche se Render riavvia il server)
+let backupInCorso = false;
+async function controllaBackupSettimanale(){
+  if (backupInCorso || !db || !settingsCollection || !RESEND_API_KEY) return;
+  try {
+    const doc = await settingsCollection.findOne({ _id: 'ultimoBackup' });
+    const ultimo = doc && doc.value ? new Date(doc.value).getTime() : 0;
+    if (Date.now() - ultimo < BACKUP_GIORNI * 24 * 60 * 60 * 1000) return;
+    backupInCorso = true;
+    await inviaBackupEmail('settimanale');
+  } catch (err) { console.error('Errore copia di sicurezza settimanale:', err.message || err); }
+  finally { backupInCorso = false; }
+}
+setTimeout(controllaBackupSettimanale, 2 * 60 * 1000);
+setInterval(controllaBackupSettimanale, 60 * 60 * 1000);
+
+// dal Titolare: scarica subito la copia, oppure mandala per email adesso
+app.get('/api/backup/scarica', soloTitolare, async (req, res) => {
+  try {
+    const b = await creaBackup();
+    res.setHeader('Content-Type', 'application/gzip');
+    res.setHeader('Content-Disposition', `attachment; filename="${b.nomeFile}"`);
+    res.end(b.gz);
+  } catch (err) { console.error('Errore copia di sicurezza:', err); res.status(500).json({ ok: false, error: err.message || 'Errore' }); }
+});
+app.post('/api/backup/invia', soloTitolare, async (req, res) => {
+  if (backupInCorso) return res.status(409).json({ ok: false, error: 'Copia già in corso, riprova tra un minuto' });
+  backupInCorso = true;
+  try { const r = await inviaBackupEmail('manuale'); res.json({ ok: true, ...r, a: ORDER_EMAIL }); }
+  catch (err) { console.error('Errore invio copia:', err); res.status(500).json({ ok: false, error: err.message || 'Errore' }); }
+  finally { backupInCorso = false; }
+});
+app.get('/api/backup/stato', soloTitolare, async (req, res) => {
+  const doc = settingsCollection ? await settingsCollection.findOne({ _id: 'ultimoBackup' }).catch(() => null) : null;
+  res.json({ ok: true, ultimo: doc ? doc.value : null, kb: doc ? doc.kb : null, email: ORDER_EMAIL, ogniGiorni: BACKUP_GIORNI });
+});
+
 app.listen(PORT, () => {
   console.log(`Server ordini in ascolto sulla porta ${PORT}`);
 });
