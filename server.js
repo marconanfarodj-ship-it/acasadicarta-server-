@@ -3757,7 +3757,9 @@ app.post('/api/costi', soloTitolare, async (req, res) => {
 
 // ---------- Impostazioni del titolare ----------
 function configPubblica(){
-  return { ...CONFIG, camerieri: (CONFIG.camerieri || []).map(x => ({ nome: x.nome, pin: !!x.pin })),
+  // il pagamento online si mostra ai clienti solo se Stripe è davvero collegato (chiave su Render)
+  const sito = { ...CONFIG.sito, pagamenti: { ...CONFIG.sito.pagamenti, online: !!(stripe && CONFIG.sito.pagamenti.online) } };
+  return { ...CONFIG, sito, pagamentoOnlineCollegato: !!stripe, camerieri: (CONFIG.camerieri || []).map(x => ({ nome: x.nome, pin: !!x.pin })),
     offerte: (CONFIG.offerte || []).filter(o => o.attiva).map(o => ({ ...o, codice: undefined, conCodice: !!o.codice })) };
 }
 function configTitolare(){
