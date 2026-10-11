@@ -2212,8 +2212,15 @@ function normalizzaRighe(righe){
       return p == null ? null : { chiave: k, nome: String(e.nome || k.split('|')[1] || '').slice(0, 60), prezzo: round2(p) };
     }).filter(Boolean);
     const pane = STAFF_PANE_PREZZI[r.pane] !== undefined ? r.pane : '';
+    // varianti libere scritte dallo staff (es. "metà diavola", "+ nduja"): testo e prezzo decisi a mano
+    const varianti = (Array.isArray(r.varianti) ? r.varianti : []).slice(0, 10).map(v => {
+      const testo = String((v && v.testo) || '').trim().slice(0, 60);
+      const pr = Number(v && v.prezzo);
+      return testo ? { testo, prezzo: Number.isFinite(pr) && pr >= -50 && pr <= 50 ? round2(pr) : 0 } : null;
+    }).filter(Boolean);
+    const varTot = varianti.reduce((t, v) => t + v.prezzo, 0);
     const extraTot = extra.reduce((t, e) => t + e.prezzo, 0) * (max ? 2 : 1); // con la Max anche gli extra raddoppiano
-    const prezzoListino = base + extraTot + (glutine ? STAFF_SENZA_GLUTINE : 0) + (pane ? STAFF_PANE_PREZZI[pane] : 0);
+    const prezzoListino = base + extraTot + varTot + (glutine ? STAFF_SENZA_GLUTINE : 0) + (pane ? STAFF_PANE_PREZZI[pane] : 0);
     // prezzo deciso a mano dallo staff per questo piatto (sconto, offerta, piatto speciale)
     const manuale = r.prezzoManuale === null || r.prezzoManuale === undefined || r.prezzoManuale === '' ? null : Number(r.prezzoManuale);
     const prezzoManuale = Number.isFinite(manuale) && manuale >= 0 && manuale <= 999 ? round2(manuale) : null;
@@ -2223,7 +2230,7 @@ function normalizzaRighe(righe){
       chiave, nome, cat,
       qty: Math.max(0, Math.min(99, parseInt(r.qty, 10) || 0)),
       note: String(r.note || '').slice(0, 200),
-      pane, extra, opzioni, prezzoManuale,
+      pane, extra, varianti, opzioni, prezzoManuale,
       prezzoBase: round2(listino != null ? listino : Math.max(0, Number(r.prezzoBase ?? r.prezzo) || 0)),
       prezzo: round2(prezzo) // prezzo di un pezzo, varianti comprese
     };
@@ -2263,7 +2270,7 @@ function firmaRiga(r){
   const o = r.opzioni || {};
   return JSON.stringify([r.note || '', r.pane || '', (r.extra || []).map(e => e.chiave).sort(),
     [...(o.senza || [])].sort(), o.cottura || '', !!o.max, !!o.mezzaMax, !!o.glutine, o.formato || '',
-    [...(o.rifinitura || [])].sort(), [...(o.salse || [])].sort()]);
+    [...(o.rifinitura || [])].sort(), [...(o.salse || [])].sort(), (r.varianti || []).map(v => v.testo + '=' + v.prezzo)]);
 }
 // righe di stampa per un piatto: nome, pane, extra, nota
 // extra uguali messi più volte (doppio prosciutto...): "2x Prosciutto"
@@ -2287,6 +2294,7 @@ function righeStampa(r, prefisso){
   if (o.glutine) out.push('   *** SENZA GLUTINE ***');
   if (o.senza && o.senza.length) out.push(`   SENZA: ${o.senza.join(', ')}`);
   if (r.extra && r.extra.length) out.push(`   + ${nomiExtra(r.extra).join(', + ')}`);
+  (r.varianti || []).forEach(v => out.push(`   * ${v.testo}`));
   if (o.rifinitura && o.rifinitura.length) out.push(`   con: ${o.rifinitura.join(', ')}`);
   if (o.salse && o.salse.length) out.push(`   salse: ${o.salse.join(', ')}`);
   if (r.note) out.push(`   >> ${r.note}`);
@@ -2369,6 +2377,7 @@ function testoConto(c, selezione){
     tot += r.prezzo * n;
     L.push(rigaPrezzo(`${n}x ${r.nome}${o.max ? ' MAX' : o.mezzaMax ? ' MEZZA MAX' : ''}${o.formato ? ' ' + o.formato : ''}`, r.prezzo * n));
     nomiExtra(r.extra).forEach(x => L.push(`   + ${x}`));
+    (r.varianti || []).forEach(v => L.push(`   * ${v.testo}`));
     if (o.glutine) L.push('   senza glutine');
     if (r.pane && STAFF_PANE_PREZZI[r.pane]) L.push(`   pane: ${r.pane}`);
   });
@@ -2480,7 +2489,9 @@ app.post('/api/staff/comande/:id/invia', async (req, res) => {
   const primaVolta = c.invii === 0;
   c.invii += 1;
   if ((req.body || {}).cameriere) { c.ultimoCameriere = String(req.body.cameriere).slice(0, 30); if (!c.cameriere) c.cameriere = c.ultimoCameriere; }
-  stampaStaff(testoComandaCucina(c, diff, primaVolta), `${etichettaComanda(c)} #${c.invii}`);
+  const senzaStampa = !!(req.body || {}).senzaStampa; // "salva senza stampare": segna come già in cucina, niente scontrino
+  if (!senzaStampa) stampaStaff(testoComandaCucina(c, diff, primaVolta), `${etichettaComanda(c)} #${c.invii}`);
+  else c.salvateSenzaStampa = (c.salvateSenzaStampa || 0) + 1;
   c.inviate = c.righe.map(r => ({ ...r }));
   c.ultimoInvio = new Date().toISOString();
   await comandaSave(c);
@@ -3229,7 +3240,93 @@ app.post('/api/staff/cameriere', (req, res) => {
 
 // ===== ORDINE DAL TAVOLO CON IL QR: il cliente ordina, lo staff accetta =====
 const richiesteArch = archivio('richiesteTavolo');
+// piatti scelti dal cliente dal telefono (QR tavolo / QR banco): solo voci del menu, i prezzi li rimette normalizzaRighe
+function righeDaCliente(lista){
+  return (Array.isArray(lista) ? lista : []).slice(0, 40)
+    .filter(r => r && getCurrentPrice(String(r.chiave || '')) != null && !soldOutCache.has(String(r.chiave)) && !String(r.chiave).startsWith('EXTRA_'))
+    .map(r => ({ chiave: String(r.chiave), nome: String(r.nome || String(r.chiave).split('|')[1] || ''), cat: String(r.cat || String(r.chiave).split('|')[0] || ''), qty: Math.min(20, Math.max(1, parseInt(r.qty, 10) || 1)), note: String(r.note || '').slice(0, 120),
+      // extra, pane e "senza" scelti dal cliente: i prezzi li rimette normalizzaRighe dal listino
+      extra: (Array.isArray(r.extra) ? r.extra : []).slice(0, 15).map(e => ({ chiave: String((e && e.chiave) || ''), nome: String((e && e.nome) || '') }))
+        .filter(e => e.chiave.startsWith('EXTRA_') && getCurrentPrice(e.chiave) != null && !soldOutCache.has(e.chiave)),
+      pane: STAFF_PANE_PREZZI[r.pane] !== undefined && !soldOutCache.has('PANE|' + r.pane) ? r.pane : '',
+      opzioni: { senza: (r.opzioni && Array.isArray(r.opzioni.senza)) ? r.opzioni.senza.slice(0, 12).map(x => String(x).slice(0, 40)) : [],
+        salse: (r.opzioni && Array.isArray(r.opzioni.salse)) ? r.opzioni.salse.slice(0, 12).map(x => String(x).slice(0, 40)) : [] } }));
+}
 const tentativiQr = new Map();
+// =====================================================================
+//  QR AL BANCO: il cliente in pizzeria ordina dal telefono, scrive solo il nome,
+//  sceglie contanti (paga alla cassa) o pagamento online, e aspetta il suo numero.
+// =====================================================================
+function ordineBanco(righe, nome, online){
+  const sep = '------------------------------';
+  const articoli = righe.map(r => {
+    const o = r.opzioni || {}, dettagli = [];
+    if (r.pane && r.pane !== 'Panino Classico') dettagli.push(`Pane: ${r.pane}`);
+    if ((o.senza || []).length) dettagli.push(`Senza: ${o.senza.join(', ')}`);
+    nomiExtra(r.extra).forEach(x => dettagli.push(`+ ${x}`));
+    if ((o.salse || []).length) dettagli.push(`Salse: ${o.salse.join(', ')}`);
+    if (r.note) dettagli.push(r.note);
+    return { qty: r.qty, nome: r.nome, prezzo: round2(r.prezzo * r.qty), dettagli, chiave: r.chiave };
+  });
+  const totale = round2(articoli.reduce((t, a) => t + a.prezzo, 0));
+  let testo = `ORDINE AL BANCO (QR) — LA CASA DI CARTA\n${sep}\nModalità: Ritiro in sede — aspetta al banco\nOrario richiesto: Il prima possibile\nNome: ${nome}\n${sep}\n`;
+  articoli.forEach(a => { testo += `${a.qty}x ${a.nome}  ${money(a.prezzo)}\n`; a.dettagli.forEach(d => { testo += `   ${d}\n`; }); });
+  testo += `${sep}\nTotale: ${money(totale)}\n`;
+  testo += online ? 'PAGATO ONLINE\n' : 'DA PAGARE ALLA CASSA (contanti)\n';
+  return {
+    fonte: 'banco', interno: true, modalita: 'ritiro', nome, name: nome, phone: '', address: '', note: '',
+    articoli, subtotaleBase: totale, scontoPrimoOrdine: 0, subtotale: totale, speseConsegna: 0, grandTotal: totale,
+    pagamento: 'contanti', timing: 'prima', orarioLabel: 'Al banco — il prima possibile', testoStampa: testo,
+    oggettoEmail: `Nuovo ordine (banco QR) — ${nome}`
+  };
+}
+app.post('/api/banco/ordine', async (req, res) => {
+  const b = req.body || {};
+  const nome = String(b.nome || '').trim().slice(0, 40);
+  if (!nome) return res.status(400).json({ ok: false, error: 'Scrivi il tuo nome: ti chiamiamo così quando è pronto.' });
+  if (ordersPaused) return res.status(403).json({ ok: false, error: 'In questo momento siamo pieni: chiedi al banco.' });
+  if (isClosedDate(dateKey(new Date()))) return res.status(409).json({ ok: false, error: 'Oggi siamo chiusi.' });
+  const online = b.pagamento === 'online';
+  if (online && (!stripe || !CONFIG.sito.pagamenti.online)) return res.status(400).json({ ok: false, error: 'Il pagamento online ora non è disponibile: scegli contanti.' });
+  const ip = req.ip || 'x';
+  const t = tentativiQr.get(ip) || { n: 0, dal: Date.now() };
+  if (Date.now() - t.dal > 10 * 60 * 1000) { t.n = 0; t.dal = Date.now(); }
+  if (t.n >= 8) return res.status(429).json({ ok: false, error: 'Troppi ordini di seguito: chiedi al banco.' });
+  const righe = normalizzaRighe(righeDaCliente(b.righe));
+  if (!righe.length) return res.status(400).json({ ok: false, error: 'Il carrello è vuoto o i piatti non sono più disponibili' });
+  t.n++; tentativiQr.set(ip, t);
+  const order = ordineBanco(righe, nome, online);
+  order.ipCliente = ip;
+  if (!online) {
+    order.pagatoOnline = false;
+    await finalizeOrder(order, null);
+    return res.json({ ok: true, numeroOrdine: order.numeroOrdine, totale: order.grandTotal });
+  }
+  try {
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment', payment_method_types: ['card'],
+      line_items: [{ price_data: { currency: 'eur', product_data: { name: `Ordine al banco — ${nome}` }, unit_amount: Math.round(order.grandTotal * 100) }, quantity: 1 }],
+      success_url: `${SITE_URL}/banco.html?sessione={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${SITE_URL}/banco.html?annullato=1`
+    });
+    order.pagamento = 'carta_online'; order.pagatoOnline = true; order.stripeSession = session.id;
+    const pendingData = { order, customerId: null };
+    if (pendingOrdersCollection) await pendingOrdersCollection.insertOne({ _id: session.id, ...pendingData, createdAt: new Date() });
+    else pendingOnlineOrders[session.id] = pendingData;
+    res.json({ ok: true, url: session.url });
+  } catch (err) {
+    console.error('Errore pagamento banco:', err);
+    res.status(500).json({ ok: false, error: 'Pagamento non avviato: riprova o scegli contanti.' });
+  }
+});
+// dopo il pagamento online: il telefono del cliente chiede qui il suo numero d'ordine
+app.get('/api/banco/sessione/:id', async (req, res) => {
+  const id = String(req.params.id || '').slice(0, 200);
+  let o = orderHistory.find(x => x.stripeSession === id);
+  if (!o && ordersCollection) { try { o = await ordersCollection.findOne({ stripeSession: id }); } catch (e) {} }
+  if (o) return res.json({ ok: true, numeroOrdine: o.numeroOrdine, stato: o.stato || 'da_preparare' });
+  res.json({ ok: true, inAttesa: true }); // il pagamento sta ancora arrivando da Stripe
+});
 app.post('/api/tavolo/richiesta', async (req, res) => {
   if (!CONFIG.sala.qrAttivo) return res.status(403).json({ ok: false, error: 'Gli ordini dal tavolo sono spenti: chiama il cameriere.' });
   const b = req.body || {};
@@ -3239,14 +3336,8 @@ app.post('/api/tavolo/richiesta', async (req, res) => {
   const t = tentativiQr.get(ip) || { n: 0, dal: Date.now() };
   if (Date.now() - t.dal > 10 * 60 * 1000) { t.n = 0; t.dal = Date.now(); }
   if (t.n >= 8) return res.status(429).json({ ok: false, error: 'Troppi ordini di seguito: chiama il cameriere.' });
-  const grezze = (Array.isArray(b.righe) ? b.righe : []).slice(0, 40)
-    .filter(r => r && getCurrentPrice(String(r.chiave || '')) != null && !soldOutCache.has(String(r.chiave)) && !String(r.chiave).startsWith('EXTRA_'))
-    .map(r => ({ chiave: String(r.chiave), nome: String(r.nome || String(r.chiave).split('|')[1] || ''), cat: String(r.cat || String(r.chiave).split('|')[0] || ''), qty: Math.min(20, Math.max(1, parseInt(r.qty, 10) || 1)), note: String(r.note || '').slice(0, 120),
-      // extra, pane e "senza" scelti dal cliente: i prezzi li rimette normalizzaRighe dal listino
-      extra: (Array.isArray(r.extra) ? r.extra : []).slice(0, 15).map(e => ({ chiave: String((e && e.chiave) || ''), nome: String((e && e.nome) || '') }))
-        .filter(e => e.chiave.startsWith('EXTRA_') && getCurrentPrice(e.chiave) != null && !soldOutCache.has(e.chiave)),
-      pane: STAFF_PANE_PREZZI[r.pane] !== undefined && !soldOutCache.has('PANE|' + r.pane) ? r.pane : '',
-      opzioni: { senza: (r.opzioni && Array.isArray(r.opzioni.senza)) ? r.opzioni.senza.slice(0, 12).map(x => String(x).slice(0, 40)) : [] } }));
+  const grezze = righeDaCliente(b.righe);
+
   const righe = normalizzaRighe(grezze);
   if (!righe.length) return res.status(400).json({ ok: false, error: 'Il carrello è vuoto o i piatti non sono più disponibili' });
   t.n++; tentativiQr.set(ip, t);
