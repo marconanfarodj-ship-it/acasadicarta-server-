@@ -2754,6 +2754,29 @@ app.post('/api/sold-out/reset-all', async (req, res) => {
 });
 
 // ---------- Endpoint: segna/togli un prodotto come esaurito ----------
+// esaurisci / rendi disponibile un'intera categoria in un colpo solo
+app.post('/api/sold-out/bulk', async (req, res) => {
+  const b = req.body || {};
+  const chiavi = (Array.isArray(b.chiavi) ? b.chiavi : []).map(String).filter(k => k.includes('|')).slice(0, 300);
+  if (!chiavi.length) return res.status(400).json({ ok: false, error: 'Nessun prodotto' });
+  const oggi = giornoServizio();
+  let fino = oggi;
+  const richiesto = String(b.fino || 'oggi');
+  if (richiesto === 'sempre') fino = null;
+  else if (/^\d{4}-\d{2}-\d{2}$/.test(richiesto) && richiesto >= oggi) fino = richiesto;
+  for (const k of chiavi) {
+    if (b.esaurito) {
+      soldOutCache.add(k); soldOutFino.set(k, fino);
+      if (soldOutCollection) await soldOutCollection.updateOne({ _id: k }, { $set: { _id: k, fino } }, { upsert: true }).catch(() => {});
+    } else {
+      soldOutCache.delete(k); soldOutFino.delete(k);
+      if (soldOutCollection) await soldOutCollection.deleteOne({ _id: k }).catch(() => {});
+    }
+  }
+  avvisaEsauriti();
+  res.json({ ok: true, esauriti: [...soldOutCache], fino: esauritiDettagli(), oggi });
+});
+
 app.post('/api/sold-out/toggle', async (req, res) => {
   const { chiave, esaurito } = req.body || {};
   if (!chiave) return res.status(400).json({ ok: false, error: 'Manca la chiave del prodotto' });
@@ -3218,7 +3241,12 @@ app.post('/api/tavolo/richiesta', async (req, res) => {
   if (t.n >= 8) return res.status(429).json({ ok: false, error: 'Troppi ordini di seguito: chiama il cameriere.' });
   const grezze = (Array.isArray(b.righe) ? b.righe : []).slice(0, 40)
     .filter(r => r && getCurrentPrice(String(r.chiave || '')) != null && !soldOutCache.has(String(r.chiave)) && !String(r.chiave).startsWith('EXTRA_'))
-    .map(r => ({ chiave: String(r.chiave), nome: String(r.nome || String(r.chiave).split('|')[1] || ''), cat: String(r.cat || String(r.chiave).split('|')[0] || ''), qty: Math.min(20, Math.max(1, parseInt(r.qty, 10) || 1)), note: String(r.note || '').slice(0, 120) }));
+    .map(r => ({ chiave: String(r.chiave), nome: String(r.nome || String(r.chiave).split('|')[1] || ''), cat: String(r.cat || String(r.chiave).split('|')[0] || ''), qty: Math.min(20, Math.max(1, parseInt(r.qty, 10) || 1)), note: String(r.note || '').slice(0, 120),
+      // extra, pane e "senza" scelti dal cliente: i prezzi li rimette normalizzaRighe dal listino
+      extra: (Array.isArray(r.extra) ? r.extra : []).slice(0, 15).map(e => ({ chiave: String((e && e.chiave) || ''), nome: String((e && e.nome) || '') }))
+        .filter(e => e.chiave.startsWith('EXTRA_') && getCurrentPrice(e.chiave) != null && !soldOutCache.has(e.chiave)),
+      pane: STAFF_PANE_PREZZI[r.pane] !== undefined && !soldOutCache.has('PANE|' + r.pane) ? r.pane : '',
+      opzioni: { senza: (r.opzioni && Array.isArray(r.opzioni.senza)) ? r.opzioni.senza.slice(0, 12).map(x => String(x).slice(0, 40)) : [] } }));
   const righe = normalizzaRighe(grezze);
   if (!righe.length) return res.status(400).json({ ok: false, error: 'Il carrello è vuoto o i piatti non sono più disponibili' });
   t.n++; tentativiQr.set(ip, t);
@@ -3519,6 +3547,35 @@ async function riepilogoGiornata(giorno){
     contantiIncassati: round2(sala.contanti + online.contanti)
   };
 }
+// comande rimaste aperte a fine serata: si chiudono da sole e finiscono negli incassi
+// (conteggiate in contanti, segnate "chiusa in automatico"); quelle vuote si annullano
+async function chiudiComandeRimaste(prendi){
+  const aperte = await comandeList({ stato: 'aperta' }, 5000);
+  let chiuse = 0, totale = 0;
+  for (const c of aperte) {
+    if (!prendi(c.giorno || '')) continue;
+    const ora = new Date().toISOString();
+    if (!(c.righe || []).length) { c.stato = 'annullata'; c.annullataAuto = true; c.annullataAlle = ora; await comandaSave(c); continue; }
+    const resto = residuoComanda(c);
+    c.pagamenti = c.pagamenti || [];
+    if (resto > 0) {
+      c.pagamenti.push({ importo: resto, metodo: 'contanti', chiusura: true, auto: true, alle: ora });
+      c.righe.forEach(r => { r.pagate = r.qty; });
+    }
+    c.stato = 'chiusa'; c.chiusaAuto = true;
+    c.pagamento = c.pagamenti.every(p => p.metodo === 'contanti') ? 'contanti' : 'misto';
+    c.totaleIncassato = pagatoComanda(c);
+    c.chiusaAlle = ora;
+    await comandaSave(c);
+    chiuse++; totale += c.totaleIncassato;
+  }
+  if (chiuse) { console.log(`Chiuse in automatico ${chiuse} comande rimaste aperte (${money(totale)})`); broadcastOrder({ evento: 'comande_chiuse_auto', numero: chiuse }); }
+  return { chiuse, totale: round2(totale) };
+}
+// alle 5 di mattina (inizio della nuova "giornata") chiude quelle della sera prima
+setInterval(() => chiudiComandeRimaste(g => g && g < giornoServizio()).catch(err => console.error('Errore chiusura automatica:', err)), 10 * 60 * 1000);
+setTimeout(() => chiudiComandeRimaste(g => g && g < giornoServizio()).catch(() => {}), 90 * 1000);
+
 function testoChiusura(r, ch){
   const L = [];
   L.push('================================');
@@ -3549,6 +3606,7 @@ function testoChiusura(r, ch){
     L.push(rigaPrezzo(ch.differenza >= 0 ? 'AVANZANO' : 'MANCANO', Math.abs(ch.differenza)));
     if (r.online.nonRegistrato) L.push('(ordini online "non registrato": controlla se pagati in contanti)');
   }
+  if (ch && ch.comandeChiuseAuto) L.push(`Chiuse in automatico: ${ch.comandeChiuseAuto} comande (contate in contanti)`);
   if (r.aperte.numero) L.push(`ATTENZIONE: ${r.aperte.numero} comande ancora aperte (${money(r.aperte.residuo)})`);
   if (ch && ch.note) { L.push(''); L.push(`Note: ${ch.note}`); }
   L.push('================================');
@@ -3567,13 +3625,15 @@ app.post('/api/titolare/chiusura', soloTitolare, async (req, res) => {
   try {
     const b = req.body || {};
     const giorno = /^\d{4}-\d{2}-\d{2}$/.test(b.giorno || '') ? b.giorno : giornoServizio();
+    // chiudendo la cassa, le comande ancora aperte di quella serata vanno negli incassi
+    const auto = b.chiudiAperte === false ? { chiuse: 0, totale: 0 } : await chiudiComandeRimaste(g => g && g <= giorno);
     const r = await riepilogoGiornata(giorno);
     const num = v => round2(Math.max(0, Number(String(v ?? '').replace(',', '.')) || 0));
     const fondoCassa = num(b.fondoCassa), contati = num(b.contantiContati);
     const attesi = round2(fondoCassa + r.contantiIncassati);
     const ch = { _id: giorno, giorno, fondoCassa, contati, attesi, differenza: round2(contati - attesi),
       fondoProssimo: b.fondoProssimo !== undefined && b.fondoProssimo !== '' ? num(b.fondoProssimo) : fondoCassa,
-      note: String(b.note || '').slice(0, 300), riepilogo: r, chiusaAlle: new Date().toISOString() };
+      note: String(b.note || '').slice(0, 300), riepilogo: r, chiusaAlle: new Date().toISOString(), comandeChiuseAuto: auto.chiuse };
     await chiusureArch.save(ch);
     if (b.stampa !== false) stampaStaff(testoChiusura(r, ch), `Chiusura cassa ${giorno}`);
     res.json({ ok: true, chiusura: ch });
