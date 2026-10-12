@@ -108,32 +108,8 @@ let productPhotosCache = {}; // chiave -> { data: "data:image/jpeg;base64,...", 
 let productPhotosCollection = null;
 
 // Piatti nuovi aggiunti dal titolare dal pannello di stampa (in più rispetto al menu di base).
-let customMenuItemsCache = []; // [{ cat, nome, descrizione, prezzo, gruppo? }] — gruppo = EXTRA_PIZZA/EXTRA_PANINO per gli extra
+let customMenuItemsCache = []; // [{ cat, nome, descrizione, prezzo }]
 let customMenuItemsCollection = null;
-// prefisso della chiave di una voce aggiunta: gli extra usano il gruppo (EXTRA_PIZZA|nome), i piatti la categoria (Pizza|nome)
-const prefissoCustom = (i) => i.gruppo || i.cat;
-const chiaveCustom = (i) => `${prefissoCustom(i)}|${i.nome}`;
-
-// Voci del menu di base cancellate dal titolare (spariscono da sito, staff e pannello; si possono ripristinare)
-let hiddenMenuCache = new Set();
-let hiddenMenuCollection = null;
-const voceVisibile = (chiave) => !hiddenMenuCache.has(chiave);
-
-// catalogo completo: menu di base + voci aggiunte (anche extra), senza le voci cancellate
-function catalogoCompleto(){
-  const categorie = MENU_CATALOG.map(g => ({ ...g, items: g.items.filter(n => voceVisibile(`${g.keyPrefix}|${n}`)) }));
-  customMenuItemsCache.forEach(item => {
-    let gruppo = item.gruppo
-      ? categorie.find(g => g.keyPrefix === item.gruppo)
-      : categorie.find(g => g.cat === item.cat && !String(g.keyPrefix || '').startsWith('EXTRA_'));
-    if (!gruppo) {
-      gruppo = { cat: item.cat, items: [], keyPrefix: item.gruppo || item.cat };
-      categorie.push(gruppo);
-    }
-    if (!gruppo.items.includes(item.nome)) gruppo.items.push(item.nome);
-  });
-  return categorie;
-}
 
 
 async function connectDB(){
@@ -189,8 +165,6 @@ async function connectDB(){
     await comandeCollection.createIndex({ stato: 1, aggiornataAlle: -1 });
     customMenuItemsCollection = db.collection('customMenuItems');
     customMenuItemsCache = await customMenuItemsCollection.find({}).toArray();
-    hiddenMenuCollection = db.collection('hiddenMenuItems');
-    hiddenMenuCache = new Set((await hiddenMenuCollection.find({}).toArray()).map(d => d._id));
     console.log('Connesso a MongoDB Atlas.');
     riprendiStorico();
   }catch(err){
@@ -579,7 +553,9 @@ const CONFIG_BASE = {
   fedelta: { attiva: false, ogni: 10, premio: 'Una pizza Margherita in omaggio' },
   recensioni: { attiva: false, link: '', dopoOre: 18 },
   stampa: { prezziComanda: true, totaleComanda: true, spazioTraProdotti: true, logo: true,
-    intestazioneConto: 'PIZZERIA LA CASA DI CARTA\nVia XX Settembre 192 - Niscemi', piedeConto: 'Grazie e arrivederci!' }
+    intestazioneConto: 'PIZZERIA LA CASA DI CARTA\nVia XX Settembre 192 - Niscemi', piedeConto: 'Grazie e arrivederci!',
+    // due stampanti: dove va ogni tipo di stampa (1 = prima, 2 = seconda, 3 = tutte e due)
+    nome1: 'Cucina', nome2: 'Stampante 2', instrada: { sito: 1, noi: 1, banco: 1, conti: 1, cassa: 1 } }
 };
 let CONFIG = JSON.parse(JSON.stringify(CONFIG_BASE));
 function cfgNum(v, min, max, def, intero){
@@ -684,6 +660,11 @@ function pulisciConfig(inp, attuale){
     ['prezziComanda', 'totaleComanda', 'spazioTraProdotti', 'logo'].forEach(k => { d[k] = cfgBool(x[k], d[k]); });
     d.intestazioneConto = cfgTesto(x.intestazioneConto, 200, d.intestazioneConto);
     d.piedeConto = cfgTesto(x.piedeConto, 200, d.piedeConto);
+    d.nome1 = cfgTesto(x.nome1, 20, d.nome1 || 'Cucina') || 'Cucina';
+    d.nome2 = cfgTesto(x.nome2, 20, d.nome2 || 'Stampante 2') || 'Stampante 2';
+    const ins = { sito: 1, noi: 1, banco: 1, conti: 1, cassa: 1, ...(d.instrada || {}) };
+    if (x.instrada && typeof x.instrada === 'object') Object.keys(ins).forEach(k => { const v = Number(x.instrada[k]); if ([1, 2, 3].includes(v)) ins[k] = v; });
+    d.instrada = ins;
   }
   return c;
 }
@@ -1665,8 +1646,17 @@ app.post('/api/orders/:numeroOrdine/pagamento', async (req, res) => {
 const BREAD_TYPES = ["Panino Classico", "Pan Pizza", "Tortilla"];
 
 app.get('/api/menu-catalog', (req, res) => {
-  // catalogo di base + voci aggiunte dal titolare (piatti ed extra), senza quelle cancellate
-  res.json({ categorie: catalogoCompleto(), tipiPane: BREAD_TYPES, cancellati: [...hiddenMenuCache] });
+  // uniamo il catalogo di base con i piatti nuovi aggiunti dal titolare, categoria per categoria
+  const categorie = MENU_CATALOG.map(g => ({ ...g, items: [...g.items] }));
+  customMenuItemsCache.forEach(item => {
+    let gruppo = categorie.find(g => g.cat === item.cat && !g.keyPrefix?.startsWith('EXTRA_'));
+    if (!gruppo) {
+      gruppo = { cat: item.cat, items: [], keyPrefix: item.cat };
+      categorie.push(gruppo);
+    }
+    if (!gruppo.items.includes(item.nome)) gruppo.items.push(item.nome);
+  });
+  res.json({ categorie, tipiPane: BREAD_TYPES });
 });
 
 // ---------- Endpoint: piatti nuovi aggiunti dal titolare dal pannello di stampa ----------
@@ -1675,22 +1665,16 @@ app.get('/api/custom-menu-items', (req, res) => {
 });
 
 app.post('/api/custom-menu-items/add', async (req, res) => {
-  const { cat, nome: nomeGrezzo, descrizione, prezzo, soloSala, gruppo: gruppoGrezzo } = req.body || {};
-  const nome = typeof nomeGrezzo === 'string' ? nomeGrezzo.trim().replace(/\s+/g, ' ').replace(/\|/g, '/').slice(0, 80) : '';
+  const { cat, nome, descrizione, prezzo, soloSala } = req.body || {};
   const nuovoPrezzo = Number(prezzo);
-  if (!cat || !nome || typeof cat !== 'string' || !Number.isFinite(nuovoPrezzo) || nuovoPrezzo < 0) {
+  if (!cat || !nome || typeof cat !== 'string' || typeof nome !== 'string' || !Number.isFinite(nuovoPrezzo) || nuovoPrezzo < 0) {
     return res.status(400).json({ ok: false, error: 'Dati non validi' });
   }
-  // gli extra (ingredienti aggiunti) appartengono a un gruppo: EXTRA_PIZZA o EXTRA_PANINO
-  const gruppo = typeof gruppoGrezzo === 'string' && /^EXTRA_[A-Z]+$/.test(gruppoGrezzo) && MENU_CATALOG.some(g => g.keyPrefix === gruppoGrezzo) ? gruppoGrezzo : null;
-  const chiave = `${gruppo || cat}|${nome}`;
+  const chiave = `${cat}|${nome}`;
   const item = { _id: chiave, cat, nome, descrizione: descrizione || '', prezzo: nuovoPrezzo, createdAt: new Date().toISOString() };
-  if (gruppo) item.gruppo = gruppo;
-  if (soloSala && !gruppo) { soloSalaCache.add(chiave); salvaSoloSala(); }
-  // se era una voce di base cancellata, riaggiungerla la fa tornare
-  if (hiddenMenuCache.delete(chiave) && hiddenMenuCollection) hiddenMenuCollection.deleteOne({ _id: chiave }).catch(() => {});
+  if (soloSala) { soloSalaCache.add(chiave); salvaSoloSala(); }
 
-  customMenuItemsCache = customMenuItemsCache.filter(i => chiaveCustom(i) !== chiave);
+  customMenuItemsCache = customMenuItemsCache.filter(i => i.cat !== cat || i.nome !== nome);
   customMenuItemsCache.push(item);
   priceOverridesCache[chiave] = nuovoPrezzo; // così è subito modificabile anche da "Modifica prezzi"
 
@@ -1709,43 +1693,17 @@ app.post('/api/custom-menu-items/add', async (req, res) => {
 });
 
 app.post('/api/custom-menu-items/delete', async (req, res) => {
-  const { cat, nome, gruppo } = req.body || {};
+  const { cat, nome } = req.body || {};
   if (!cat || !nome) return res.status(400).json({ ok: false, error: 'Dati mancanti' });
-  const chiave = `${gruppo || cat}|${nome}`;
+  const chiave = `${cat}|${nome}`;
   if (soloSalaCache.delete(chiave)) salvaSoloSala();
-  customMenuItemsCache = customMenuItemsCache.filter(i => chiaveCustom(i) !== chiave);
+  customMenuItemsCache = customMenuItemsCache.filter(i => i.cat !== cat || i.nome !== nome);
   if (customMenuItemsCollection) {
     customMenuItemsCollection.deleteOne({ _id: chiave }).catch(err => {
       console.error('Errore rimozione piatto:', err);
     });
   }
   res.json({ ok: true });
-});
-
-// ---------- Cancellare e ripristinare qualsiasi voce del menu (piatti ed extra) ----------
-// Le voci aggiunte dal titolare si cancellano davvero; quelle del menu di base vengono nascoste (ripristinabili).
-app.get('/api/menu-hidden', (req, res) => res.json([...hiddenMenuCache]));
-app.post('/api/menu-items/delete', async (req, res) => {
-  const chiave = String((req.body || {}).chiave || '');
-  if (!chiave.includes('|') || chiave.startsWith('PANE|')) return res.status(400).json({ ok: false, error: 'Voce non valida' });
-  const custom = customMenuItemsCache.find(i => chiaveCustom(i) === chiave);
-  if (custom) {
-    customMenuItemsCache = customMenuItemsCache.filter(i => i !== custom);
-    if (customMenuItemsCollection) await customMenuItemsCollection.deleteOne({ _id: custom._id || chiave }).catch(err => console.error('Errore rimozione voce:', err));
-    if (soloSalaCache.delete(chiave)) salvaSoloSala();
-    return res.json({ ok: true, cancellata: chiave, definitiva: true });
-  }
-  const [pref, ...resto] = chiave.split('|'); const nome = resto.join('|');
-  if (!MENU_CATALOG.some(g => g.keyPrefix === pref && g.items.includes(nome))) return res.status(404).json({ ok: false, error: 'Voce non trovata nel menu' });
-  hiddenMenuCache.add(chiave);
-  if (hiddenMenuCollection) await hiddenMenuCollection.updateOne({ _id: chiave }, { $set: { _id: chiave, quando: new Date().toISOString() } }, { upsert: true }).catch(err => console.error('Errore salvataggio voce cancellata:', err));
-  res.json({ ok: true, cancellata: chiave, definitiva: false });
-});
-app.post('/api/menu-items/restore', async (req, res) => {
-  const chiave = String((req.body || {}).chiave || '');
-  if (!hiddenMenuCache.delete(chiave)) return res.status(404).json({ ok: false, error: 'Voce non tra quelle cancellate' });
-  if (hiddenMenuCollection) await hiddenMenuCollection.deleteOne({ _id: chiave }).catch(() => {});
-  res.json({ ok: true, ripristinata: chiave });
 });
 
 // ---------- Esauriti a tempo ----------
@@ -1779,7 +1737,7 @@ setInterval(scadenzaEsauriti, 60 * 1000);
 // ---------- Endpoint: elenco prodotti attualmente esauriti ----------
 app.get('/api/sold-out', (req, res) => {
   scadenzaEsauriti();
-  res.json([...soldOutCache, ...hiddenMenuCache]);   // le voci cancellate risultano non ordinabili anche per le versioni vecchie del sito
+  res.json([...soldOutCache]);
 });
 // stesso elenco con la scadenza di ognuno (per il pannello)
 app.get('/api/sold-out/dettagli', (req, res) => {
@@ -1819,7 +1777,7 @@ function articoloSoloSala(articoli){
   const nomiSala = new Set([...soloSalaCache].map(k => k.split('|').slice(1).join('|')));
   const nomiOnline = new Set();
   MENU_CATALOG.forEach(g => g.items.forEach(n => { if (!soloSalaCache.has(`${g.keyPrefix}|${n}`)) nomiOnline.add(n); }));
-  customMenuItemsCache.forEach(i => { if (!soloSalaCache.has(chiaveCustom(i))) nomiOnline.add(i.nome); });
+  customMenuItemsCache.forEach(i => { if (!soloSalaCache.has(`${i.cat}|${i.nome}`)) nomiOnline.add(i.nome); });
   const a = articoli.find(x => x && nomiSala.has(x.nome) && !nomiOnline.has(x.nome));
   return a ? a.nome : null;
 }
@@ -2085,7 +2043,6 @@ app.get('/api/menu-prices', (req, res) => {
   Object.keys(DEFAULT_PRICES).forEach(chiave => {
     prezzi[chiave] = getCurrentPrice(chiave);
   });
-  customMenuItemsCache.forEach(i => { const k = chiaveCustom(i); prezzi[k] = getCurrentPrice(k) ?? i.prezzo; });
   res.json(prezzi);
 });
 
@@ -2453,8 +2410,9 @@ function selezioneValida(c, voci){
   return out.length ? out : { errore: 'Scegli almeno un prodotto' };
 }
 
-function stampaStaff(testo, rif){
-  broadcastOrder({ evento: 'stampa_staff', testoStampa: testo, rif });
+// tipo = su quale stampante va (vedi CONFIG.stampa.instrada): noi | conti | cassa | sito | banco
+function stampaStaff(testo, rif, tipo){
+  broadcastOrder({ evento: 'stampa_staff', testoStampa: testo, rif, tipo: tipo || 'noi' });
 }
 
 function infoComandaDaBody(b, c){
@@ -2565,9 +2523,9 @@ app.post('/api/staff/comande/:id/conto', async (req, res) => {
   if (Array.isArray(voci)) {
     const sel = selezioneValida(c, voci);
     if (sel.errore) return res.status(400).json({ ok: false, error: sel.errore });
-    stampaStaff(testoConto(c, sel), `Conto parziale ${etichettaComanda(c)}`);
+    stampaStaff(testoConto(c, sel), `Conto parziale ${etichettaComanda(c)}`, 'conti');
   } else {
-    stampaStaff(testoConto(c), `Conto ${etichettaComanda(c)}`);
+    stampaStaff(testoConto(c), `Conto ${etichettaComanda(c)}`, 'conti');
   }
   res.json({ ok: true });
 });
@@ -2753,7 +2711,12 @@ app.get('/api/staff/stats', soloTitolare, async (req, res) => {
 
 // listino per l'app staff: categorie, voci con prezzo attuale ed esauriti
 app.get('/api/staff/menu', (req, res) => {
-  const categorie = catalogoCompleto();
+  const categorie = MENU_CATALOG.map(g => ({ cat: g.cat, keyPrefix: g.keyPrefix, items: [...g.items] }));
+  customMenuItemsCache.forEach(item => {
+    let g = categorie.find(x => x.cat === item.cat && !String(x.keyPrefix).startsWith('EXTRA_'));
+    if (!g) { g = { cat: item.cat, keyPrefix: item.cat, items: [] }; categorie.push(g); }
+    if (!g.items.includes(item.nome)) g.items.push(item.nome);
+  });
   res.json(categorie.map(g => ({
     cat: g.cat,
     gruppoExtra: String(g.keyPrefix).startsWith('EXTRA_') ? g.keyPrefix : null,
@@ -2761,7 +2724,7 @@ app.get('/api/staff/menu', (req, res) => {
     extra: String(g.keyPrefix).startsWith('EXTRA_'),
     items: g.items.map(nome => {
       const chiave = `${g.keyPrefix}|${nome}`;
-      const custom = customMenuItemsCache.find(i => chiaveCustom(i) === chiave);
+      const custom = customMenuItemsCache.find(i => i.cat === g.cat && i.nome === nome);
       return { nome, chiave, prezzo: getCurrentPrice(chiave), esaurito: soldOutCache.has(chiave), soloSala: soloSalaCache.has(chiave), desc: custom ? custom.descrizione || '' : undefined };
     })
   })));
@@ -2921,7 +2884,7 @@ app.post('/api/orders/:numeroOrdine/ristampa', async (req, res) => {
   const order = await trovaOrdine(numeroOrdine);
   if (!order) return res.status(404).json({ ok: false, error: 'Ordine non trovato' });
   if (!order.testoStampa) return res.status(400).json({ ok: false, error: 'Comanda senza testo da stampare' });
-  stampaStaff('*** RISTAMPA ***\n' + order.testoStampa, `Ristampa ordine #${numeroOrdine}`);
+  stampaStaff('*** RISTAMPA ***\n' + order.testoStampa, `Ristampa ordine #${numeroOrdine}`, order.fonte === 'banco' ? 'banco' : order.interno ? 'noi' : 'sito');
   res.json({ ok: true, numeroOrdine, pannelli: pannelliStampa() });
 });
 
@@ -2931,8 +2894,8 @@ const normNome = s => String(s || '').toLowerCase().normalize('NFD').replace(/[\
   .replace(/\bquattro\b/g, '4').replace(/\bsette\b/g, '7').replace(/\bdieci\b/g, '10').replace(/\bwurstel\b/g, 'wurstel');
 function vociMenu(){
   const out = [];
-  MENU_CATALOG.forEach(g => g.items.forEach(nome => { if (voceVisibile(`${g.keyPrefix}|${nome}`)) out.push({ chiave: `${g.keyPrefix}|${nome}`, nome, cat: g.cat, prefisso: g.keyPrefix }); }));
-  customMenuItemsCache.forEach(i => out.push({ chiave: chiaveCustom(i), nome: i.nome, cat: i.cat, prefisso: prefissoCustom(i), prezzoCustom: i.prezzo }));
+  MENU_CATALOG.forEach(g => g.items.forEach(nome => out.push({ chiave: `${g.keyPrefix}|${nome}`, nome, cat: g.cat, prefisso: g.keyPrefix })));
+  customMenuItemsCache.forEach(i => out.push({ chiave: `${i.cat}|${i.nome}`, nome: i.nome, cat: i.cat, prefisso: i.cat, prezzoCustom: i.prezzo }));
   return out;
 }
 function trovaVoce(nome, categoria, prefissoExtra){
@@ -3372,11 +3335,24 @@ app.get('/api/banco/sessione/:id', async (req, res) => {
   if (o) return res.json({ ok: true, numeroOrdine: o.numeroOrdine, stato: o.stato || 'da_preparare' });
   res.json({ ok: true, inAttesa: true }); // il pagamento sta ancora arrivando da Stripe
 });
+// tavolo già assegnato a un gruppo del QR universale (solo se quella comanda è ancora aperta)
+async function tavoloDelGruppo(gruppo){
+  if (!gruppo) return '';
+  const da = new Date(Date.now() - 8 * 3600 * 1000).toISOString();
+  const prima = (await richiesteArch.list({ gruppo, stato: 'accettata', creataAlle: { $gte: da } }, { creataAlle: -1 }, 1))[0];
+  if (!prima || !prima.tavolo) return '';
+  const aperta = (await comandeList({ stato: 'aperta' })).some(x => x.tipo === 'tavolo' && x.tavolo === prima.tavolo);
+  return aperta ? prima.tavolo : '';
+}
 app.post('/api/tavolo/richiesta', async (req, res) => {
   if (!CONFIG.sala.qrAttivo) return res.status(403).json({ ok: false, error: 'Gli ordini dal tavolo sono spenti: chiama il cameriere.' });
   const b = req.body || {};
-  const tavolo = String(b.tavolo || '').trim().slice(0, 10);
-  if (!tavolo) return res.status(400).json({ ok: false, error: 'Tavolo mancante' });
+  let tavolo = String(b.tavolo || '').trim().slice(0, 10);
+  // QR universale: nessun tavolo nel QR. Le persone dello stesso tavolo condividono un codice gruppo;
+  // il cameriere assegna il tavolo quando accetta, e i successivi ordini del gruppo vanno da soli a quel tavolo.
+  const gruppo = String(b.gruppo || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8);
+  if (!tavolo && !gruppo) return res.status(400).json({ ok: false, error: 'Tavolo mancante' });
+  if (!tavolo) tavolo = await tavoloDelGruppo(gruppo);
   const ip = req.ip || 'x';
   const t = tentativiQr.get(ip) || { n: 0, dal: Date.now() };
   if (Date.now() - t.dal > 10 * 60 * 1000) { t.n = 0; t.dal = Date.now(); }
@@ -3386,12 +3362,48 @@ app.post('/api/tavolo/richiesta', async (req, res) => {
   const righe = normalizzaRighe(grezze);
   if (!righe.length) return res.status(400).json({ ok: false, error: 'Il carrello è vuoto o i piatti non sono più disponibili' });
   t.n++; tentativiQr.set(ip, t);
-  const r = { _id: crypto.randomUUID(), tavolo, righe, nome: String(b.nome || '').slice(0, 40), nota: String(b.nota || '').slice(0, 200),
-    stato: 'attesa', totale: round2(righe.reduce((x, y) => x + y.prezzo * y.qty, 0)), creataAlle: new Date().toISOString() };
+  // bozza = l'ordine di questa persona aspetta gli altri del tavolo: al cameriere arriva UNA notifica
+  // quando qualcuno tocca "Tutti hanno scelto" (o da sola dopo qualche minuto senza nuovi ordini)
+  const bozza = !!b.bozza && !!tavolo;
+  const r = { _id: crypto.randomUUID(), tavolo, gruppo, righe, nome: String(b.nome || '').slice(0, 40), nota: String(b.nota || '').slice(0, 200),
+    stato: bozza ? 'bozza' : 'attesa', totale: round2(righe.reduce((x, y) => x + y.prezzo * y.qty, 0)), creataAlle: new Date().toISOString() };
   await richiesteArch.save(r);
-  broadcastOrder({ evento: 'richiesta_tavolo', tavolo, id: r._id });
-  res.json({ ok: true, id: r._id });
+  if (!bozza) broadcastOrder({ evento: 'richiesta_tavolo', tavolo, id: r._id });
+  res.json({ ok: true, id: r._id, bozza });
 });
+// ordine del tavolo in preparazione: cosa hanno già scelto gli altri (solo nomi e piatti)
+async function bozzeTavolo(tavolo){
+  const da = new Date(Date.now() - 3 * 3600 * 1000).toISOString();
+  return (await richiesteArch.list({ tavolo, stato: 'bozza', creataAlle: { $gte: da } }, { creataAlle: 1 }, 60));
+}
+app.get('/api/tavolo/:tavolo/bozza', async (req, res) => {
+  const lista = await bozzeTavolo(String(req.params.tavolo).slice(0, 10));
+  res.json({ ok: true, persone: lista.map(r => ({ nome: r.nome || 'Qualcuno', piatti: r.righe.reduce((t, x) => t + x.qty, 0), righe: r.righe.map(x => `${x.qty}× ${x.nome}`) })),
+    totale: round2(lista.reduce((t, r) => t + r.totale, 0)) });
+});
+// "Tutti hanno scelto": l'ordine del tavolo parte verso il cameriere, con una sola notifica
+async function inviaBozzeTavolo(tavolo){
+  const lista = await bozzeTavolo(tavolo);
+  if (!lista.length) return 0;
+  for (const r of lista) { r.stato = 'attesa'; r.inviataAlle = new Date().toISOString(); await richiesteArch.save(r); }
+  broadcastOrder({ evento: 'richiesta_tavolo', tavolo, id: lista[0]._id, persone: lista.length });
+  return lista.length;
+}
+app.post('/api/tavolo/:tavolo/invia', async (req, res) => {
+  const n = await inviaBozzeTavolo(String(req.params.tavolo).slice(0, 10));
+  res.json({ ok: true, inviate: n });
+});
+// se nessuno tocca "Tutti hanno scelto", dopo qualche minuto senza nuovi ordini al tavolo parte da solo
+const MINUTI_AUTO_INVIO_TAVOLO = 6;
+setInterval(async () => {
+  try {
+    const da = new Date(Date.now() - 3 * 3600 * 1000).toISOString();
+    const bozze = await richiesteArch.list({ stato: 'bozza', creataAlle: { $gte: da } }, null, 500);
+    const ultimo = new Map();
+    bozze.forEach(r => { if (!ultimo.has(r.tavolo) || r.creataAlle > ultimo.get(r.tavolo)) ultimo.set(r.tavolo, r.creataAlle); });
+    for (const [tav, ora] of ultimo) if (Date.now() - new Date(ora).getTime() > MINUTI_AUTO_INVIO_TAVOLO * 60 * 1000) await inviaBozzeTavolo(tav);
+  } catch (e) { console.error('Invio automatico ordini tavolo:', e.message); }
+}, 60 * 1000);
 app.get('/api/tavolo/richiesta/:id', async (req, res) => {
   const r = await richiesteArch.get(req.params.id);
   if (!r) return res.status(404).json({ ok: false, error: 'Non trovata' });
@@ -3413,6 +3425,15 @@ app.post('/api/tavolo/richieste/:id/:azione', async (req, res) => {
     return res.json({ ok: true });
   }
   if (req.params.azione !== 'accetta') return res.status(400).json({ ok: false, error: 'Azione sconosciuta' });
+  // QR universale: il cameriere sceglie il tavolo adesso
+  if (!r.tavolo) {
+    const scelto = String((req.body || {}).tavolo || '').trim().slice(0, 10);
+    if (!scelto) return res.status(400).json({ ok: false, error: 'Scegli il numero del tavolo' });
+    r.tavolo = scelto;
+  }
+  // insieme a questa, accetto anche gli altri ordini in attesa dello stesso gruppo (stesso tavolo)
+  // (stesso gruppo, oppure stesso numero di tavolo scritto da ognuno dal proprio telefono)
+  const altri = (await richiesteArch.list({ stato: 'attesa' })).filter(x => x._id !== r._id && ((r.gruppo && x.gruppo === r.gruppo) || (x.tavolo && x.tavolo === r.tavolo)));
   // aggiungo i piatti alla comanda aperta di quel tavolo (o ne apro una nuova): NON vanno in cucina da soli
   let c = (await comandeList({ stato: 'aperta' })).find(x => x.tipo === 'tavolo' && x.tavolo === r.tavolo);
   if (!c) {
@@ -3421,12 +3442,16 @@ app.post('/api/tavolo/richieste/:id/:azione', async (req, res) => {
     c = { _id: crypto.randomUUID(), numero, giorno, tipo: 'tavolo', tavolo: r.tavolo, nome: '', telefono: '', indirizzo: '', orario: '', noteComanda: '', spese: 0,
       cameriere: String((req.body || {}).cameriere || '').slice(0, 30), righe: [], inviate: [], invii: 0, stato: 'aperta', creataAlle: new Date().toISOString() };
   }
-  r.righe.forEach(x => c.righe.push({ ...x, rid: crypto.randomUUID() }));
-  if (r.nota) c.noteComanda = [c.noteComanda, r.nota].filter(Boolean).join(' · ');
+  for (const q of [r, ...altri]) {
+    q.righe.forEach(x => c.righe.push({ ...x, rid: crypto.randomUUID() }));
+    if (q.nota) c.noteComanda = [c.noteComanda, q.nota].filter(Boolean).join(' · ');
+  }
   await comandaSave(c);
-  r.stato = 'accettata'; r.gestitaAlle = new Date().toISOString(); r.comanda = c._id;
-  await richiesteArch.save(r);
-  broadcastOrder({ evento: 'richiesta_tavolo', tavolo: r.tavolo, id: r._id });
+  for (const q of [r, ...altri]) {
+    q.tavolo = r.tavolo; q.stato = 'accettata'; q.gestitaAlle = new Date().toISOString(); q.comanda = c._id;
+    await richiesteArch.save(q);
+    broadcastOrder({ evento: 'richiesta_tavolo', tavolo: r.tavolo, id: q._id });
+  }
   res.json({ ok: true, comanda: conTotali(c) });
 });
 
@@ -3771,7 +3796,7 @@ app.post('/api/titolare/chiusura', soloTitolare, async (req, res) => {
       fondoProssimo: b.fondoProssimo !== undefined && b.fondoProssimo !== '' ? num(b.fondoProssimo) : fondoCassa,
       note: String(b.note || '').slice(0, 300), riepilogo: r, chiusaAlle: new Date().toISOString(), comandeChiuseAuto: auto.chiuse };
     await chiusureArch.save(ch);
-    if (b.stampa !== false) stampaStaff(testoChiusura(r, ch), `Chiusura cassa ${giorno}`);
+    if (b.stampa !== false) stampaStaff(testoChiusura(r, ch), `Chiusura cassa ${giorno}`, 'cassa');
     res.json({ ok: true, chiusura: ch });
   } catch (err) { console.error('Errore chiusura cassa:', err); res.status(500).json({ ok: false, error: 'Errore server' }); }
 });
@@ -3784,7 +3809,7 @@ app.get('/api/titolare/chiusure', soloTitolare, async (req, res) => {
 app.get('/api/costi', soloTitolare, (req, res) => {
   const piatti = [];
   MENU_CATALOG.forEach(g => { if (!String(g.keyPrefix).startsWith('EXTRA_') && g.cat !== 'Extra') g.items.forEach(n => piatti.push({ cat: g.cat, nome: n, prezzo: getCurrentPrice(`${g.keyPrefix}|${n}`) })); });
-  customMenuItemsCache.filter(i => !i.gruppo).forEach(i => piatti.push({ cat: i.cat, nome: i.nome, prezzo: getCurrentPrice(chiaveCustom(i)) }));
+  customMenuItemsCache.forEach(i => piatti.push({ cat: i.cat, nome: i.nome, prezzo: getCurrentPrice(`${i.cat}|${i.nome}`) }));
   res.json({ ok: true, costi: COSTO_INGREDIENTI, piatti });
 });
 app.post('/api/costi', soloTitolare, async (req, res) => {
