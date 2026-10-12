@@ -108,8 +108,32 @@ let productPhotosCache = {}; // chiave -> { data: "data:image/jpeg;base64,...", 
 let productPhotosCollection = null;
 
 // Piatti nuovi aggiunti dal titolare dal pannello di stampa (in più rispetto al menu di base).
-let customMenuItemsCache = []; // [{ cat, nome, descrizione, prezzo }]
+let customMenuItemsCache = []; // [{ cat, nome, descrizione, prezzo, gruppo? }] — gruppo = EXTRA_PIZZA/EXTRA_PANINO per gli extra
 let customMenuItemsCollection = null;
+// prefisso della chiave di una voce aggiunta: gli extra usano il gruppo (EXTRA_PIZZA|nome), i piatti la categoria (Pizza|nome)
+const prefissoCustom = (i) => i.gruppo || i.cat;
+const chiaveCustom = (i) => `${prefissoCustom(i)}|${i.nome}`;
+
+// Voci del menu di base cancellate dal titolare (spariscono da sito, staff e pannello; si possono ripristinare)
+let hiddenMenuCache = new Set();
+let hiddenMenuCollection = null;
+const voceVisibile = (chiave) => !hiddenMenuCache.has(chiave);
+
+// catalogo completo: menu di base + voci aggiunte (anche extra), senza le voci cancellate
+function catalogoCompleto(){
+  const categorie = MENU_CATALOG.map(g => ({ ...g, items: g.items.filter(n => voceVisibile(`${g.keyPrefix}|${n}`)) }));
+  customMenuItemsCache.forEach(item => {
+    let gruppo = item.gruppo
+      ? categorie.find(g => g.keyPrefix === item.gruppo)
+      : categorie.find(g => g.cat === item.cat && !String(g.keyPrefix || '').startsWith('EXTRA_'));
+    if (!gruppo) {
+      gruppo = { cat: item.cat, items: [], keyPrefix: item.gruppo || item.cat };
+      categorie.push(gruppo);
+    }
+    if (!gruppo.items.includes(item.nome)) gruppo.items.push(item.nome);
+  });
+  return categorie;
+}
 
 
 async function connectDB(){
@@ -165,6 +189,8 @@ async function connectDB(){
     await comandeCollection.createIndex({ stato: 1, aggiornataAlle: -1 });
     customMenuItemsCollection = db.collection('customMenuItems');
     customMenuItemsCache = await customMenuItemsCollection.find({}).toArray();
+    hiddenMenuCollection = db.collection('hiddenMenuItems');
+    hiddenMenuCache = new Set((await hiddenMenuCollection.find({}).toArray()).map(d => d._id));
     console.log('Connesso a MongoDB Atlas.');
     riprendiStorico();
   }catch(err){
@@ -1639,17 +1665,8 @@ app.post('/api/orders/:numeroOrdine/pagamento', async (req, res) => {
 const BREAD_TYPES = ["Panino Classico", "Pan Pizza", "Tortilla"];
 
 app.get('/api/menu-catalog', (req, res) => {
-  // uniamo il catalogo di base con i piatti nuovi aggiunti dal titolare, categoria per categoria
-  const categorie = MENU_CATALOG.map(g => ({ ...g, items: [...g.items] }));
-  customMenuItemsCache.forEach(item => {
-    let gruppo = categorie.find(g => g.cat === item.cat && !g.keyPrefix?.startsWith('EXTRA_'));
-    if (!gruppo) {
-      gruppo = { cat: item.cat, items: [], keyPrefix: item.cat };
-      categorie.push(gruppo);
-    }
-    if (!gruppo.items.includes(item.nome)) gruppo.items.push(item.nome);
-  });
-  res.json({ categorie, tipiPane: BREAD_TYPES });
+  // catalogo di base + voci aggiunte dal titolare (piatti ed extra), senza quelle cancellate
+  res.json({ categorie: catalogoCompleto(), tipiPane: BREAD_TYPES, cancellati: [...hiddenMenuCache] });
 });
 
 // ---------- Endpoint: piatti nuovi aggiunti dal titolare dal pannello di stampa ----------
@@ -1658,16 +1675,22 @@ app.get('/api/custom-menu-items', (req, res) => {
 });
 
 app.post('/api/custom-menu-items/add', async (req, res) => {
-  const { cat, nome, descrizione, prezzo, soloSala } = req.body || {};
+  const { cat, nome: nomeGrezzo, descrizione, prezzo, soloSala, gruppo: gruppoGrezzo } = req.body || {};
+  const nome = typeof nomeGrezzo === 'string' ? nomeGrezzo.trim().replace(/\s+/g, ' ').replace(/\|/g, '/').slice(0, 80) : '';
   const nuovoPrezzo = Number(prezzo);
-  if (!cat || !nome || typeof cat !== 'string' || typeof nome !== 'string' || !Number.isFinite(nuovoPrezzo) || nuovoPrezzo < 0) {
+  if (!cat || !nome || typeof cat !== 'string' || !Number.isFinite(nuovoPrezzo) || nuovoPrezzo < 0) {
     return res.status(400).json({ ok: false, error: 'Dati non validi' });
   }
-  const chiave = `${cat}|${nome}`;
+  // gli extra (ingredienti aggiunti) appartengono a un gruppo: EXTRA_PIZZA o EXTRA_PANINO
+  const gruppo = typeof gruppoGrezzo === 'string' && /^EXTRA_[A-Z]+$/.test(gruppoGrezzo) && MENU_CATALOG.some(g => g.keyPrefix === gruppoGrezzo) ? gruppoGrezzo : null;
+  const chiave = `${gruppo || cat}|${nome}`;
   const item = { _id: chiave, cat, nome, descrizione: descrizione || '', prezzo: nuovoPrezzo, createdAt: new Date().toISOString() };
-  if (soloSala) { soloSalaCache.add(chiave); salvaSoloSala(); }
+  if (gruppo) item.gruppo = gruppo;
+  if (soloSala && !gruppo) { soloSalaCache.add(chiave); salvaSoloSala(); }
+  // se era una voce di base cancellata, riaggiungerla la fa tornare
+  if (hiddenMenuCache.delete(chiave) && hiddenMenuCollection) hiddenMenuCollection.deleteOne({ _id: chiave }).catch(() => {});
 
-  customMenuItemsCache = customMenuItemsCache.filter(i => i.cat !== cat || i.nome !== nome);
+  customMenuItemsCache = customMenuItemsCache.filter(i => chiaveCustom(i) !== chiave);
   customMenuItemsCache.push(item);
   priceOverridesCache[chiave] = nuovoPrezzo; // così è subito modificabile anche da "Modifica prezzi"
 
@@ -1686,17 +1709,43 @@ app.post('/api/custom-menu-items/add', async (req, res) => {
 });
 
 app.post('/api/custom-menu-items/delete', async (req, res) => {
-  const { cat, nome } = req.body || {};
+  const { cat, nome, gruppo } = req.body || {};
   if (!cat || !nome) return res.status(400).json({ ok: false, error: 'Dati mancanti' });
-  const chiave = `${cat}|${nome}`;
+  const chiave = `${gruppo || cat}|${nome}`;
   if (soloSalaCache.delete(chiave)) salvaSoloSala();
-  customMenuItemsCache = customMenuItemsCache.filter(i => i.cat !== cat || i.nome !== nome);
+  customMenuItemsCache = customMenuItemsCache.filter(i => chiaveCustom(i) !== chiave);
   if (customMenuItemsCollection) {
     customMenuItemsCollection.deleteOne({ _id: chiave }).catch(err => {
       console.error('Errore rimozione piatto:', err);
     });
   }
   res.json({ ok: true });
+});
+
+// ---------- Cancellare e ripristinare qualsiasi voce del menu (piatti ed extra) ----------
+// Le voci aggiunte dal titolare si cancellano davvero; quelle del menu di base vengono nascoste (ripristinabili).
+app.get('/api/menu-hidden', (req, res) => res.json([...hiddenMenuCache]));
+app.post('/api/menu-items/delete', async (req, res) => {
+  const chiave = String((req.body || {}).chiave || '');
+  if (!chiave.includes('|') || chiave.startsWith('PANE|')) return res.status(400).json({ ok: false, error: 'Voce non valida' });
+  const custom = customMenuItemsCache.find(i => chiaveCustom(i) === chiave);
+  if (custom) {
+    customMenuItemsCache = customMenuItemsCache.filter(i => i !== custom);
+    if (customMenuItemsCollection) await customMenuItemsCollection.deleteOne({ _id: custom._id || chiave }).catch(err => console.error('Errore rimozione voce:', err));
+    if (soloSalaCache.delete(chiave)) salvaSoloSala();
+    return res.json({ ok: true, cancellata: chiave, definitiva: true });
+  }
+  const [pref, ...resto] = chiave.split('|'); const nome = resto.join('|');
+  if (!MENU_CATALOG.some(g => g.keyPrefix === pref && g.items.includes(nome))) return res.status(404).json({ ok: false, error: 'Voce non trovata nel menu' });
+  hiddenMenuCache.add(chiave);
+  if (hiddenMenuCollection) await hiddenMenuCollection.updateOne({ _id: chiave }, { $set: { _id: chiave, quando: new Date().toISOString() } }, { upsert: true }).catch(err => console.error('Errore salvataggio voce cancellata:', err));
+  res.json({ ok: true, cancellata: chiave, definitiva: false });
+});
+app.post('/api/menu-items/restore', async (req, res) => {
+  const chiave = String((req.body || {}).chiave || '');
+  if (!hiddenMenuCache.delete(chiave)) return res.status(404).json({ ok: false, error: 'Voce non tra quelle cancellate' });
+  if (hiddenMenuCollection) await hiddenMenuCollection.deleteOne({ _id: chiave }).catch(() => {});
+  res.json({ ok: true, ripristinata: chiave });
 });
 
 // ---------- Esauriti a tempo ----------
@@ -1730,7 +1779,7 @@ setInterval(scadenzaEsauriti, 60 * 1000);
 // ---------- Endpoint: elenco prodotti attualmente esauriti ----------
 app.get('/api/sold-out', (req, res) => {
   scadenzaEsauriti();
-  res.json([...soldOutCache]);
+  res.json([...soldOutCache, ...hiddenMenuCache]);   // le voci cancellate risultano non ordinabili anche per le versioni vecchie del sito
 });
 // stesso elenco con la scadenza di ognuno (per il pannello)
 app.get('/api/sold-out/dettagli', (req, res) => {
@@ -1770,7 +1819,7 @@ function articoloSoloSala(articoli){
   const nomiSala = new Set([...soloSalaCache].map(k => k.split('|').slice(1).join('|')));
   const nomiOnline = new Set();
   MENU_CATALOG.forEach(g => g.items.forEach(n => { if (!soloSalaCache.has(`${g.keyPrefix}|${n}`)) nomiOnline.add(n); }));
-  customMenuItemsCache.forEach(i => { if (!soloSalaCache.has(`${i.cat}|${i.nome}`)) nomiOnline.add(i.nome); });
+  customMenuItemsCache.forEach(i => { if (!soloSalaCache.has(chiaveCustom(i))) nomiOnline.add(i.nome); });
   const a = articoli.find(x => x && nomiSala.has(x.nome) && !nomiOnline.has(x.nome));
   return a ? a.nome : null;
 }
@@ -2036,6 +2085,7 @@ app.get('/api/menu-prices', (req, res) => {
   Object.keys(DEFAULT_PRICES).forEach(chiave => {
     prezzi[chiave] = getCurrentPrice(chiave);
   });
+  customMenuItemsCache.forEach(i => { const k = chiaveCustom(i); prezzi[k] = getCurrentPrice(k) ?? i.prezzo; });
   res.json(prezzi);
 });
 
@@ -2703,12 +2753,7 @@ app.get('/api/staff/stats', soloTitolare, async (req, res) => {
 
 // listino per l'app staff: categorie, voci con prezzo attuale ed esauriti
 app.get('/api/staff/menu', (req, res) => {
-  const categorie = MENU_CATALOG.map(g => ({ cat: g.cat, keyPrefix: g.keyPrefix, items: [...g.items] }));
-  customMenuItemsCache.forEach(item => {
-    let g = categorie.find(x => x.cat === item.cat && !String(x.keyPrefix).startsWith('EXTRA_'));
-    if (!g) { g = { cat: item.cat, keyPrefix: item.cat, items: [] }; categorie.push(g); }
-    if (!g.items.includes(item.nome)) g.items.push(item.nome);
-  });
+  const categorie = catalogoCompleto();
   res.json(categorie.map(g => ({
     cat: g.cat,
     gruppoExtra: String(g.keyPrefix).startsWith('EXTRA_') ? g.keyPrefix : null,
@@ -2716,7 +2761,7 @@ app.get('/api/staff/menu', (req, res) => {
     extra: String(g.keyPrefix).startsWith('EXTRA_'),
     items: g.items.map(nome => {
       const chiave = `${g.keyPrefix}|${nome}`;
-      const custom = customMenuItemsCache.find(i => i.cat === g.cat && i.nome === nome);
+      const custom = customMenuItemsCache.find(i => chiaveCustom(i) === chiave);
       return { nome, chiave, prezzo: getCurrentPrice(chiave), esaurito: soldOutCache.has(chiave), soloSala: soloSalaCache.has(chiave), desc: custom ? custom.descrizione || '' : undefined };
     })
   })));
@@ -2886,8 +2931,8 @@ const normNome = s => String(s || '').toLowerCase().normalize('NFD').replace(/[\
   .replace(/\bquattro\b/g, '4').replace(/\bsette\b/g, '7').replace(/\bdieci\b/g, '10').replace(/\bwurstel\b/g, 'wurstel');
 function vociMenu(){
   const out = [];
-  MENU_CATALOG.forEach(g => g.items.forEach(nome => out.push({ chiave: `${g.keyPrefix}|${nome}`, nome, cat: g.cat, prefisso: g.keyPrefix })));
-  customMenuItemsCache.forEach(i => out.push({ chiave: `${i.cat}|${i.nome}`, nome: i.nome, cat: i.cat, prefisso: i.cat, prezzoCustom: i.prezzo }));
+  MENU_CATALOG.forEach(g => g.items.forEach(nome => { if (voceVisibile(`${g.keyPrefix}|${nome}`)) out.push({ chiave: `${g.keyPrefix}|${nome}`, nome, cat: g.cat, prefisso: g.keyPrefix }); }));
+  customMenuItemsCache.forEach(i => out.push({ chiave: chiaveCustom(i), nome: i.nome, cat: i.cat, prefisso: prefissoCustom(i), prezzoCustom: i.prezzo }));
   return out;
 }
 function trovaVoce(nome, categoria, prefissoExtra){
@@ -3739,7 +3784,7 @@ app.get('/api/titolare/chiusure', soloTitolare, async (req, res) => {
 app.get('/api/costi', soloTitolare, (req, res) => {
   const piatti = [];
   MENU_CATALOG.forEach(g => { if (!String(g.keyPrefix).startsWith('EXTRA_') && g.cat !== 'Extra') g.items.forEach(n => piatti.push({ cat: g.cat, nome: n, prezzo: getCurrentPrice(`${g.keyPrefix}|${n}`) })); });
-  customMenuItemsCache.forEach(i => piatti.push({ cat: i.cat, nome: i.nome, prezzo: getCurrentPrice(`${i.cat}|${i.nome}`) }));
+  customMenuItemsCache.filter(i => !i.gruppo).forEach(i => piatti.push({ cat: i.cat, nome: i.nome, prezzo: getCurrentPrice(chiaveCustom(i)) }));
   res.json({ ok: true, costi: COSTO_INGREDIENTI, piatti });
 });
 app.post('/api/costi', soloTitolare, async (req, res) => {
