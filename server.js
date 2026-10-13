@@ -3911,7 +3911,7 @@ app.post('/api/scorte', async (req, res) => {
   const vecchia = b._id ? await scorteArch.get(String(b._id)) : null;
   const sc = pulisciScorta(b, vecchia || { _id: crypto.randomUUID(), nome: '', unita: 'pz', quantita: 0, soglia: 0, collegati: [] });
   if (!sc.nome) return res.status(400).json({ ok: false, error: 'Scrivi il nome' });
-  sc.aggiornata = new Date().toISOString();
+  sc.aggiornata = new Date().toISOString(); delete sc.daContare;
   await scorteArch.save(sc);
   const eraFinita = vecchia && vecchia.quantita <= 0, finita = sc.quantita <= 0;
   if (finita !== eraFinita || (vecchia && JSON.stringify(vecchia.collegati) !== JSON.stringify(sc.collegati))) await segnaEsauritiDaScorta(sc.collegati, finita);
@@ -3923,7 +3923,7 @@ app.post('/api/scorte/:id/movimento', async (req, res) => {
   if (!sc) return res.status(404).json({ ok: false, error: 'Non trovata' });
   const prima = sc.quantita;
   sc.quantita = round2(Math.max(0, prima + (Number((req.body || {}).delta) || 0)));
-  sc.aggiornata = new Date().toISOString();
+  sc.aggiornata = new Date().toISOString(); delete sc.daContare;
   await scorteArch.save(sc);
   if ((prima <= 0) !== (sc.quantita <= 0)) await segnaEsauritiDaScorta(sc.collegati, sc.quantita <= 0);
   broadcastOrder({ evento: 'scorte_aggiornate' });
@@ -3951,18 +3951,46 @@ app.get('/api/scorte/fornitori', async (req, res) => {
 app.post('/api/scorte/importa', async (req, res) => {
   const voci = Array.isArray((req.body || {}).voci) ? req.body.voci.slice(0, 200) : [];
   const esistenti = await scorteArch.list({}, null, 1000);
-  const gia = new Set(esistenti.filter(x => x.prodottoId).map(x => x.prodottoId));
+  const gia = new Set(esistenti.flatMap(x => [x.prodottoId, ...(x.prodottoIds || [])]).filter(Boolean));
+  const chiaveNome = (f, n) => String(f) + '|' + String(n).toLowerCase().replace(/\s+/g, ' ').trim();
+  const giaNomi = new Set(esistenti.filter(x => x.fornitoreId).map(x => chiaveNome(x.fornitoreId, x.nome)));
   let creati = 0;
   for (const v of voci) {
     const prodottoId = String(v.prodottoId || '').slice(0, 40), fornitoreId = String(v.fornitoreId || '').slice(0, 40);
     if (!prodottoId || !fornitoreId || gia.has(prodottoId)) continue;
     const nome = String(v.nome || '').slice(0, 60).trim(); if (!nome) continue;
-    const sc = { _id: crypto.randomUUID(), nome, unita: String(v.unita || 'pezzo').slice(0, 15), quantita: 0, soglia: Math.max(0, Number(v.soglia) || 1), collegati: [],
+    if (giaNomi.has(chiaveNome(fornitoreId, nome))) { gia.add(prodottoId); continue; }
+    giaNomi.add(chiaveNome(fornitoreId, nome));
+    const sc = { _id: crypto.randomUUID(), nome, unita: String(v.unita || 'pezzo').slice(0, 15), quantita: 0, soglia: Math.max(0, Number(v.soglia) || 0), daContare: true, collegati: [],
       fornitoreId, fornitoreNome: String(v.fornitoreNome || '').slice(0, 60), prodottoId, aggiornata: new Date().toISOString() };
     await scorteArch.save(sc); gia.add(prodottoId); creati++;
   }
   broadcastOrder({ evento: 'scorte_aggiornate' });
   res.json({ ok: true, creati });
+});
+// sistema le scorte importate: unisce i doppioni (stesso fornitore e nome) e segna "da contare" quelle mai caricate
+app.post('/api/scorte/sistema', async (req, res) => {
+  const tutte = await scorteArch.list({}, null, 2000);
+  const kn = x => String(x.fornitoreId) + '|' + String(x.nome).toLowerCase().replace(/\s+/g, ' ').trim();
+  const visti = new Map(); let uniti = 0, daContare = 0;
+  for (const x of tutte) {
+    if (!x.fornitoreId || !x.prodottoId) continue;
+    const k = kn(x), base = visti.get(k);
+    if (!base) { visti.set(k, x); continue; }
+    base.prodottoIds = [...new Set([...(base.prodottoIds || []), x.prodottoId, ...(x.prodottoIds || [])])];
+    base.quantita = round2((base.quantita || 0) + (x.quantita || 0));
+    base.collegati = [...new Set([...(base.collegati || []), ...(x.collegati || [])])];
+    if (x.ultimoCarico && !base.ultimoCarico) base.ultimoCarico = x.ultimoCarico;
+    if (!x.daContare) base.daContare = false;
+    await scorteArch.del(x._id); uniti++;
+  }
+  for (const x of visti.values()) {
+    if (x.daContare === undefined && !x.ultimoCarico && !(x.quantita > 0) && (x.soglia || 0) <= 1 && !(x.collegati || []).length) { x.daContare = true; x.soglia = 0; }
+    if (x.daContare) daContare++;
+    await scorteArch.save(x);
+  }
+  broadcastOrder({ evento: 'scorte_aggiornate' });
+  res.json({ ok: true, uniti, daContare });
 });
 // carico automatico: arriva dall'app fornitori quando una fattura scansionata nel ricevimento merce HACCP viene letta
 const caricoScorteArch = archivio('caricoScorte');
@@ -3976,10 +4004,10 @@ app.post('/api/scorte/carico', async (req, res) => {
     const chiave = String(c.chiave || '').slice(0, 200), q = round2(Number(c.quantita));
     if (!chiave || !Number.isFinite(q) || q <= 0 || q > 100000) continue;
     if (await caricoScorteArch.get(chiave)) { giaVisti++; continue; }
-    const sc = scorte.find(x => x.prodottoId && x.prodottoId === String(c.prodottoId));
+    const sc = scorte.find(x => x.prodottoId && (x.prodottoId === String(c.prodottoId) || (x.prodottoIds || []).includes(String(c.prodottoId))));
     await caricoScorteArch.save({ _id: chiave, quando: new Date().toISOString(), prodottoId: String(c.prodottoId || ''), quantita: q, applicato: !!sc });
     if (!sc) { senzaScorta++; continue; }
-    const prima = sc.quantita; sc.quantita = round2(prima + q); sc.aggiornata = new Date().toISOString(); sc.ultimoCarico = { quando: sc.aggiornata, quantita: q };
+    const prima = sc.quantita; sc.quantita = round2(prima + q); sc.aggiornata = new Date().toISOString(); sc.ultimoCarico = { quando: sc.aggiornata, quantita: q }; delete sc.daContare;
     await scorteArch.save(sc);
     if (prima <= 0 && sc.quantita > 0) await segnaEsauritiDaScorta(sc.collegati, false);
     caricati++;
