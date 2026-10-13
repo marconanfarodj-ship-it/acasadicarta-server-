@@ -3017,7 +3017,8 @@ app.get('/api/staff/menu', (req, res) => {
     if (!g.items.includes(item.nome)) g.items.push(item.nome);
   });
   // i piatti "solo online" non si vedono in sala (app staff, QR tavolo e QR banco)
-  categorie.forEach(g => { if (!String(g.keyPrefix).startsWith('EXTRA_')) g.items = g.items.filter(nome => !soloOnlineCache.has(`${g.keyPrefix}|${nome}`)); });
+  // (con ?tutti=1 il personale e il titolare vedono comunque tutto, anche i piatti solo online)
+  if (req.query.tutti !== '1') categorie.forEach(g => { if (!String(g.keyPrefix).startsWith('EXTRA_')) g.items = g.items.filter(nome => !soloOnlineCache.has(`${g.keyPrefix}|${nome}`)); });
   res.json(categorie.filter(g => g.items.length || String(g.keyPrefix).startsWith('EXTRA_')).map(g => ({
     cat: g.cat,
     gruppoExtra: String(g.keyPrefix).startsWith('EXTRA_') ? g.keyPrefix : null,
@@ -3026,7 +3027,7 @@ app.get('/api/staff/menu', (req, res) => {
     items: g.items.map(nome => {
       const chiave = `${g.keyPrefix}|${nome}`;
       const custom = customMenuItemsCache.find(i => i.cat === g.cat && i.nome === nome);
-      return { nome, chiave, prezzo: getCurrentPrice(chiave), esaurito: soldOutCache.has(chiave), soloSala: soloSalaCache.has(chiave), desc: custom ? custom.descrizione || '' : undefined };
+      return { nome, chiave, prezzo: getCurrentPrice(chiave), esaurito: soldOutCache.has(chiave), soloSala: soloSalaCache.has(chiave), soloOnline: soloOnlineCache.has(chiave), desc: custom ? custom.descrizione || '' : undefined };
     })
   })));
 });
@@ -3550,9 +3551,9 @@ app.post('/api/staff/cameriere', (req, res) => {
 // ===== ORDINE DAL TAVOLO CON IL QR: il cliente ordina, lo staff accetta =====
 const richiesteArch = archivio('richiesteTavolo');
 // piatti scelti dal cliente dal telefono (QR tavolo / QR banco): solo voci del menu, i prezzi li rimette normalizzaRighe
-function righeDaCliente(lista){
+function righeDaCliente(lista, conSoloOnline){
   return (Array.isArray(lista) ? lista : []).slice(0, 40)
-    .filter(r => r && getCurrentPrice(String(r.chiave || '')) != null && !soldOutCache.has(String(r.chiave)) && !soloOnlineCache.has(String(r.chiave)) && !String(r.chiave).startsWith('EXTRA_'))
+    .filter(r => r && getCurrentPrice(String(r.chiave || '')) != null && !soldOutCache.has(String(r.chiave)) && (conSoloOnline || !soloOnlineCache.has(String(r.chiave))) && !String(r.chiave).startsWith('EXTRA_'))
     .map(r => ({ chiave: String(r.chiave), nome: String(r.nome || String(r.chiave).split('|')[1] || ''), cat: String(r.cat || String(r.chiave).split('|')[0] || ''), qty: Math.min(20, Math.max(1, parseInt(r.qty, 10) || 1)), note: String(r.note || '').slice(0, 120),
       // extra, pane e "senza" scelti dal cliente: i prezzi li rimette normalizzaRighe dal listino
       extra: (Array.isArray(r.extra) ? r.extra : []).slice(0, 15).map(e => ({ chiave: String((e && e.chiave) || ''), nome: String((e && e.nome) || '') }))
@@ -3601,7 +3602,7 @@ app.post('/api/banco/ordine', async (req, res) => {
   const t = tentativiQr.get(ip) || { n: 0, dal: Date.now() };
   if (Date.now() - t.dal > 10 * 60 * 1000) { t.n = 0; t.dal = Date.now(); }
   if (t.n >= 8) return res.status(429).json({ ok: false, error: 'Troppi ordini di seguito: chiedi al banco.' });
-  const righe = normalizzaRighe(righeDaCliente(b.righe));
+  const righe = normalizzaRighe(righeDaCliente(b.righe, true)); // al banco si ordina anche quello che in sala non c'è (solo online)
   if (!righe.length) return res.status(400).json({ ok: false, error: 'Il carrello è vuoto o i piatti non sono più disponibili' });
   t.n++; tentativiQr.set(ip, t);
   const order = ordineBanco(righe, nome, online);
