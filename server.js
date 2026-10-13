@@ -623,7 +623,7 @@ const CONFIG_BASE = {
   stampa: { prezziComanda: true, totaleComanda: true, spazioTraProdotti: true, logo: true,
     intestazioneConto: 'PIZZERIA LA CASA DI CARTA\nVia XX Settembre 192 - Niscemi', piedeConto: 'Grazie e arrivederci!',
     // due stampanti: dove va ogni tipo di stampa (1 = prima, 2 = seconda, 3 = tutte e due)
-    nome1: 'Cucina', nome2: 'Stampante 2', instrada: { sito: 1, noi: 1, banco: 1, conti: 1, cassa: 1 } }
+    nome1: 'Cucina', nome2: 'Stampante 2', instrada: { sito: 1, noi: 1, banco: 1, conti: 1, cassa: 1 }, stile: {} }
 };
 let CONFIG = JSON.parse(JSON.stringify(CONFIG_BASE));
 function cfgNum(v, min, max, def, intero){
@@ -733,6 +733,18 @@ function pulisciConfig(inp, attuale){
     const ins = { sito: 1, noi: 1, banco: 1, conti: 1, cassa: 1, ...(d.instrada || {}) };
     if (x.instrada && typeof x.instrada === 'object') Object.keys(ins).forEach(k => { const v = Number(x.instrada[k]); if ([1, 2, 3].includes(v)) ins[k] = v; });
     d.instrada = ins;
+    if (x.stile && typeof x.stile === 'object') {
+      const SEZ = ['numero', 'fascia', 'orario', 'indirizzo', 'cliente', 'telefono', 'pagamento', 'piatto', 'dettagli', 'senza', 'note', 'totale'];
+      const st = {};
+      SEZ.forEach(id => {
+        const o = x.stile[id]; if (!o || typeof o !== 'object') return;
+        const r = {};
+        if (['normale', 'alto', 'largo', 'grande', 'enorme'].includes(o.dim)) r.dim = o.dim;
+        ['bold', 'ul', 'inv'].forEach(b => { if (typeof o[b] === 'boolean') r[b] = o[b]; });
+        if (Object.keys(r).length) st[id] = r;
+      });
+      d.stile = st;
+    }
   }
   return c;
 }
@@ -4014,6 +4026,14 @@ app.post('/api/scorte/carico', async (req, res) => {
   }
   if (caricati) broadcastOrder({ evento: 'scorte_aggiornate' });
   res.json({ ok: true, caricati, giaVisti, senzaScorta });
+});
+// svuota tutto il magazzino (solo titolare)
+app.post('/api/scorte/azzera', soloTitolare, async (req, res) => {
+  if ((req.body || {}).conferma !== true) return res.status(400).json({ ok: false, error: 'Serve la conferma' });
+  const tutte = await scorteArch.list({}, null, 5000);
+  for (const x of tutte) await scorteArch.del(x._id);
+  broadcastOrder({ evento: 'scorte_aggiornate' });
+  res.json({ ok: true, eliminate: tutte.length });
 });
 app.delete('/api/scorte/:id', async (req, res) => {
   await scorteArch.del(req.params.id);
