@@ -168,6 +168,8 @@ let productPhotosCache = {}; // chiave -> { data: "data:image/jpeg;base64,...", 
 let productPhotosCollection = null;
 
 // Piatti nuovi aggiunti dal titolare dal pannello di stampa (in più rispetto al menu di base).
+let menuTestiCache = {}; // nome e descrizione mostrati per i piatti di base: { 'Pizza|Margherita': { nome, desc } }
+let menuTestiCollection = null;
 let customMenuItemsCache = []; // [{ cat, nome, descrizione, prezzo }]
 let customMenuItemsCollection = null;
 
@@ -227,6 +229,9 @@ async function connectDB(){
     await comandeCollection.createIndex({ stato: 1, aggiornataAlle: -1 });
     customMenuItemsCollection = db.collection('customMenuItems');
     customMenuItemsCache = await customMenuItemsCollection.find({}).toArray();
+    menuTestiCollection = db.collection('menuTesti');
+    menuTestiCache = {};
+    (await menuTestiCollection.find({}).toArray()).forEach(d => { menuTestiCache[d._id] = { nome: d.nome || '', desc: d.desc || '' }; });
     console.log('Connesso a MongoDB Atlas.');
     riprendiStorico();
   }catch(err){
@@ -1882,7 +1887,7 @@ function infoPiatto(g, nome){
   const custom = customMenuItemsCache.find(i => i.cat === g.cat && i.nome === nome);
   const esaurito = soldOutCache.has(chiave);
   return { nome, chiave, prezzo: getCurrentPrice(chiave), esaurito, fino: esaurito ? (soldOutFino.has(chiave) ? soldOutFino.get(chiave) : null) : undefined,
-    online: !soloSalaCache.has(chiave), sala: !soloOnlineCache.has(chiave), custom: !!custom, desc: custom ? (custom.descrizione || '') : '', foto: !!productPhotosCache[chiave] };
+    online: !soloSalaCache.has(chiave), sala: !soloOnlineCache.has(chiave), custom: !!custom, mostrato: (!custom && menuTestiCache[chiave] && menuTestiCache[chiave].nome) || '', desc: custom ? (custom.descrizione || '') : ((menuTestiCache[chiave] && menuTestiCache[chiave].desc) || ''), foto: !!productPhotosCache[chiave] };
 }
 // applica i canali a un piatto; ritorna se qualcosa è cambiato
 function impostaCanali(chiave, canali){
@@ -1937,6 +1942,21 @@ async function rimuoviPiattoNuovo(chiave){
   if (productPhotosCollection) ops.push(productPhotosCollection.deleteOne({ _id: chiave }));
   await Promise.all(ops.map(p => p.catch(err => console.error('Errore rimozione piatto:', err))));
 }
+// testi mostrati sul sito per i piatti di base (la chiave interna non cambia: prezzi, foto e ordini restano collegati)
+app.get('/api/menu-testi', (req, res) => { res.json(menuTestiCache); });
+app.post('/api/menu/testi', soloTitolare, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const chiave = String(b.chiave || '');
+    const eBase = MENU_CATALOG.some(g => !String(g.keyPrefix).startsWith('EXTRA_') && g.items.some(n => `${g.keyPrefix}|${n}` === chiave));
+    if (!eBase) return res.status(400).json({ ok: false, error: 'Questo non è un piatto di base.' });
+    const nome = String(b.nome || '').trim().slice(0, 60), desc = String(b.descrizione || '').trim().slice(0, 200);
+    if (nome.includes('|')) return res.status(400).json({ ok: false, error: 'Nel nome non si può usare il simbolo |.' });
+    if (!nome && !desc) { delete menuTestiCache[chiave]; if (menuTestiCollection) await menuTestiCollection.deleteOne({ _id: chiave }); }
+    else { menuTestiCache[chiave] = { nome, desc }; if (menuTestiCollection) await menuTestiCollection.updateOne({ _id: chiave }, { $set: { nome, desc } }, { upsert: true }); }
+    res.json({ ok: true });
+  } catch (err) { console.error('Errore salvataggio testi:', err); res.status(500).json({ ok: false, error: 'Errore di salvataggio' }); }
+});
 app.post('/api/menu/piatto', soloTitolare, async (req, res) => {
   try {
     const b = req.body || {};
