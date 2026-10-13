@@ -164,6 +164,7 @@ function getCurrentPrice(chiave){
 
 // Foto dei singoli piatti caricate dal titolare dal pannello di stampa.
 // Salvate come immagine (base64) dentro MongoDB, chiave uguale a quella usata per prezzi/esauriti.
+let productPhotosVer = {}; // chiave -> data ultimo cambio (ms), serve a rinfrescare la cache delle foto
 let productPhotosCache = {}; // chiave -> { data: "data:image/jpeg;base64,...", updatedAt }
 let productPhotosCollection = null;
 
@@ -224,7 +225,7 @@ async function connectDB(){
     const photoDocs = await productPhotosCollection.find({}, { projection: { data: 0 } }).toArray();
     // all'avvio carichiamo solo l'elenco delle chiavi con foto (leggero); l'immagine vera si scarica
     // una alla volta quando serve, tramite /api/product-photos/img/:chiave
-    photoDocs.forEach(d => { productPhotosCache[d._id] = true; });
+    photoDocs.forEach(d => { productPhotosCache[d._id] = true; productPhotosVer[d._id] = Date.parse(d.updatedAt) || 1; });
     comandeCollection = db.collection('comandeStaff');
     await comandeCollection.createIndex({ stato: 1, aggiornataAlle: -1 });
     customMenuItemsCollection = db.collection('customMenuItems');
@@ -1942,6 +1943,61 @@ async function rimuoviPiattoNuovo(chiave){
   if (productPhotosCollection) ops.push(productPhotosCollection.deleteOne({ _id: chiave }));
   await Promise.all(ops.map(p => p.catch(err => console.error('Errore rimozione piatto:', err))));
 }
+// =====================================================================
+//  INCASSI SUMUP (POS) per la dashboard del Titolare — sola lettura.
+//  Richiede su Render la variabile SUMUP_API_KEY (stessa chiave usata da Jarvis). Facoltativa: SUMUP_MERCHANT_CODE.
+// =====================================================================
+let sumupMerchantCode = null;
+const sumupCache = {};
+function dataRoma(d) { return new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Rome' }).format(d || new Date()); }
+function sommaGiorni(iso, n) { const d = new Date(iso + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); }
+// mezzanotte di Roma per una data (gestisce ora legale/solare)
+function mezzanotteRoma(iso) {
+  for (const off of ['+02:00', '+01:00']) {
+    const t = new Date(iso + 'T00:00:00' + off);
+    if (dataRoma(t) === iso && new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Rome', hour: '2-digit', hour12: false }).format(t).replace('24', '00') === '00') return t;
+  }
+  return new Date(iso + 'T00:00:00+01:00');
+}
+async function sumupIncassi(periodo) {
+  const key = process.env.SUMUP_API_KEY;
+  const H = { authorization: 'Bearer ' + key };
+  if (!sumupMerchantCode) {
+    sumupMerchantCode = process.env.SUMUP_MERCHANT_CODE;
+    if (!sumupMerchantCode) {
+      const r = await fetch('https://api.sumup.com/v0.1/me', { headers: H }); const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error('SumUp: chiave non valida');
+      sumupMerchantCode = d.merchant_profile && d.merchant_profile.merchant_code;
+    }
+    if (!sumupMerchantCode) throw new Error('SumUp: codice esercente non trovato');
+  }
+  const oggi = dataRoma();
+  const da = periodo === 'settimana' ? sommaGiorni(oggi, -6) : periodo === 'mese' ? oggi.slice(0, 8) + '01' : oggi;
+  const a = sommaGiorni(oggi, 1);
+  let url = `https://api.sumup.com/v2.1/merchants/${sumupMerchantCode}/transactions/history?limit=100&order=descending&statuses[]=SUCCESSFUL&oldest_time=${encodeURIComponent(mezzanotteRoma(da).toISOString())}&newest_time=${encodeURIComponent(mezzanotteRoma(a).toISOString())}`;
+  const items = [];
+  for (let i = 0; i < 10 && url; i++) {
+    const r = await fetch(url, { headers: H }); const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error('SumUp: ' + (d.message || d.error_message || r.status));
+    items.push(...(d.items || []));
+    const next = (d.links || []).find(l => l.rel === 'next');
+    const h = next && next.href;
+    url = h ? (h.startsWith('http') ? h : `https://api.sumup.com/v2.1/merchants/${sumupMerchantCode}/transactions/history?${h.replace(/^\?/, '')}`) : null;
+  }
+  const arr = n => Math.round(n * 100) / 100;
+  let contanti = 0, carte = 0, nCont = 0, nCarte = 0;
+  items.forEach(t => { const x = Number(t.amount || 0); if (t.payment_type === 'CASH') { contanti += x; nCont++; } else { carte += x; nCarte++; } });
+  return { ok: true, configurato: true, periodo, dal: da, transazioni: items.length, totale: arr(contanti + carte), carte: arr(carte), nCarte, contanti: arr(contanti), nContanti: nCont };
+}
+app.get('/api/sumup/incassi', soloTitolare, async (req, res) => {
+  if (!process.env.SUMUP_API_KEY) return res.json({ ok: true, configurato: false });
+  const periodo = ['oggi', 'settimana', 'mese'].includes(req.query.periodo) ? req.query.periodo : 'oggi';
+  const c = sumupCache[periodo];
+  if (c && Date.now() - c.t < 60000) return res.json(c.d);
+  try { const d = await sumupIncassi(periodo); sumupCache[periodo] = { t: Date.now(), d }; res.json(d); }
+  catch (err) { console.error('Errore SumUp:', err.message); res.status(502).json({ ok: false, configurato: true, error: err.message }); }
+});
+
 // testi mostrati sul sito per i piatti di base (la chiave interna non cambia: prezzi, foto e ordini restano collegati)
 app.get('/api/menu-testi', (req, res) => { res.json(menuTestiCache); });
 app.post('/api/menu/testi', soloTitolare, async (req, res) => {
@@ -1993,7 +2049,7 @@ app.post('/api/menu/piatto', soloTitolare, async (req, res) => {
         if (soldOutCollection) soldOutCollection.updateOne({ _id: chiave }, { $set: { _id: chiave, fino: finoV === undefined ? null : finoV } }, { upsert: true }).catch(() => {});
       }
       if (fotoDoc && fotoDoc.data) {
-        productPhotosCache[chiave] = true;
+        productPhotosCache[chiave] = true; productPhotosVer[chiave] = Date.now();
         productPhotosCollection.updateOne({ _id: chiave }, { $set: { data: fotoDoc.data, updatedAt: new Date().toISOString() } }, { upsert: true }).catch(() => {});
       }
     }
@@ -2296,6 +2352,11 @@ app.post('/api/menu-prices/update', async (req, res) => {
 app.get('/api/product-photos/keys', (req, res) => {
   res.json(Object.keys(productPhotosCache));
 });
+app.get('/api/product-photos/versions', (req, res) => {
+  const out = {}; Object.keys(productPhotosCache).forEach(k => { out[k] = productPhotosVer[k] || 1; });
+  res.set('Cache-Control', 'no-cache');
+  res.json(out);
+});
 
 // Serve la singola immagine (scaricata dal database solo quando serve davvero, e tenuta
 // in cache dal browser per una settimana: non pesa sul caricamento iniziale del sito).
@@ -2311,7 +2372,7 @@ app.get('/api/product-photos/img/:chiave', async (req, res) => {
     if (!match) return res.status(500).send('Formato immagine non valido');
     const buffer = Buffer.from(match[2], 'base64');
     res.set('Content-Type', match[1]);
-    res.set('Cache-Control', 'public, max-age=604800');
+    res.set('Cache-Control', req.query.v ? 'public, max-age=31536000, immutable' : 'public, max-age=3600');
     res.send(buffer);
   } catch (err) {
     console.error('Errore lettura foto piatto:', err);
@@ -2329,7 +2390,7 @@ app.post('/api/product-photos/upload', async (req, res) => {
   if (imageDataUrl.length > 2_000_000) {
     return res.status(400).json({ ok: false, error: 'Immagine troppo pesante' });
   }
-  productPhotosCache[chiave] = true;
+  productPhotosCache[chiave] = true; productPhotosVer[chiave] = Date.now();
   if (productPhotosCollection) {
     try {
       await productPhotosCollection.updateOne(
