@@ -24,14 +24,16 @@ app.set('trust proxy', true); // Render fa da proxy: serve per leggere il vero I
 // e, per compatibilità durante il passaggio, anche il vecchio indirizzo netlify.app)
 const ALLOWED_ORIGINS = [
   'https://ordini.pizzerialacasadicarta.it',
+  'https://pizzerialacasadicarta.it',
+  'https://www.pizzerialacasadicarta.it',
   'https://cheerful-melomakarona-cc557e.netlify.app'
-];
-app.use(cors({
-  origin: function(origin, callback){
-    if(!origin || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-    callback(null, true); // per ora permissivo anche verso altre origini (es. claude.ai in fase di test)
-  },
-  credentials: true
+].concat((process.env.CORS_ORIGINS || '').split(',').map(x => x.trim()).filter(Boolean));
+// Le app staff mandano un token nell'intestazione e non usano cookie, quindi possono chiamare
+// da qualunque indirizzo. I cookie di login dei clienti, invece, vengono accettati SOLO dai nostri
+// siti: prima venivano accettati da qualsiasi sito, e una pagina estranea poteva leggere i dati di un cliente loggato.
+app.use(cors((req, callback) => {
+  const origin = req.get('Origin');
+  callback(null, { origin: true, credentials: !!origin && ALLOWED_ORIGINS.includes(origin) });
 }));
 app.use(cookieParser());
 app.use((req, res, next) => {
@@ -40,6 +42,62 @@ app.use((req, res, next) => {
   } else {
     express.json({ limit: '3mb' })(req, res, next);
   }
+});
+
+// =====================================================================
+//  ACCESSO STAFF — protegge le rotte che modificano dati o mostrano dati dei clienti
+//  (ordini, comande, clienti, prenotazioni, scorte, prezzi, blacklist...).
+//  Si attiva impostando STAFF_CODE su Render (il codice che si scrive una volta sola
+//  su ogni telefono/tablet dello staff). Senza STAFF_CODE tutto resta aperto come prima.
+//  Chi può entrare: l'app Titolare (token titolare), lo staff (token staff dopo il codice)
+//  e Jarvis (intestazione x-staff-key uguale a STAFF_KEY).
+// =====================================================================
+const STAFF_CODE = process.env.STAFF_CODE || '';
+const cryptoGuardia = require('crypto');
+function tokenStaff(){ return cryptoGuardia.createHmac('sha256', JWT_SECRET).update('staff:' + STAFF_CODE).digest('hex'); }
+const ROTTE_STAFF = [
+  ['GET',  /^\/api\/orders\/?$/],
+  ['GET',  /^\/api\/orders\/(cerca|stream|non-stampati|pronti-consegna)\/?$/],
+  ['POST', /^\/api\/orders\/(segna-stampato|interno)\/?$/],
+  ['POST', /^\/api\/orders\/[^/]+\/(pronto|pagamento|in-consegna|ristampa)\/?$/],
+  ['POST', /^\/api\/driver-location\/?$/],
+  ['POST', /^\/api\/(custom-menu-items\/(add|delete)|orders-status\/toggle|solo-sala\/toggle|stampa\/dimensione|calendario\/giorno|menu-prices\/update|product-photos\/(upload|delete)|blacklist\/(add|remove)|sold-out\/(reset-all|bulk|toggle)|fedelta\/riscatta)\/?$/],
+  ['GET',  /^\/api\/blacklist\/?$/],
+  ['*',    /^\/api\/staff\/comande(\/|$)/],
+  ['*',    /^\/api\/(prenotazioni|clienti|scorte)(\/|$)/],
+  ['GET',  /^\/api\/tavolo\/richieste\/?$/],
+  ['POST', /^\/api\/tavolo\/richieste\/[^/]+\/[^/]+\/?$/],
+  ['GET',  /^\/api\/daily-report\/test\/?$/]
+];
+function haAccessoStaff(req){
+  const q = String(req.query.t || '');
+  const tit = req.get('x-titolare-token') || q;
+  const sta = req.get('x-staff-token') || q;
+  const chiave = req.get('x-staff-key') || '';
+  if (passwordAttiva() && tit && uguali(tit, tokenTitolare())) return true;
+  if (STAFF_CODE && sta && uguali(sta, tokenStaff())) return true;
+  if (STAFF_KEY && chiave && uguali(chiave, STAFF_KEY)) return true;
+  return false;
+}
+app.use('/api', (req, res, next) => {
+  if (!STAFF_CODE || req.method === 'OPTIONS') return next();
+  const percorso = req.originalUrl.split('?')[0];
+  const metodo = req.method === 'HEAD' ? 'GET' : req.method;
+  const protetta = ROTTE_STAFF.some(([m, rx]) => (m === '*' || m === metodo) && rx.test(percorso));
+  if (!protetta || haAccessoStaff(req)) return next();
+  // 'accesso_negato' = è l'app Titolare e il suo token è scaduto; 'accesso_staff' = serve il codice dello staff
+  return res.status(401).json({ ok: false, error: req.get('x-titolare-token') ? 'accesso_negato' : 'accesso_staff' });
+});
+const tentativiStaffCode = new Map(); // ip -> { n, dal }
+app.post('/api/staff/accesso', (req, res) => {
+  if (!STAFF_CODE) return res.json({ ok: true, aperto: true, token: '' });
+  const ip = req.ip || 'x';
+  const t = tentativiStaffCode.get(ip) || { n: 0, dal: Date.now() };
+  if (Date.now() - t.dal > 10 * 60 * 1000) { t.n = 0; t.dal = Date.now(); }
+  if (t.n >= 10) return res.status(429).json({ ok: false, error: 'Troppi tentativi, riprova tra qualche minuto' });
+  if (!uguali(String((req.body || {}).codice || ''), STAFF_CODE)) { t.n++; tentativiStaffCode.set(ip, t); return res.status(401).json({ ok: false, error: 'Codice sbagliato' }); }
+  tentativiStaffCode.delete(ip);
+  res.json({ ok: true, token: tokenStaff() });
 });
 
 // dominio su cui il cookie di sessione è condiviso (sito e server sono su sottodomini diversi
@@ -52,6 +110,7 @@ const ORDER_EMAIL = process.env.ORDER_EMAIL || "Marconanfarodj@gmail.com";
 const FROM_EMAIL = process.env.FROM_EMAIL || "onboarding@resend.dev";
 const MONGODB_URI = process.env.MONGODB_URI || "";
 const JWT_SECRET = process.env.JWT_SECRET || "cambia-questa-chiave-segreta";
+if (!process.env.JWT_SECRET) console.warn('ATTENZIONE: JWT_SECRET non impostata su Render. Si sta usando la chiave di riserva, che è pubblica: imposta una chiave lunga e casuale.');
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
 const SITE_URL = process.env.SITE_URL || "https://ordini.pizzerialacasadicarta.it";
@@ -86,6 +145,7 @@ const DIMENSIONI_STAMPA = ['piccola', 'media', 'grande'];
 let dimensioneStampa = 'media';
 let settingsCollection = null;
 let soloSalaCache = new Set();  // piatti ordinabili solo in sala (nascosti nel sito clienti)
+let soloOnlineCache = new Set(); // piatti ordinabili solo online (nascosti in sala: app staff, QR tavolo e banco)
 let comandeCollection = null;   // comande dell'app staff (sala, banco, telefono)
 let comandeMemoria = {};        // riserva in memoria se il database non è disponibile
 
@@ -146,6 +206,8 @@ async function connectDB(){
     ordersPaused = !!(pausedDoc && pausedDoc.value);
     const salaDoc = await settingsCollection.findOne({ _id: 'soloSala' });
     if (salaDoc && Array.isArray(salaDoc.value)) soloSalaCache = new Set(salaDoc.value);
+    const onlineDoc = await settingsCollection.findOne({ _id: 'soloOnline' });
+    if (onlineDoc && Array.isArray(onlineDoc.value)) soloOnlineCache = new Set(onlineDoc.value);
     const costiDoc = await settingsCollection.findOne({ _id: 'costi' });
     if (costiDoc && costiDoc.value) COSTO_INGREDIENTI = costiDoc.value;
     const cfgDoc = await settingsCollection.findOne({ _id: 'config' });
@@ -1697,6 +1759,7 @@ app.post('/api/custom-menu-items/delete', async (req, res) => {
   if (!cat || !nome) return res.status(400).json({ ok: false, error: 'Dati mancanti' });
   const chiave = `${cat}|${nome}`;
   if (soloSalaCache.delete(chiave)) salvaSoloSala();
+  if (soloOnlineCache.delete(chiave)) salvaSoloOnline();
   customMenuItemsCache = customMenuItemsCache.filter(i => i.cat !== cat || i.nome !== nome);
   if (customMenuItemsCollection) {
     customMenuItemsCollection.deleteOne({ _id: chiave }).catch(err => {
@@ -1788,6 +1851,149 @@ app.post('/api/solo-sala/toggle', (req, res) => {
   if (soloSala) soloSalaCache.add(chiave); else soloSalaCache.delete(chiave);
   salvaSoloSala();
   res.json({ ok: true, soloSala: [...soloSalaCache] });
+});
+
+// ---------- Piatti "solo online": non si vedono in sala (app staff, QR tavolo e QR banco) ----------
+function salvaSoloOnline(){
+  if (settingsCollection) {
+    settingsCollection.updateOne({ _id: 'soloOnline' }, { $set: { value: [...soloOnlineCache] } }, { upsert: true })
+      .catch(err => console.error('Errore salvataggio solo online:', err));
+  }
+}
+app.get('/api/solo-online', (req, res) => res.json([...soloOnlineCache]));
+
+// =====================================================================
+//  GESTIONE DEL MENU dall'app Titolare (Impostazioni → Menu e piatti)
+//  Per ogni piatto: dove si vende (sito online / sala), prezzo, esaurito, foto, descrizione.
+//  I piatti di base si possono nascondere ovunque; quelli nuovi si possono anche modificare ed eliminare.
+// =====================================================================
+function gruppiMenu(){
+  const gruppi = MENU_CATALOG.map(g => ({ cat: g.cat, keyPrefix: g.keyPrefix, items: [...g.items] }));
+  customMenuItemsCache.forEach(item => {
+    let g = gruppi.find(x => x.cat === item.cat && !String(x.keyPrefix).startsWith('EXTRA_'));
+    if (!g) { g = { cat: item.cat, keyPrefix: item.cat, items: [] }; gruppi.push(g); }
+    if (!g.items.includes(item.nome)) g.items.push(item.nome);
+  });
+  return gruppi;
+}
+function testoMenuValido(t){ return typeof t === 'string' && t.length > 0 && t.length <= 60 && !t.includes('|'); }
+function infoPiatto(g, nome){
+  const chiave = `${g.keyPrefix}|${nome}`;
+  const custom = customMenuItemsCache.find(i => i.cat === g.cat && i.nome === nome);
+  const esaurito = soldOutCache.has(chiave);
+  return { nome, chiave, prezzo: getCurrentPrice(chiave), esaurito, fino: esaurito ? (soldOutFino.has(chiave) ? soldOutFino.get(chiave) : null) : undefined,
+    online: !soloSalaCache.has(chiave), sala: !soloOnlineCache.has(chiave), custom: !!custom, desc: custom ? (custom.descrizione || '') : '', foto: !!productPhotosCache[chiave] };
+}
+// applica i canali a un piatto; ritorna se qualcosa è cambiato
+function impostaCanali(chiave, canali){
+  let sala1 = false, onl = false;
+  if (typeof canali.online === 'boolean') {
+    if (canali.online) sala1 = soloSalaCache.delete(chiave);
+    else if (!soloSalaCache.has(chiave)) { soloSalaCache.add(chiave); sala1 = true; }
+  }
+  if (typeof canali.sala === 'boolean') {
+    if (canali.sala) onl = soloOnlineCache.delete(chiave);
+    else if (!soloOnlineCache.has(chiave)) { soloOnlineCache.add(chiave); onl = true; }
+  }
+  if (sala1) salvaSoloSala();
+  if (onl) salvaSoloOnline();
+  return sala1 || onl;
+}
+app.get('/api/menu/gestione', soloTitolare, (req, res) => {
+  scadenzaEsauriti();
+  res.json({ ok: true, oggi: giornoServizio(), categorie: gruppiMenu().map(g => ({
+    cat: g.cat, keyPrefix: g.keyPrefix, extra: String(g.keyPrefix).startsWith('EXTRA_'), items: g.items.map(n => infoPiatto(g, n))
+  })) });
+});
+app.post('/api/menu/canali', soloTitolare, (req, res) => {
+  const b = req.body || {};
+  const chiave = String(b.chiave || '');
+  const esiste = gruppiMenu().some(g => !String(g.keyPrefix).startsWith('EXTRA_') && g.items.some(n => `${g.keyPrefix}|${n}` === chiave));
+  if (!esiste) return res.status(404).json({ ok: false, error: 'Piatto non trovato' });
+  impostaCanali(chiave, b);
+  res.json({ ok: true, online: !soloSalaCache.has(chiave), sala: !soloOnlineCache.has(chiave) });
+});
+app.post('/api/menu/canali-gruppo', soloTitolare, (req, res) => {
+  const b = req.body || {};
+  const g = gruppiMenu().find(x => x.keyPrefix === b.keyPrefix && !String(x.keyPrefix).startsWith('EXTRA_'));
+  if (!g) return res.status(404).json({ ok: false, error: 'Categoria non trovata' });
+  g.items.forEach(n => impostaCanali(`${g.keyPrefix}|${n}`, b));
+  res.json({ ok: true, piatti: g.items.length });
+});
+// toglie del tutto un piatto nuovo (prezzo, esaurito, canali, foto compresi)
+async function rimuoviPiattoNuovo(chiave){
+  const i = customMenuItemsCache.findIndex(x => `${x.cat}|${x.nome}` === chiave);
+  if (i >= 0) customMenuItemsCache.splice(i, 1);
+  delete priceOverridesCache[chiave];
+  soldOutCache.delete(chiave); soldOutFino.delete(chiave);
+  delete productPhotosCache[chiave];
+  const sala1 = soloSalaCache.delete(chiave), onl = soloOnlineCache.delete(chiave);
+  if (sala1) salvaSoloSala();
+  if (onl) salvaSoloOnline();
+  const ops = [];
+  if (customMenuItemsCollection) ops.push(customMenuItemsCollection.deleteOne({ _id: chiave }));
+  if (priceOverridesCollection) ops.push(priceOverridesCollection.deleteOne({ _id: chiave }));
+  if (soldOutCollection) ops.push(soldOutCollection.deleteOne({ _id: chiave }));
+  if (productPhotosCollection) ops.push(productPhotosCollection.deleteOne({ _id: chiave }));
+  await Promise.all(ops.map(p => p.catch(err => console.error('Errore rimozione piatto:', err))));
+}
+app.post('/api/menu/piatto', soloTitolare, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const cat = String(b.cat || '').trim(), nome = String(b.nome || '').trim();
+    const descrizione = String(b.descrizione || '').trim().slice(0, 200);
+    const prezzo = Number(String(b.prezzo ?? '').replace(',', '.'));
+    if (!testoMenuValido(cat) || !testoMenuValido(nome) || cat.startsWith('EXTRA_')) {
+      return res.status(400).json({ ok: false, error: 'Scrivi il nome e la categoria (massimo 60 lettere, senza il simbolo |).' });
+    }
+    if (!Number.isFinite(prezzo) || prezzo < 0 || prezzo > 500) {
+      return res.status(400).json({ ok: false, error: 'Il prezzo deve essere tra 0 e 500 euro.' });
+    }
+    const chiave = `${cat}|${nome}`;
+    const vecchiaChiave = (b.vecchiaCat && b.vecchioNome) ? `${b.vecchiaCat}|${b.vecchioNome}` : '';
+    const eBase = MENU_CATALOG.some(g => g.keyPrefix === cat && g.items.includes(nome));
+    if (eBase) return res.status(409).json({ ok: false, error: 'Esiste già un piatto di base con questo nome in questa categoria.' });
+    const esistente = customMenuItemsCache.find(i => i.cat === cat && i.nome === nome);
+    if (esistente && vecchiaChiave !== chiave) return res.status(409).json({ ok: false, error: 'Esiste già un piatto con questo nome in questa categoria.' });
+    // se cambio nome o categoria di un piatto nuovo, porto con me prezzo, esaurito, canali e foto
+    let creato = esistente ? esistente.createdAt : new Date().toISOString();
+    if (vecchiaChiave && vecchiaChiave !== chiave) {
+      const vecchio = customMenuItemsCache.find(i => `${i.cat}|${i.nome}` === vecchiaChiave);
+      if (!vecchio) return res.status(404).json({ ok: false, error: 'Piatto da modificare non trovato (si rinominano solo i piatti nuovi).' });
+      creato = vecchio.createdAt || creato;
+      const eraEsaurito = soldOutCache.has(vecchiaChiave), finoV = soldOutFino.get(vecchiaChiave);
+      const online = !soloSalaCache.has(vecchiaChiave), sala = !soloOnlineCache.has(vecchiaChiave);
+      let fotoDoc = null;
+      if (productPhotosCollection && productPhotosCache[vecchiaChiave]) { try { fotoDoc = await productPhotosCollection.findOne({ _id: vecchiaChiave }); } catch (e) {} }
+      await rimuoviPiattoNuovo(vecchiaChiave);
+      if (b.online === undefined) b.online = online;
+      if (b.sala === undefined) b.sala = sala;
+      if (eraEsaurito) {
+        soldOutCache.add(chiave); soldOutFino.set(chiave, finoV === undefined ? null : finoV);
+        if (soldOutCollection) soldOutCollection.updateOne({ _id: chiave }, { $set: { _id: chiave, fino: finoV === undefined ? null : finoV } }, { upsert: true }).catch(() => {});
+      }
+      if (fotoDoc && fotoDoc.data) {
+        productPhotosCache[chiave] = true;
+        productPhotosCollection.updateOne({ _id: chiave }, { $set: { data: fotoDoc.data, updatedAt: new Date().toISOString() } }, { upsert: true }).catch(() => {});
+      }
+    }
+    const item = { _id: chiave, cat, nome, descrizione, prezzo, createdAt: creato };
+    customMenuItemsCache = customMenuItemsCache.filter(i => i.cat !== cat || i.nome !== nome);
+    customMenuItemsCache.push(item);
+    priceOverridesCache[chiave] = prezzo;
+    if (customMenuItemsCollection) await customMenuItemsCollection.updateOne({ _id: chiave }, { $set: item }, { upsert: true });
+    if (priceOverridesCollection) await priceOverridesCollection.updateOne({ _id: chiave }, { $set: { prezzo } }, { upsert: true });
+    impostaCanali(chiave, { online: typeof b.online === 'boolean' ? b.online : true, sala: typeof b.sala === 'boolean' ? b.sala : true });
+    res.json({ ok: true, item: infoPiatto({ cat, keyPrefix: cat }, nome) });
+  } catch (err) { console.error('Errore salvataggio piatto:', err); res.status(500).json({ ok: false, error: 'Errore di salvataggio' }); }
+});
+app.post('/api/menu/elimina', soloTitolare, async (req, res) => {
+  const chiave = String((req.body || {}).chiave || '');
+  if (!customMenuItemsCache.some(i => `${i.cat}|${i.nome}` === chiave)) {
+    return res.status(400).json({ ok: false, error: 'piatto_base', messaggio: 'I piatti di base non si cancellano: si nascondono (togli Online e Sala).' });
+  }
+  await rimuoviPiattoNuovo(chiave);
+  res.json({ ok: true });
 });
 
 // ---------- Endpoint: grandezza caratteri in stampa (decisa dal titolare) ----------
@@ -2717,7 +2923,9 @@ app.get('/api/staff/menu', (req, res) => {
     if (!g) { g = { cat: item.cat, keyPrefix: item.cat, items: [] }; categorie.push(g); }
     if (!g.items.includes(item.nome)) g.items.push(item.nome);
   });
-  res.json(categorie.map(g => ({
+  // i piatti "solo online" non si vedono in sala (app staff, QR tavolo e QR banco)
+  categorie.forEach(g => { if (!String(g.keyPrefix).startsWith('EXTRA_')) g.items = g.items.filter(nome => !soloOnlineCache.has(`${g.keyPrefix}|${nome}`)); });
+  res.json(categorie.filter(g => g.items.length || String(g.keyPrefix).startsWith('EXTRA_')).map(g => ({
     cat: g.cat,
     gruppoExtra: String(g.keyPrefix).startsWith('EXTRA_') ? g.keyPrefix : null,
     tipiPane: ['Panini', 'Hamburger'].includes(g.cat) ? BREAD_TYPES : [],
@@ -3251,7 +3459,7 @@ const richiesteArch = archivio('richiesteTavolo');
 // piatti scelti dal cliente dal telefono (QR tavolo / QR banco): solo voci del menu, i prezzi li rimette normalizzaRighe
 function righeDaCliente(lista){
   return (Array.isArray(lista) ? lista : []).slice(0, 40)
-    .filter(r => r && getCurrentPrice(String(r.chiave || '')) != null && !soldOutCache.has(String(r.chiave)) && !String(r.chiave).startsWith('EXTRA_'))
+    .filter(r => r && getCurrentPrice(String(r.chiave || '')) != null && !soldOutCache.has(String(r.chiave)) && !soloOnlineCache.has(String(r.chiave)) && !String(r.chiave).startsWith('EXTRA_'))
     .map(r => ({ chiave: String(r.chiave), nome: String(r.nome || String(r.chiave).split('|')[1] || ''), cat: String(r.cat || String(r.chiave).split('|')[0] || ''), qty: Math.min(20, Math.max(1, parseInt(r.qty, 10) || 1)), note: String(r.note || '').slice(0, 120),
       // extra, pane e "senza" scelti dal cliente: i prezzi li rimette normalizzaRighe dal listino
       extra: (Array.isArray(r.extra) ? r.extra : []).slice(0, 15).map(e => ({ chiave: String((e && e.chiave) || ''), nome: String((e && e.nome) || '') }))
