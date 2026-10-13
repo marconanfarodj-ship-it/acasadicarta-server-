@@ -4041,6 +4041,92 @@ app.delete('/api/scorte/:id', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ===== ALLERGENI E INTOLLERANZE (Reg. UE 1169/2011: i 14 allergeni) =====
+// Il titolare conferma piatto per piatto: finché non e' "verificato" il sito NON elenca gli allergeni, dice di chiedere al personale.
+const ALLERGENI_ELENCO = [
+  { id: 'glutine', nome: 'Cereali contenenti glutine', emoji: '🌾' }, { id: 'crostacei', nome: 'Crostacei', emoji: '🦐' },
+  { id: 'uova', nome: 'Uova', emoji: '🥚' }, { id: 'pesce', nome: 'Pesce', emoji: '🐟' },
+  { id: 'arachidi', nome: 'Arachidi', emoji: '🥜' }, { id: 'soia', nome: 'Soia', emoji: '🫘' },
+  { id: 'latte', nome: 'Latte e derivati (lattosio)', emoji: '🥛' }, { id: 'guscio', nome: 'Frutta a guscio', emoji: '🌰' },
+  { id: 'sedano', nome: 'Sedano', emoji: '🥬' }, { id: 'senape', nome: 'Senape', emoji: '🟡' },
+  { id: 'sesamo', nome: 'Semi di sesamo', emoji: '⚪' }, { id: 'solfiti', nome: 'Anidride solforosa e solfiti', emoji: '🍷' },
+  { id: 'lupini', nome: 'Lupini', emoji: '🌼' }, { id: 'molluschi', nome: 'Molluschi', emoji: '🦪' }
+];
+const ALLERGENI_IDS = new Set(ALLERGENI_ELENCO.map(a => a.id));
+const DESCR_BASE = {"Pizza|Faccia Di Vecchia": "Olio evo, sale, origano", "Pizza|Rossa": "Polpa di pomodoro, olio evo", "Pizza|Biancaneve": "Fior di latte di Napoli, olio evo", "Pizza|Marinara": "Polpa di pomodoro, aglio, origano, olio evo", "Pizza|Margherita": "Pomodoro, fior di latte di Napoli, olio evo", "Pizza|Patapizza": "Pomodoro, fior di latte di Napoli, patatine fritte", "Pizza|Bufala": "Polpa di pomodoro, mozzarella di bufala, olio evo, basilico", "Pizza|Diavola": "Pomodoro, fior di latte di Napoli, salame piccante, olive", "Pizza|Pizza Regina": "Pomodoro, fior di latte di Napoli, prosciutto cotto, funghi freschi", "Pizza|Tonno & Cipolla": "Pomodoro, fior di latte di Napoli, tonno, cipolla", "Pizza|Napoli": "Pomodoro, fior di latte di Napoli, acciughe, olive", "Pizza|Oslo": "Pomodoro, fior di latte di Napoli, prosciutto cotto, panna", "Pizza|Norma": "Pomodoro, fior di latte di Napoli, melanzana fritta, ricotta salata", "Pizza|Berlino": "Pomodoro, fior di latte di Napoli, wurstel, patatine fritte", "Pizza|Tropea": "Pomodoro, fior di latte di Napoli, svizzero, porcini, tonno, cipolla di Tropea", "Pizza|Helsinki": "Fior di latte di Napoli, pancetta, funghi porcini, grana P dop, basilico", "Pizza|Sfiziosa": "Fior di latte di Napoli, salame piccante, salsiccia, spinaci, olive, grana P dop", "Pizza|Nairobi": "Fior di latte di Napoli, crema di pistacchio, mortadella, granella di pistacchio, grana P dop", "Pizza|Mosca": "Fior di latte di Napoli, crema di pistacchio, speck, granella di pistacchio, grana P dop", "Pizza|Rio": "Pomodoro, fior di latte di Napoli, polpette di cavallo, patatine fritte", "Pizza|Tutti I Gusti": "Pomodoro, fior di latte di Napoli, prosciutto, funghi, uova, wurstel, piselli, olive, carciofi", "Pizza|Ripiegata": "Pomodoro, mozzarella di bufala, crudo, rucola, pomodorini, grana", "Pizza|4 Formaggi": "Pomodoro, fior di latte di Napoli, gorgonzola, svizzero, grana", "Pizza|007": "Pomodoro, fior di latte di Napoli, prosciutto, uovo, wurstel, piselli", "Pizza|La Casa Di Carta": "Pomodoro, fior di latte di Napoli, svizzero, salsiccia, scamorza, funghi", "Pizza|Parmigiana": "Pomodoro, fior di latte di Napoli, melanzane fritte, prosciutto cotto, uovo, grana", "Pizza|4 Stagioni": "Pomodoro, fior di latte di Napoli, prosciutto, funghi, carciofi, olive", "Pizza|Bella Ciao": "Fior di latte di Napoli, crudo Ferrarini, rucola, pomodorini, grana Padana dop", "Pizza|Marsiglia": "Fior di latte di Napoli, capuliato, svizzero, patate della nonna, grana", "Pizza|Ai Porcini": "Pomodoro, fior di latte di Napoli, funghi porcini, crudo Ferrarini, grana Padana dop", "Pizza|Vegetariana": "Pomodoro, fior di latte di Napoli, melanzane fritte, funghi freschi, carciofi, olive, spinaci", "Pizza|Pizza Kebab": "Pomodoro, fior di latte di Napoli, kebab, patatine fritte", "Pizza|Gustosa": "Mozzarella, patate della nonna, salsiccia, spinaci, cipolla", "Pizza|Tokio": "Pomodoro, fior di latte di Napoli, bacon, porcini, scamorza", "Pizza|Bogotà": "Fior di latte di Napoli, salmone, porcini, panna, prezzemolo", "Pizza|Frutti Di Mare": "Pomodoro, fior di latte di Napoli, misto pesce, gamberoni", "Pizza|Cincinnati": "Pomodoro, fior di latte di Napoli, svizzero, funghi porcini, speck, granella pistacchio, grana P dop", "Pizza|Suprema": "Fior di latte di Napoli, patate con buccia extra croccante, bacon croccante, stracciatella pugliese, crema e granella di pistacchio", "Pizza|Denver": "Fior di latte di Napoli, prosciutto cotto, crocchette di patate, stracciata di bufala", "Pizza|Capricciosa": "Pomodoro, fior di latte di Napoli, prosciutto, funghi, uovo, olive", "Pizza Dolce|Nutella": "Nutella Ferrero, zucchero a velo", "Pizza Dolce|Kinder Bueno": "Nutella, kinder bueno, crema alle nocciole e zucchero a velo", "Pizza Dolce|Dubai": "Cioccolata, crema al pistacchio e kataifi", "Panini|Panino Patatine, Wurstel": "Patatine, Wurstel", "Panini|Panino con Patatine": "Patatine", "Panini|Panino Crocchette di Patate & Patatine": "Crocchette di patate, Patatine", "Panini|Panino Patatine, Wurstel in Salsa Rosa": "Patatine, Cocktail di würstel in salsa rosa", "Panini|Panino Pollo al Curry & Patatine": "Pollo al curry, Patatine", "Panini|Panino Pollo ai Funghi & Patatine": "Pollo ai funghi, Patatine", "Panini|Panino Pollo Impanato & Patatine": "Pollo impanato, Patatine", "Panini|Panino Pollo Messicano & Patatine": "Pollo messicano, Patatine", "Panini|Panino Pollo al Barbecue & Patatine": "Pollo al barbecue, Patatine", "Panini|Panino Petto di Pollo alla Griglia & Patatine": "Petto di pollo alla griglia, Patatine", "Panini|Panino Arrosto di Pollo & Patatine": "Arrosto di pollo, Patatine", "Panini|Panino Petto di Pollo Sfilettato & Patatine": "Petto di pollo sfilettato, Patatine", "Panini|Panino Porchettata & Patatine": "Patatine, Porchetta, Svizzero alla griglia", "Panini|Panino Salame Piccante e Mozzarella & Patatine": "Salame piccante, Mozzarella, Patatine", "Panini|Panino Salame Piccante e Svizzero & Patatine": "Salame piccante, Svizzero, Patatine", "Panini|Panino Bella Ciao & Patatine": "Patatine, Mozzarella, Crudo, Ciliegino, Rucola, Grana Padano DOP", "Panini|Panino 4 Formaggi & Patatine": "Patatine, Mozzarella, Formaggio, Svizzero, Gorgonzola, Grana Padano DOP", "Panini|Panino Prosciutto Mozzarella & Patatine": "Patatine, Prosciutto, Mozzarella alla griglia", "Panini|Cocktail Di Tonno & Patatine": "Patatine, Tonno, Lattuga, Maionese", "Panini|Panino Kebab & Patatine": "Carne kebab, Patatine", "Panini|Panino Polpette di Cavallo & Patatine": "Polpette di cavallo, Patatine", "Panini|Panino Cavallo & Patatine": "Carne di cavallo, Patatine", "Panini|Panino Salsiccia & Patatine": "Salsiccia, Patatine", "Panini|Panino in Cocktail di Gamberi in Salsa Rosa & Patatine": "Gamberi, Salsa rosa, Patatine", "Panini|Hamburger di Scottona & Patatine": "Patatine, Hamburger di scottona 200gr", "Panini|Hamburger di Angus & Patatine": "Patatine, Hamburger di Angus 200gr", "Panini|Panino Porchetta Artigianale e Patatine": "Patatine, Porchetta artigianale", "Panini|Panino con Salsiccia di Cavallo & Patatine": "Salsiccia di cavallo, Patatine", "Hamburger|Brooklyn": "Buns americano 12cm, hamburger, cheddar, salsa burger", "Hamburger|Bronx": "Doppia polpetta di cavallo, scamorza affumicata, cipolla caramellata, funghi piccanti, rucola, salsa barbecue", "Hamburger|Spicy": "Doppio hamburger di bovino, cheddar, funghi piccanti, cipolla caramellata, bacon, salsa samurai (piccante)", "Hamburger|Manathan": "Buns americano 12cm, hamburger di Angus 200gr, cheddar, bacon, pomodoro, lattuga, salsa burger, patatine", "Hamburger|Queens": "Buns americano 12cm, cotoletta di pollo croccante, lattuga, maionese", "Focacce|Focaccia Vuota Da Condire": "", "Focacce|Casareccia": "Capuliato, acciughe, olive, olio evo", "Focacce|Focaccia Prosciutto": "Prosciutto cotto, mozzarella, olive, olio", "Focacce|Focaccia Caprese": "Prosciutto cotto, mozzarella, ciliegino, origano, olio", "Focacce|Focaccia Del Pirata": "Mozzarella, tonno, ciliegino, lattuga, tabasco, maionese", "Focacce|Focaccia Mista": "Prosciutto cotto, mozzarella, uovo, olive, wurstel, olio", "Focacce|Deliziosa": "Salame piccante, mozzarella, funghi freschi, olive, olio evo", "Focacce|Focaccia 4 Formaggi": "Mozzarella, svizzero, gorgonzola, grana P dop", "Focacce|Bella Ciao": "Mozzarella, prosciutto crudo Ferrarini, rucola, pomodorini, grana P dop", "Focacce|Focaccia Nairobi": "Mozzarella, mortadella, crema di pistacchio, granella di pistacchio, grana", "Fritture|Vaschetta Piccola — Patatine": "", "Fritture|Vaschetta Media — Patatine": "", "Fritture|Patatine con Buccia": "Irresistibili, gustose e croccanti", "Fritture|Vaschetta Piccola — 4 Würstel & Patatine": "", "Fritture|Vaschetta — 8 Würstel": "", "Fritture|Vaschetta — Crocchette di Patate": "", "Fritture|Vaschetta di Kebab": "", "Fritture|Anelli di Cipolla": "", "Fritture|Panzerotti Fritti Mignon Pomodoro e Mozzarella": "", "Fritture|Mozzarelline Impanate": "", "Fritture|Bocconcini Pollo Amadori Impanato Piccante": "Dimensione normale", "Fritture|Arancini Mignon al Ragù": "7 arancini mignon al ragù", "Fritture|Nuggets 10 Pezzi": "Nuggets Amadori", "Bevande|Gassosa": "", "Bevande|Acqua Naturale Piccola": "", "Bevande|Acqua Frizzante": "", "Bevande|Coca Cola 33": "", "Bevande|Coca Cola Zero": "", "Bevande|Birra Moretti": "", "Bevande|Birra Peroni": "", "Bevande|Coca Cola Vetro cl 33": "", "Bevande|Estathe Pesca": "", "Bevande|Estathe Limone": "", "Bevande|Nastro Azzurro": "", "Bevande|Ceres": "", "Bevande|Coca Cola Bottiglia Grande": "", "Bevande|Birra Messina Grande": "Cristalli di sale", "Bevande|Birra Nastro Azzurro Grande": "", "Bevande|Peroni Chill Lemon": "", "Extra|Bustina Maionese": "", "Extra|Bustina Ketchup": ""};
+const SALSE_GRATIS = ['Ketchup', 'Maionese', 'Salsa Cheddar', 'Salsa Barbecue', 'Salsa Chili', 'Salsa Curry', 'Salsa Rosa', 'Salsa Hamburger', 'Salsa Yogurt', 'Tabasco'];
+// suggerimento automatico dagli ingredienti: serve solo come punto di partenza, il titolare deve controllare le etichette
+function suggerisciAllergeni(cat, nome, desc){
+  const t = (nome + ' ' + (desc || '')).toLowerCase(), a = new Set();
+  const ha = re => re.test(t);
+  if (['Pizza', 'Pizza Dolce', 'Panini', 'Hamburger', 'Focacce', 'Pane'].includes(cat)) a.add('glutine');
+  if (ha(/impanat|nuggets|arancin|panzerott|crocchett|cotoletta|cipolla croccante|anelli di cipolla|polpett|birra|moretti|peroni|ceres|messina|nastro azzurro|kinder|kebab|bun|tortilla|pan pizza/)) a.add('glutine');
+  if (ha(/fior di latte|mozzarell|bufala|stracciat|gorgonzola|svizzer|grana|scamorz|ricotta|panna|cheddar|formaggio|nutella|kinder|pistacchi|yogurt|burrata|cioccolat|kebab/)) a.add('latte');
+  if (ha(/\buov[ao]|maionese|salsa rosa|salsa burger|salsa hamburger|impanat|nuggets|arancin|cotoletta|polpett|mozzarelline/)) a.add('uova');
+  if (ha(/tonno|acciugh|salmone|pesce/)) a.add('pesce');
+  if (ha(/gamber|misto pesce|frutti di mare/)) a.add('crostacei');
+  if (ha(/frutti di mare|misto pesce|cozze|vongol|calamar/)) a.add('molluschi');
+  if (ha(/pistacchi|nocciol|nutella|kinder|kataifi/)) a.add('guscio');
+  if (ha(/nutella|kinder|cioccolat/)) a.add('soia');
+  if (ha(/rag[uù]|arancin/)) a.add('sedano');
+  if (ha(/maionese|salsa burger|salsa hamburger|barbecue|curry|salsa rosa/)) a.add('senape');
+  if (ha(/buns americano|\bbun\b/)) a.add('sesamo');
+  if (ha(/olive|funghi|porcin|carciofi|cipolla caramellata|birra|moretti|peroni|ceres|messina|nastro azzurro|capuliato/)) a.add('solfiti');
+  return ALLERGENI_ELENCO.map(x => x.id).filter(id => a.has(id));
+}
+const allergeniArch = archivio('allergeni');
+function gruppiAllergeni(){
+  const gruppi = [];
+  const aggiungi = (cat, chiave, nome, desc) => {
+    let g = gruppi.find(x => x.cat === cat); if (!g) { g = { cat, voci: [] }; gruppi.push(g); }
+    if (!g.voci.some(v => v.chiave === chiave)) g.voci.push({ chiave, nome, desc: desc || '', suggeriti: suggerisciAllergeni(cat.replace(/^🧀 Extra ingredienti.*/, 'Extra'), nome, desc) });
+  };
+  MENU_CATALOG.forEach(g => {
+    if (String(g.keyPrefix).startsWith('EXTRA_')) { g.items.forEach(n => aggiungi(g.cat, `${g.keyPrefix}|${n}`, n, '')); return; }
+    g.items.forEach(n => {
+      const chiave = `${g.keyPrefix}|${n}`, t = menuTestiCache[chiave] || {};
+      aggiungi(g.cat, chiave, t.nome || n, t.desc !== undefined ? t.desc : (DESCR_BASE[chiave] || ''));
+    });
+  });
+  customMenuItemsCache.forEach(i => aggiungi(i.cat, `${i.cat}|${i.nome}`, i.nome, i.descrizione || ''));
+  aggiungi('Salse gratuite', 'SALSA|__', '', '');
+  gruppi.find(g => g.cat === 'Salse gratuite').voci = SALSE_GRATIS.map(n => ({ chiave: `SALSA|${n}`, nome: n, desc: '', suggeriti: suggerisciAllergeni('Salse', n, '') }));
+  gruppi.push({ cat: 'Tipo di pane (Panini e Hamburger)', voci: BREAD_TYPES.map(n => ({ chiave: `PANE|${n}`, nome: n, desc: '', suggeriti: suggerisciAllergeni('Pane', n, '') })) });
+  return gruppi;
+}
+async function allergeniSalvati(){
+  const m = {}; (await allergeniArch.list({}, null, 2000)).forEach(x => { m[x._id] = x; }); return m;
+}
+// pagina pubblica: elenca gli allergeni solo dei piatti confermati dal titolare
+app.get('/api/allergeni', async (req, res) => {
+  try {
+    const salvati = await allergeniSalvati();
+    const gruppi = gruppiAllergeni().map(g => ({ cat: g.cat, voci: g.voci.map(v => {
+      const s = salvati[v.chiave]; const ok = !!(s && s.verificato);
+      return { nome: v.nome, desc: v.desc, a: ok ? (s.a || []) : null };
+    }) }));
+    const conf = Object.values(salvati).filter(x => x.verificato).map(x => x.aggiornato || '').sort().pop() || '';
+    res.json({ ok: true, allergeni: ALLERGENI_ELENCO, gruppi, aggiornato: conf });
+  } catch (err) { console.error('Errore allergeni:', err); res.status(500).json({ ok: false, error: 'Errore server' }); }
+});
+app.get('/api/allergeni/gestione', soloTitolare, async (req, res) => {
+  const salvati = await allergeniSalvati();
+  res.json({ ok: true, allergeni: ALLERGENI_ELENCO, gruppi: gruppiAllergeni().map(g => ({ cat: g.cat, voci: g.voci.map(v => {
+    const s = salvati[v.chiave]; return { ...v, a: s ? (s.a || []) : v.suggeriti, verificato: !!(s && s.verificato) };
+  }) })) });
+});
+app.post('/api/allergeni/salva', soloTitolare, async (req, res) => {
+  const voci = Array.isArray((req.body || {}).voci) ? req.body.voci.slice(0, 500) : [];
+  let n = 0;
+  for (const v of voci) {
+    const chiave = String(v.chiave || '').slice(0, 160); if (!chiave) continue;
+    const a = (Array.isArray(v.a) ? v.a : []).map(String).filter(x => ALLERGENI_IDS.has(x));
+    await allergeniArch.save({ _id: chiave, a: [...new Set(a)], verificato: v.verificato === true, aggiornato: new Date().toISOString() });
+    n++;
+  }
+  res.json({ ok: true, salvati: n });
+});
+
 // ===== RICHIESTA DI RECENSIONE GOOGLE (email il giorno dopo l'ordine) =====
 const recensioniArch = archivio('recensioniChieste');
 let recensioniInCorso = false;
