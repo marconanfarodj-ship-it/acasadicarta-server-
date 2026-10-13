@@ -3929,6 +3929,64 @@ app.post('/api/scorte/:id/movimento', async (req, res) => {
   broadcastOrder({ evento: 'scorte_aggiornate' });
   res.json({ ok: true, scorta: sc });
 });
+// ----- Scorte collegate all'app Fornitori (listino) e al ricevimento merce HACCP -----
+// Su Render: FORNITORI_URL = indirizzo dell'app fornitori (es. https://fornitori.pizzerialacasadicarta.it), FORNITORI_PIN = il suo PIN (se l'hai messo).
+async function leggiFornitori(){
+  const base = String(process.env.FORNITORI_URL || '').replace(/\/+$/, '');
+  if (!base) return null;
+  const headers = {}; if (process.env.FORNITORI_PIN) headers['x-pin'] = process.env.FORNITORI_PIN;
+  const r = await fetch(base + '/api/fornitori', { headers, signal: AbortSignal.timeout(15000) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ('app fornitori: errore ' + r.status));
+  return (d.fornitori || []).map(f => ({ id: f.id, nome: f.nome, whatsapp: f.whatsapp || '', referente: f.referente || '', prodotti: (f.prodotti || []).map(p => ({ id: p.id, nome: p.nome, unita: p.unita || 'pezzo', conf: p.conf || '' })) }));
+}
+app.get('/api/scorte/fornitori', async (req, res) => {
+  try {
+    const fornitori = await leggiFornitori();
+    if (!fornitori) return res.json({ ok: true, configurato: false });
+    const scorte = await scorteArch.list({}, null, 500);
+    res.json({ ok: true, configurato: true, fornitori, collegati: scorte.filter(x => x.prodottoId).map(x => x.prodottoId) });
+  } catch (err) { console.error('Errore lettura fornitori:', err.message); res.status(502).json({ ok: false, error: err.message }); }
+});
+app.post('/api/scorte/importa', async (req, res) => {
+  const voci = Array.isArray((req.body || {}).voci) ? req.body.voci.slice(0, 200) : [];
+  const esistenti = await scorteArch.list({}, null, 1000);
+  const gia = new Set(esistenti.filter(x => x.prodottoId).map(x => x.prodottoId));
+  let creati = 0;
+  for (const v of voci) {
+    const prodottoId = String(v.prodottoId || '').slice(0, 40), fornitoreId = String(v.fornitoreId || '').slice(0, 40);
+    if (!prodottoId || !fornitoreId || gia.has(prodottoId)) continue;
+    const nome = String(v.nome || '').slice(0, 60).trim(); if (!nome) continue;
+    const sc = { _id: crypto.randomUUID(), nome, unita: String(v.unita || 'pezzo').slice(0, 15), quantita: 0, soglia: Math.max(0, Number(v.soglia) || 1), collegati: [],
+      fornitoreId, fornitoreNome: String(v.fornitoreNome || '').slice(0, 60), prodottoId, aggiornata: new Date().toISOString() };
+    await scorteArch.save(sc); gia.add(prodottoId); creati++;
+  }
+  broadcastOrder({ evento: 'scorte_aggiornate' });
+  res.json({ ok: true, creati });
+});
+// carico automatico: arriva dall'app fornitori quando una fattura scansionata nel ricevimento merce HACCP viene letta
+const caricoScorteArch = archivio('caricoScorte');
+app.post('/api/scorte/carico', async (req, res) => {
+  const k = process.env.STAFF_KEY;
+  if (k && req.get('x-staff-key') !== k && !(req.get('x-titolare-token'))) return res.status(401).json({ ok: false, error: 'chiave non valida' });
+  const carichi = Array.isArray((req.body || {}).carichi) ? req.body.carichi.slice(0, 300) : [];
+  const scorte = await scorteArch.list({}, null, 1000);
+  let caricati = 0, giaVisti = 0, senzaScorta = 0;
+  for (const c of carichi) {
+    const chiave = String(c.chiave || '').slice(0, 200), q = round2(Number(c.quantita));
+    if (!chiave || !Number.isFinite(q) || q <= 0 || q > 100000) continue;
+    if (await caricoScorteArch.get(chiave)) { giaVisti++; continue; }
+    const sc = scorte.find(x => x.prodottoId && x.prodottoId === String(c.prodottoId));
+    await caricoScorteArch.save({ _id: chiave, quando: new Date().toISOString(), prodottoId: String(c.prodottoId || ''), quantita: q, applicato: !!sc });
+    if (!sc) { senzaScorta++; continue; }
+    const prima = sc.quantita; sc.quantita = round2(prima + q); sc.aggiornata = new Date().toISOString(); sc.ultimoCarico = { quando: sc.aggiornata, quantita: q };
+    await scorteArch.save(sc);
+    if (prima <= 0 && sc.quantita > 0) await segnaEsauritiDaScorta(sc.collegati, false);
+    caricati++;
+  }
+  if (caricati) broadcastOrder({ evento: 'scorte_aggiornate' });
+  res.json({ ok: true, caricati, giaVisti, senzaScorta });
+});
 app.delete('/api/scorte/:id', async (req, res) => {
   await scorteArch.del(req.params.id);
   res.json({ ok: true });
