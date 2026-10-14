@@ -63,6 +63,7 @@ const ROTTE_STAFF = [
   ['POST', /^\/api\/driver-location\/?$/],
   ['POST', /^\/api\/(custom-menu-items\/(add|delete)|orders-status\/toggle|solo-sala\/toggle|stampa\/dimensione|calendario\/giorno|menu-prices\/update|product-photos\/(upload|delete)|blacklist\/(add|remove)|sold-out\/(reset-all|bulk|toggle)|fedelta\/riscatta)\/?$/],
   ['GET',  /^\/api\/blacklist\/?$/],
+  ['*',    /^\/api\/stampe(\/|$)/],
   ['*',    /^\/api\/staff\/comande(\/|$)/],
   ['*',    /^\/api\/(prenotazioni|clienti|scorte)(\/|$)/],
   ['GET',  /^\/api\/tavolo\/richieste\/?$/],
@@ -146,7 +147,8 @@ let dimensioneStampa = 'media';
 let settingsCollection = null;
 let soloSalaCache = new Set();  // piatti ordinabili solo in sala (nascosti nel sito clienti)
 let soloOnlineCache = new Set(); // piatti ordinabili solo online (nascosti in sala: app staff, QR tavolo e banco)
-let comandeCollection = null;   // comande dell'app staff (sala, banco, telefono)
+let comandeCollection = null;
+let stampeCollection = null;    // stampe dello staff in attesa di conferma dal tablet che stampa   // comande dell'app staff (sala, banco, telefono)
 let comandeMemoria = {};        // riserva in memoria se il database non è disponibile
 
 // prezzi di partenza di ogni voce del menu (chiave uguale a quella usata per gli esauriti);
@@ -227,6 +229,8 @@ async function connectDB(){
     // una alla volta quando serve, tramite /api/product-photos/img/:chiave
     photoDocs.forEach(d => { productPhotosCache[d._id] = true; productPhotosVer[d._id] = Date.parse(d.updatedAt) || 1; });
     comandeCollection = db.collection('comandeStaff');
+    stampeCollection = db.collection('stampeStaff');
+    await stampeCollection.createIndex({ fatta: 1, creata: 1 });
     await comandeCollection.createIndex({ stato: 1, aggiornataAlle: -1 });
     customMenuItemsCollection = db.collection('customMenuItems');
     customMenuItemsCache = await customMenuItemsCollection.find({}).toArray();
@@ -2716,9 +2720,45 @@ function selezioneValida(c, voci){
 }
 
 // tipo = su quale stampante va (vedi CONFIG.stampa.instrada): noi | conti | cassa | sito | banco
+// Ogni stampa ha un id e resta "in sospeso" finché il tablet che stampa non conferma (/api/stampe/fatta).
+// Se in quel momento il tablet era scollegato, appena torna le recupera da /api/stampe/in-sospeso.
+const stampeMemoria = []; // copia in memoria (serve anche se il database non c'è)
 function stampaStaff(testo, rif, tipo){
-  broadcastOrder({ evento: 'stampa_staff', testoStampa: testo, rif, tipo: tipo || 'noi' });
+  const job = { id: crypto.randomBytes(8).toString('hex'), testoStampa: testo, rif: rif || '', tipo: tipo || 'noi', creata: new Date(), fatta: null };
+  stampeMemoria.push(job);
+  while (stampeMemoria.length > 300) stampeMemoria.shift();
+  if (stampeCollection) stampeCollection.insertOne({ ...job, _id: job.id }).catch(() => {});
+  broadcastOrder({ evento: 'stampa_staff', id: job.id, testoStampa: testo, rif: job.rif, tipo: job.tipo, creata: job.creata });
 }
+async function stampeInSospeso(){
+  const da = new Date(Date.now() - 12 * 60 * 60 * 1000);
+  if (stampeCollection) {
+    try {
+      const docs = await stampeCollection.find({ fatta: null, creata: { $gte: da } }).sort({ creata: 1 }).limit(60).toArray();
+      return docs.map(d => ({ id: d.id || d._id, testoStampa: d.testoStampa, rif: d.rif, tipo: d.tipo, creata: d.creata }));
+    } catch (e) { /* se il database non risponde usiamo la memoria */ }
+  }
+  return stampeMemoria.filter(j => !j.fatta && j.creata >= da).slice(-60);
+}
+app.get('/api/stampe/in-sospeso', async (req, res) => {
+  const stampe = await stampeInSospeso();
+  res.json({ ok: true, stampe });
+});
+app.post('/api/stampe/fatta', async (req, res) => {
+  const id = String((req.body || {}).id || '').slice(0, 40);
+  if (!id) return res.status(400).json({ ok: false, error: 'id mancante' });
+  const ora = new Date();
+  const m = stampeMemoria.find(j => j.id === id); if (m) m.fatta = ora;
+  if (stampeCollection) {
+    try {
+      await stampeCollection.updateOne({ _id: id }, { $set: { fatta: ora } });
+      // pulizia: le stampe confermate più vecchie di 3 giorni non servono più
+      stampeCollection.deleteMany({ fatta: { $ne: null }, creata: { $lt: new Date(Date.now() - 3 * 86400000) } }).catch(() => {});
+    } catch (e) {}
+  }
+  broadcastOrder({ evento: 'stampa_confermata', id });
+  res.json({ ok: true });
+});
 
 function infoComandaDaBody(b, c){
   const tipo = ['tavolo', 'asporto', 'consegna'].includes(b.tipo) ? b.tipo : (c && c.tipo) || 'tavolo';
