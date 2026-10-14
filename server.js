@@ -2851,6 +2851,15 @@ app.post('/api/staff/comande/:id/invia', async (req, res) => {
   res.json({ ok: true, comanda: conTotali(c) });
 });
 
+// "Servito": ferma il contatore dell'attesa in cucina (si riattiva da solo al prossimo invio)
+app.post('/api/staff/comande/:id/servito', async (req, res) => {
+  const c = await comandaGet(req.params.id);
+  if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
+  c.servitoAlle = (req.body || {}).servito === false ? null : new Date().toISOString();
+  await comandaSave(c);
+  res.json({ ok: true, comanda: conTotali(c) });
+});
+
 app.post('/api/staff/comande/:id/ristampa', async (req, res) => {
   const c = await comandaGet(req.params.id);
   if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
@@ -3494,9 +3503,11 @@ let ultimoResocontoInviatoIl = null; // evita invii doppi nello stesso minuto/gi
 setInterval(() => {
   const now = new Date(); // ora italiana grazie a TZ=Europe/Rome
   const oggiKey = dateKey(now);
-  if (now.getHours() === 23 && now.getMinutes() === 30 && ultimoResocontoInviatoIl !== oggiKey) {
+  // alle 3 di notte: se la cassa non è stata chiusa, manda lo stesso il riepilogo completo della serata
+  if (now.getHours() === 3 && now.getMinutes() === 0 && ultimoResocontoInviatoIl !== oggiKey) {
     ultimoResocontoInviatoIl = oggiKey;
-    sendDailyReport();
+    const g = giornoServizio(now);
+    chiusureArch.get(g).then(ch => { if (!ch || !ch.mailSerata) mandaRiepilogoSerata(g); }).catch(() => mandaRiepilogoSerata(g));
   }
 }, 60 * 1000);
 
@@ -3871,6 +3882,90 @@ async function ordiniDi(tel){
   if (ordersCollection) return ordersCollection.find({ phoneNormalized: tel }, { projection: { _id: 0, numeroOrdine: 1, ricevutoAlle: 1, grandTotal: 1, articoli: 1, nome: 1, name: 1, cognome: 1, address: 1, modalita: 1, email: 1 } }).sort({ ricevutoAlle: -1 }).limit(300).toArray();
   return orderHistory.filter(o => o.phoneNormalized === tel);
 }
+// ===== PROMEMORIA AI CLIENTI VIA E-MAIL (deciso dal titolare, con link per non riceverne più) =====
+const disiscrittiArch = archivio('disiscrittiEmail');   // _id = email
+const promemoriaArch = archivio('promemoriaInviati');   // _id = email, ultimo invio
+const emailValida = e => /^[^\s@<>"']{1,64}@[^\s@<>"']{1,180}\.[a-z]{2,}$/i.test(String(e || '').trim());
+function firmaDisiscrivi(email){ return crypto.createHmac('sha256', JWT_SECRET).update('unsub:' + email.toLowerCase()).digest('hex').slice(0, 20); }
+async function clientiDaRichiamare(giorni){
+  const limite = Date.now() - giorni * 86400000, da = new Date(Date.now() - 365 * 86400000).toISOString();
+  const ordini = ordersCollection
+    ? await ordersCollection.find({ ricevutoAlle: { $gte: da }, email: { $exists: true, $ne: '' } }, { projection: { email: 1, name: 1, nome: 1, grandTotal: 1, ricevutoAlle: 1 } }).limit(20000).toArray()
+    : orderHistory.filter(o => o.email && o.ricevutoAlle >= da);
+  const m = new Map();
+  ordini.forEach(o => {
+    const e = String(o.email || '').trim().toLowerCase(); if (!emailValida(e)) return;
+    const x = m.get(e) || { email: e, nome: '', ordini: 0, speso: 0, ultimo: '' };
+    if (!x.nome) x.nome = String(o.nome || o.name || '').trim().split(' ')[0];
+    x.ordini++; x.speso += Number(o.grandTotal) || 0; if (o.ricevutoAlle > x.ultimo) x.ultimo = o.ricevutoAlle;
+    m.set(e, x);
+  });
+  const out = [];
+  for (const x of m.values()) {
+    if (new Date(x.ultimo).getTime() > limite) continue;
+    if (await disiscrittiArch.get(x.email)) continue;
+    const pr = await promemoriaArch.get(x.email);
+    x.ultimoPromemoria = pr ? pr.alle : null;
+    x.speso = round2(x.speso);
+    out.push(x);
+  }
+  return out.sort((a, b) => b.speso - a.speso).slice(0, 300);
+}
+app.get('/api/titolare/promemoria', soloTitolare, async (req, res) => {
+  try {
+    const giorni = Math.min(365, Math.max(7, parseInt(req.query.giorni, 10) || 30));
+    res.json({ ok: true, clienti: await clientiDaRichiamare(giorni), emailAttiva: !!RESEND_API_KEY,
+      offerte: (CONFIG.offerte || []).filter(o => o.attiva && o.codice).map(o => ({ id: o.id, nome: o.nome, codice: o.codice, tipo: o.tipo, valore: o.valore, scadenza: o.scadenza })) });
+  } catch (err) { console.error('Errore promemoria:', err); res.status(500).json({ ok: false, error: 'Errore server' }); }
+});
+function htmlPromemoria(nome, messaggio, offerta, linkStop){
+  const sconto = offerta ? (offerta.tipo === 'euro' ? `${money(offerta.valore)} di sconto` : `${offerta.valore}% di sconto`) : '';
+  const escH = t => String(t || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return `<!DOCTYPE html><html lang="it"><body style="margin:0;background:#f4f1ee;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="padding:20px 0;"><tr><td align="center">
+<table width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#fff;border-radius:18px;overflow:hidden;">
+<tr><td style="background:linear-gradient(135deg,#c1382b,#7a1f16);padding:26px;text-align:center;color:#fff;">
+<img src="${SITE_URL}/icon-512.png?v=${ASSET_VERSION}" width="64" height="64" alt="La Casa di Carta" style="border-radius:16px;display:block;margin:0 auto 10px;">
+<div style="font-size:22px;font-weight:800;">Ciao ${escH(nome || '')}!</div></td></tr>
+<tr><td style="padding:22px;font-size:16px;line-height:1.5;color:#333;">${escH(messaggio).replace(/\n/g, '<br>')}
+${offerta ? `<div style="margin:18px 0;padding:16px;border:2px dashed #c1382b;border-radius:14px;text-align:center;"><div style="font-size:14px;color:#7a1f16;">Per te ${sconto}${offerta.scadenza ? ` fino al ${new Date(offerta.scadenza + 'T12:00:00').toLocaleDateString('it-IT')}` : ''}</div><div style="font-size:26px;font-weight:800;letter-spacing:2px;color:#c1382b;margin-top:4px;">${escH(offerta.codice)}</div><div style="font-size:13px;color:#777;">scrivi il codice quando ordini online</div></div>` : ''}
+<div style="text-align:center;margin-top:16px;"><a href="${SITE_URL}" style="display:inline-block;background:#c1382b;color:#fff;text-decoration:none;font-weight:800;padding:14px 26px;border-radius:12px;">🍕 Ordina ora</a></div>
+</td></tr>
+<tr><td style="padding:14px 22px 22px;font-size:12px;color:#999;text-align:center;">Pizzeria La Casa di Carta · Via XX Settembre 192, Niscemi<br>Ricevi questa mail perché hai ordinato da noi online. <a href="${linkStop}" style="color:#999;">Non voglio più ricevere queste e-mail</a></td></tr>
+</table></td></tr></table></body></html>`;
+}
+app.post('/api/titolare/promemoria', soloTitolare, async (req, res) => {
+  try {
+    if (!RESEND_API_KEY) return res.status(400).json({ ok: false, error: 'Invio e-mail non configurato (manca RESEND_API_KEY su Render)' });
+    const b = req.body || {};
+    const emails = [...new Set((Array.isArray(b.emails) ? b.emails : []).map(e => String(e).trim().toLowerCase()).filter(emailValida))].slice(0, 100);
+    if (!emails.length) return res.status(400).json({ ok: false, error: 'Nessun cliente scelto' });
+    const messaggio = String(b.messaggio || '').slice(0, 1200) || 'È da un po\' che non ci vediamo! Ti aspettiamo con le nostre pizze appena sfornate.';
+    const oggetto = String(b.oggetto || '').slice(0, 120) || 'Ci manchi! 🍕 La Casa di Carta';
+    const offerta = b.offertaId ? (CONFIG.offerte || []).find(o => o.id === b.offertaId && o.attiva && o.codice) : null;
+    const nomi = new Map((Array.isArray(b.nomi) ? b.nomi : []).map(x => [String(x.email || '').toLowerCase(), String(x.nome || '').slice(0, 40)]));
+    let inviate = 0, saltate = 0;
+    for (const e of emails) {
+      if (await disiscrittiArch.get(e)) { saltate++; continue; }
+      const link = `https://${req.get('host')}/api/disiscrivi?e=${encodeURIComponent(e)}&k=${firmaDisiscrivi(e)}`;
+      const nome = nomi.get(e) || '';
+      const testo = `Ciao ${nome}!\n\n${messaggio}\n${offerta ? `\nCodice sconto: ${offerta.codice}\n` : ''}\nOrdina qui: ${SITE_URL}\n\nPer non ricevere più queste e-mail: ${link}`;
+      await sendEmail(e, oggetto, testo, htmlPromemoria(nome, messaggio, offerta, link));
+      await promemoriaArch.save({ _id: e, alle: new Date().toISOString() });
+      inviate++;
+      await new Promise(r => setTimeout(r, 600)); // piano piano: niente invii a raffica
+    }
+    res.json({ ok: true, inviate, saltate });
+  } catch (err) { console.error('Errore invio promemoria:', err); res.status(500).json({ ok: false, error: 'Errore server' }); }
+});
+app.get('/api/disiscrivi', async (req, res) => {
+  const e = String(req.query.e || '').trim().toLowerCase(), k = String(req.query.k || '');
+  const pagina = (t) => `<!DOCTYPE html><html lang="it"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f4f1ee;display:flex;align-items:center;justify-content:center;min-height:90vh;margin:0;padding:16px;"><div style="background:#fff;border-radius:18px;padding:28px;max-width:420px;text-align:center;"><div style="font-size:40px;">🍕</div><h2 style="color:#7a1f16;">La Casa di Carta</h2><p style="font-size:16px;color:#333;">${t}</p></div></body></html>`;
+  if (!emailValida(e) || !uguali(k, firmaDisiscrivi(e))) return res.status(400).send(pagina('Link non valido.'));
+  await disiscrittiArch.save({ _id: e, alle: new Date().toISOString() });
+  res.send(pagina('Fatto: non riceverai più le nostre e-mail promozionali. Le conferme dei tuoi ordini continueranno ad arrivare normalmente.'));
+});
+
 app.get('/api/clienti/cerca', async (req, res) => {
   try {
     const q = String(req.query.q || '').trim().slice(0, 40);
@@ -4325,8 +4420,87 @@ app.post('/api/titolare/chiusura', soloTitolare, async (req, res) => {
       note: String(b.note || '').slice(0, 300), riepilogo: r, chiusaAlle: new Date().toISOString(), comandeChiuseAuto: auto.chiuse };
     await chiusureArch.save(ch);
     if (b.stampa !== false) stampaStaff(testoChiusura(r, ch), `Chiusura cassa ${giorno}`, 'cassa');
+    setTimeout(() => mandaRiepilogoSerata(giorno).catch(() => {}), 1500); // mail con il riepilogo della serata
     res.json({ ok: true, chiusura: ch });
   } catch (err) { console.error('Errore chiusura cassa:', err); res.status(500).json({ ok: false, error: 'Errore server' }); }
+});
+
+// ===== RIEPILOGO SERATA COMPLETO (sala + asporto + online, piatti più venduti, confronto con la settimana prima) =====
+async function serataCompleta(giorno){
+  const r = await riepilogoGiornata(giorno);
+  const tipi = { tavolo: { n: 0, tot: 0 }, asporto: { n: 0, tot: 0 }, consegna: { n: 0, tot: 0 }, online: { n: r.online.ordini, tot: r.online.incasso } };
+  const piatti = new Map();
+  const conta = (nome, qty, tot) => { if (!nome) return; const k = String(nome).trim(); const v = piatti.get(k) || { nome: k, qty: 0, tot: 0 }; v.qty += Number(qty) || 0; v.tot += Number(tot) || 0; piatti.set(k, v); };
+  (await comandeList({ stato: 'chiusa', giorno }, 20000)).forEach(c => {
+    const t = tipi[c.tipo] ? c.tipo : 'tavolo';
+    tipi[t].n++; tipi[t].tot += Number(c.totaleIncassato) || 0;
+    (c.righe || []).forEach(x => conta(x.nome, x.qty, (Number(x.prezzo) || 0) * (Number(x.qty) || 0)));
+  });
+  const dal = new Date(giorno + 'T05:00:00').toISOString(), al = new Date(giornoAggiunto(giorno, 1) + 'T05:00:00').toISOString();
+  const ordini = ordersCollection
+    ? await ordersCollection.find({ ricevutoAlle: { $gte: dal, $lt: al } }, { projection: { articoli: 1 } }).toArray()
+    : orderHistory.filter(o => o.ricevutoAlle >= dal && o.ricevutoAlle < al);
+  ordini.forEach(o => (o.articoli || []).forEach(a => conta(a.nome, a.qty, a.prezzo)));
+  const top = [...piatti.values()].sort((a, b) => b.qty - a.qty || b.tot - a.tot).slice(0, 10).map(v => ({ ...v, tot: round2(v.tot) }));
+  const pezzi = [...piatti.values()].reduce((t, v) => t + v.qty, 0);
+  const gPrima = giornoAggiunto(giorno, -7);
+  const prima = await riepilogoGiornata(gPrima);
+  Object.values(tipi).forEach(v => { v.tot = round2(v.tot); });
+  return { ...r, tipi, top, pezzi, scontrinoMedio: (() => { const n = tipi.tavolo.n + tipi.asporto.n + tipi.consegna.n + tipi.online.n; return n ? round2(r.totale / n) : 0; })(),
+    settimanaPrima: { giorno: gPrima, totale: prima.totale, differenza: round2(r.totale - prima.totale), percento: prima.totale ? Math.round((r.totale - prima.totale) / prima.totale * 100) : null } };
+}
+function htmlSerata(s){
+  const data = new Date(s.giorno + 'T12:00:00').toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric', month: 'long' });
+  const riga = (a, b, forte) => `<tr><td style="padding:7px 0;border-bottom:1px solid #eee;color:#333;${forte ? 'font-weight:700;' : ''}">${a}</td><td style="padding:7px 0;border-bottom:1px solid #eee;text-align:right;${forte ? 'font-weight:800;' : ''}">${b}</td></tr>`;
+  const sp = s.settimanaPrima;
+  const conf = sp.totale ? `${sp.differenza >= 0 ? '▲' : '▼'} ${money(Math.abs(sp.differenza))}${sp.percento !== null ? ` (${sp.percento >= 0 ? '+' : ''}${sp.percento}%)` : ''} rispetto a ${new Date(sp.giorno + 'T12:00:00').toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric', month: 'long' })} (${money(sp.totale)})` : 'Nessun dato della settimana prima';
+  const top = s.top.map((p, i) => riga(`${i + 1}. ${p.nome}`, `${p.qty} pz · ${money(p.tot)}`)).join('');
+  return `<!DOCTYPE html><html lang="it"><body style="margin:0;background:#f4f1ee;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="padding:20px 0;"><tr><td align="center">
+<table width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#fff;border-radius:18px;overflow:hidden;">
+<tr><td style="background:linear-gradient(135deg,#c1382b,#7a1f16);padding:24px;text-align:center;color:#fff;">
+<div style="font-size:14px;opacity:.85;text-transform:capitalize;">${data}</div>
+<div style="font-size:34px;font-weight:800;margin-top:4px;">${money(s.totale)}</div>
+<div style="font-size:14px;margin-top:6px;">${conf}</div></td></tr>
+<tr><td style="padding:18px 22px;">
+<div style="font-weight:800;color:#7a1f16;margin-bottom:6px;">Da dove arrivano</div>
+<table width="100%" cellpadding="0" cellspacing="0" style="font-size:15px;">
+${riga(`🍽️ Tavoli (${s.tipi.tavolo.n})`, money(s.tipi.tavolo.tot))}${riga(`🏠 Asporto (${s.tipi.asporto.n})`, money(s.tipi.asporto.tot))}${riga(`🛵 Consegne (${s.tipi.consegna.n})`, money(s.tipi.consegna.tot))}${riga(`🌐 Ordini online (${s.tipi.online.n})`, money(s.tipi.online.tot))}
+${riga('Scontrino medio', money(s.scontrinoMedio), true)}</table>
+<div style="font-weight:800;color:#7a1f16;margin:16px 0 6px;">Pagamenti</div>
+<table width="100%" cellpadding="0" cellspacing="0" style="font-size:15px;">
+${riga('💵 Contanti (sala + online)', money(s.contantiIncassati))}${riga('💳 Carta in sala', money(s.sala.carta))}${riga('💳 Pagati online', money(s.online.online))}${riga('💳 Bancomat consegne', money(s.online.bancomat))}${s.online.nonRegistrato ? riga('⚠️ Online non registrati', money(s.online.nonRegistrato)) : ''}</table>
+<div style="font-weight:800;color:#7a1f16;margin:16px 0 6px;">Più venduti (${s.pezzi} pezzi in tutto)</div>
+<table width="100%" cellpadding="0" cellspacing="0" style="font-size:15px;">${top || riga('Nessun piatto', '')}</table>
+${s.aperte.numero ? `<p style="color:#b3261e;font-weight:700;">Attenzione: ${s.aperte.numero} comande ancora aperte (${money(s.aperte.residuo)})</p>` : ''}
+</td></tr></table></td></tr></table></body></html>`;
+}
+function testoSerata(s){
+  return `RIEPILOGO SERATA ${s.giorno}\nTotale: ${money(s.totale)}\nTavoli ${s.tipi.tavolo.n}: ${money(s.tipi.tavolo.tot)}\nAsporto ${s.tipi.asporto.n}: ${money(s.tipi.asporto.tot)}\nConsegne ${s.tipi.consegna.n}: ${money(s.tipi.consegna.tot)}\nOnline ${s.tipi.online.n}: ${money(s.tipi.online.tot)}\nSettimana prima: ${money(s.settimanaPrima.totale)}\n\nPiù venduti:\n` + s.top.map((p, i) => `${i + 1}. ${p.nome} — ${p.qty}`).join('\n');
+}
+const serateInviate = new Set();
+async function mandaRiepilogoSerata(giorno){
+  if (serateInviate.has(giorno)) return false;
+  serateInviate.add(giorno);
+  try {
+    const s = await serataCompleta(giorno);
+    await sendEmail(ORDER_EMAIL, `Serata ${new Date(giorno + 'T12:00:00').toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric', month: 'long' })} — ${money(s.totale)}`, testoSerata(s), htmlSerata(s));
+    try { const ch = await chiusureArch.get(giorno); if (ch) { ch.mailSerata = new Date().toISOString(); await chiusureArch.save(ch); } } catch (e) {}
+    console.log('Riepilogo serata inviato:', giorno);
+    return true;
+  } catch (e) { serateInviate.delete(giorno); console.error('Errore riepilogo serata:', e); return false; }
+}
+app.get('/api/titolare/serata', soloTitolare, async (req, res) => {
+  try {
+    const giorno = /^\d{4}-\d{2}-\d{2}$/.test(req.query.giorno || '') ? req.query.giorno : giornoServizio();
+    res.json({ ok: true, serata: await serataCompleta(giorno) });
+  } catch (err) { console.error('Errore serata:', err); res.status(500).json({ ok: false, error: 'Errore server' }); }
+});
+app.post('/api/titolare/serata/invia', soloTitolare, async (req, res) => {
+  const giorno = /^\d{4}-\d{2}-\d{2}$/.test((req.body || {}).giorno || '') ? req.body.giorno : giornoServizio();
+  serateInviate.delete(giorno);
+  const ok = await mandaRiepilogoSerata(giorno);
+  res.json({ ok, email: ORDER_EMAIL ? ORDER_EMAIL.replace(/(.{2}).*(@.*)/, '$1…$2') : '' });
 });
 app.get('/api/titolare/chiusure', soloTitolare, async (req, res) => {
   const lista = await chiusureArch.list({}, { giorno: -1 }, 60);
