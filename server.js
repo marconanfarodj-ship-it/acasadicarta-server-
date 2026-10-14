@@ -620,6 +620,8 @@ const CONFIG_BASE = {
   offerte: [],     // [{ id, nome, attiva, tipo: 'percento'|'euro', valore, codice, giorni: [], minimo, scadenza }]
   fedelta: { attiva: false, ogni: 10, premio: 'Una pizza Margherita in omaggio' },
   recensioni: { attiva: false, link: '', dopoOre: 18 },
+  // salse gratuite di panini, hamburger e fritture: le gestisce il titolare
+  salse: ['Ketchup', 'Maionese', 'Salsa Cheddar', 'Salsa Barbecue', 'Salsa Chili', 'Salsa Curry', 'Salsa Rosa', 'Salsa Hamburger', 'Salsa Yogurt', 'Tabasco'],
   stampa: { prezziComanda: true, totaleComanda: true, spazioTraProdotti: true, logo: true,
     intestazioneConto: 'PIZZERIA LA CASA DI CARTA\nVia XX Settembre 192 - Niscemi', piedeConto: 'Grazie e arrivederci!',
     // due stampanti: dove va ogni tipo di stampa (1 = prima, 2 = seconda, 3 = tutte e due)
@@ -665,6 +667,10 @@ function pulisciConfig(inp, attuale){
     if (!d.pagamenti.contanti && !d.pagamenti.carta && !d.pagamenti.online) d.pagamenti.contanti = true; // almeno un modo di pagare
   }
   if (i.sala && typeof i.sala.qrAttivo === 'boolean') c.sala.qrAttivo = i.sala.qrAttivo;
+  if (Array.isArray(i.salse)) {
+    const viste = new Set();
+    c.salse = i.salse.slice(0, 40).map(x => cfgTesto(x, 40, '').replace(/[<>"'`\\]/g, '').trim()).filter(x => x && !viste.has(x.toLowerCase()) && viste.add(x.toLowerCase()));
+  }
   if (Array.isArray(i.camerieri)) {
     const visti = new Set();
     c.camerieri = i.camerieri.slice(0, 30).map(x => {
@@ -4090,7 +4096,7 @@ function gruppiAllergeni(){
   });
   customMenuItemsCache.forEach(i => aggiungi(i.cat, `${i.cat}|${i.nome}`, i.nome, i.descrizione || ''));
   aggiungi('Salse gratuite', 'SALSA|__', '', '');
-  gruppi.find(g => g.cat === 'Salse gratuite').voci = SALSE_GRATIS.map(n => ({ chiave: `SALSA|${n}`, nome: n, desc: '', suggeriti: suggerisciAllergeni('Salse', n, '') }));
+  gruppi.find(g => g.cat === 'Salse gratuite').voci = (Array.isArray(CONFIG.salse) ? CONFIG.salse : SALSE_GRATIS).map(n => ({ chiave: `SALSA|${n}`, nome: n, desc: '', suggeriti: suggerisciAllergeni('Salse', n, '') }));
   gruppi.push({ cat: 'Tipo di pane (Panini e Hamburger)', voci: BREAD_TYPES.map(n => ({ chiave: `PANE|${n}`, nome: n, desc: '', suggeriti: suggerisciAllergeni('Pane', n, '') })) });
   return gruppi;
 }
