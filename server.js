@@ -2709,16 +2709,16 @@ const CAT_PANINI = new Set(['Panini', 'Hamburger', 'Fritture', 'Bevande', 'Extra
 function gruppoRiga(r){ return CAT_PANINI.has(String((r && r.cat) || '').trim()) ? 'panini' : 'pizze'; }
 function stampaComandaCucina(c, diff, primaVolta, rif, ritocca){
   const fai = t => ritocca ? ritocca(t) : t;
-  if (CONFIG.stampa.dividi === false) return stampaStaff(fai(testoComandaCucina(c, diff, primaVolta)), rif);
+  if (CONFIG.stampa.dividi === false) return stampaStaff(fai(testoComandaCucina(c, diff, primaVolta)), rif, 'noi', c._id);
   const parti = ['pizze', 'panini'].map(g => ({ g, d: {
     aggiunte: (diff.aggiunte || []).filter(r => gruppoRiga(r) === g),
     tolte: (diff.tolte || []).filter(r => gruppoRiga(r) === g),
     note: (diff.note || []).filter(r => gruppoRiga(r) === g) } }))
     .filter(p => p.d.aggiunte.length || p.d.tolte.length || p.d.note.length);
-  if (!parti.length) return stampaStaff(fai(testoComandaCucina(c, diff, primaVolta)), rif);
+  if (!parti.length) return stampaStaff(fai(testoComandaCucina(c, diff, primaVolta)), rif, 'noi', c._id);
   parti.forEach((p, i) => {
     const etichetta = (p.g === 'pizze' ? 'PIZZE' : 'PANINI') + (parti.length > 1 ? ` (${i + 1} di ${parti.length})` : '');
-    stampaStaff(fai(testoComandaCucina(c, p.d, primaVolta, etichetta)), `${rif} · ${p.g}`, p.g);
+    stampaStaff(fai(testoComandaCucina(c, p.d, primaVolta, etichetta)), `${rif} · ${p.g}`, p.g, c._id);
   });
 }
 function testoComandaCucina(c, diff, primaVolta, parte){
@@ -2810,8 +2810,8 @@ function selezioneValida(c, voci){
 // Ogni stampa ha un id e resta "in sospeso" finché il tablet che stampa non conferma (/api/stampe/fatta).
 // Se in quel momento il tablet era scollegato, appena torna le recupera da /api/stampe/in-sospeso.
 const stampeMemoria = []; // copia in memoria (serve anche se il database non c'è)
-function stampaStaff(testo, rif, tipo){
-  const job = { id: crypto.randomBytes(8).toString('hex'), testoStampa: testo, rif: rif || '', tipo: tipo || 'noi', creata: new Date(), fatta: null };
+function stampaStaff(testo, rif, tipo, comandaId){
+  const job = { id: crypto.randomBytes(8).toString('hex'), testoStampa: testo, rif: rif || '', tipo: tipo || 'noi', creata: new Date(), fatta: null, comandaId: comandaId || null };
   stampeMemoria.push(job);
   while (stampeMemoria.length > 300) stampeMemoria.shift();
   if (stampeCollection) stampeCollection.insertOne({ ...job, _id: job.id }).catch(() => {});
@@ -3038,13 +3038,23 @@ app.post('/api/staff/comande/:id/riapri', async (req, res) => {
   res.json({ ok: true, comanda: conTotali(c) });
 });
 
-// annulla: se qualcosa era già in cucina, stampa l'avviso di annullamento
+// annulla: non stampa niente; e se qualche scontrino di questa comanda non era ancora uscito, non esce più
+async function annullaStampeComanda(comandaId){
+  const ora = new Date(), ids = new Set();
+  stampeMemoria.forEach(j => { if (j.comandaId === comandaId && !j.fatta) { j.fatta = ora; j.annullata = true; ids.add(j.id); } });
+  if (stampeCollection) {
+    try {
+      const docs = await stampeCollection.find({ comandaId, fatta: null }).toArray();
+      docs.forEach(d => ids.add(d.id || d._id));
+      if (docs.length) await stampeCollection.updateMany({ comandaId, fatta: null }, { $set: { fatta: ora, annullata: true } });
+    } catch (e) {}
+  }
+  ids.forEach(id => broadcastOrder({ evento: 'stampa_confermata', id }));
+}
 app.post('/api/staff/comande/:id/annulla', async (req, res) => {
   const c = await comandaGet(req.params.id);
   if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
-  if (c.invii > 0) {
-    stampaStaff(['================================', etichettaComanda(c), `*** COMANDA ANNULLATA - ore ${oraIT()} ***`, 'Non preparare nulla di questa comanda', '================================'].join('\n'), `Annullata ${etichettaComanda(c)}`);
-  }
+  await annullaStampeComanda(c._id);
   c.stato = 'annullata';
   await comandaSave(c);
   res.json({ ok: true });
