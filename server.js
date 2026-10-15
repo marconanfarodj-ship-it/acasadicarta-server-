@@ -629,7 +629,9 @@ const CONFIG_BASE = {
   stampa: { prezziComanda: true, totaleComanda: true, spazioTraProdotti: true, logo: true,
     intestazioneConto: 'PIZZERIA LA CASA DI CARTA\nVia XX Settembre 192 - Niscemi', piedeConto: 'Grazie e arrivederci!',
     // due stampanti: dove va ogni tipo di stampa (1 = prima, 2 = seconda, 3 = tutte e due)
-    nome1: 'Cucina', nome2: 'Stampante 2', instrada: { sito: 1, noi: 1, banco: 1, conti: 1, cassa: 1 }, stile: {} }
+    nome1: 'Cucina', nome2: 'Stampante 2', instrada: { sito: 1, noi: 1, banco: 1, conti: 1, cassa: 1, pizze: 1, panini: 2 }, stile: {},
+    // comanda con pizze e panini: due scontrini (pizze/focacce/fritture e panini/hamburger/bevande)
+    dividi: true }
 };
 let CONFIG = JSON.parse(JSON.stringify(CONFIG_BASE));
 function cfgNum(v, min, max, def, intero){
@@ -740,7 +742,8 @@ function pulisciConfig(inp, attuale){
     d.piedeConto = cfgTesto(x.piedeConto, 200, d.piedeConto);
     d.nome1 = cfgTesto(x.nome1, 20, d.nome1 || 'Cucina') || 'Cucina';
     d.nome2 = cfgTesto(x.nome2, 20, d.nome2 || 'Stampante 2') || 'Stampante 2';
-    const ins = { sito: 1, noi: 1, banco: 1, conti: 1, cassa: 1, ...(d.instrada || {}) };
+    const ins = { sito: 1, noi: 1, banco: 1, conti: 1, cassa: 1, pizze: 1, panini: 2, ...(d.instrada || {}) };
+    d.dividi = cfgBool(x.dividi, d.dividi !== false);
     if (x.instrada && typeof x.instrada === 'object') Object.keys(ins).forEach(k => { const v = Number(x.instrada[k]); if ([1, 2, 3].includes(v)) ins[k] = v; });
     d.instrada = ins;
     if (x.stile && typeof x.stile === 'object') {
@@ -2635,7 +2638,24 @@ function diffComanda(inviate, righe){
   return { aggiunte, tolte, note };
 }
 
-function testoComandaCucina(c, diff, primaVolta){
+// ===== Comande divise: pizze (con focacce e fritture) da una parte, panini (con hamburger e bevande) dall'altra =====
+const CAT_PANINI = new Set(['Panini', 'Hamburger', 'Bevande', 'Extra']);
+function gruppoRiga(r){ return CAT_PANINI.has(String((r && r.cat) || '').trim()) ? 'panini' : 'pizze'; }
+function stampaComandaCucina(c, diff, primaVolta, rif, ritocca){
+  const fai = t => ritocca ? ritocca(t) : t;
+  if (CONFIG.stampa.dividi === false) return stampaStaff(fai(testoComandaCucina(c, diff, primaVolta)), rif);
+  const parti = ['pizze', 'panini'].map(g => ({ g, d: {
+    aggiunte: (diff.aggiunte || []).filter(r => gruppoRiga(r) === g),
+    tolte: (diff.tolte || []).filter(r => gruppoRiga(r) === g),
+    note: (diff.note || []).filter(r => gruppoRiga(r) === g) } }))
+    .filter(p => p.d.aggiunte.length || p.d.tolte.length || p.d.note.length);
+  if (!parti.length) return stampaStaff(fai(testoComandaCucina(c, diff, primaVolta)), rif);
+  parti.forEach((p, i) => {
+    const etichetta = (p.g === 'pizze' ? 'PIZZE' : 'PANINI') + (parti.length > 1 ? ` (${i + 1} di ${parti.length})` : '');
+    stampaStaff(fai(testoComandaCucina(c, p.d, primaVolta, etichetta)), `${rif} · ${p.g}`, p.g);
+  });
+}
+function testoComandaCucina(c, diff, primaVolta, parte){
   const L = [];
   L.push('================================');
   L.push(etichettaComanda(c));
@@ -2644,6 +2664,7 @@ function testoComandaCucina(c, diff, primaVolta){
   if (c.telefono && c.tipo !== 'tavolo') L.push(`Tel: ${c.telefono}`);
   if (c.orario) L.push(`Per le ore: ${c.orario}`);
   L.push(primaVolta ? `NUOVA COMANDA - ore ${oraIT()}` : `*** MODIFICA n.${c.invii} - ore ${oraIT()} ***`);
+  if (parte) L.push(`>>> ${parte} <<<`);
   L.push('================================');
   if (diff.aggiunte.length){
     if (!primaVolta) L.push('AGGIUNGERE:');
@@ -2843,7 +2864,7 @@ app.post('/api/staff/comande/:id/invia', async (req, res) => {
   c.invii += 1;
   if ((req.body || {}).cameriere) { c.ultimoCameriere = String(req.body.cameriere).slice(0, 30); if (!c.cameriere) c.cameriere = c.ultimoCameriere; }
   const senzaStampa = !!(req.body || {}).senzaStampa; // "salva senza stampare": segna come già in cucina, niente scontrino
-  if (!senzaStampa) stampaStaff(testoComandaCucina(c, diff, primaVolta), `${etichettaComanda(c)} #${c.invii}`);
+  if (!senzaStampa) stampaComandaCucina(c, diff, primaVolta, `${etichettaComanda(c)} #${c.invii}`);
   else c.salvateSenzaStampa = (c.salvateSenzaStampa || 0) + 1;
   c.inviate = c.righe.map(r => ({ ...r }));
   c.ultimoInvio = new Date().toISOString();
@@ -2864,9 +2885,8 @@ app.post('/api/staff/comande/:id/ristampa', async (req, res) => {
   const c = await comandaGet(req.params.id);
   if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
   if (!c.invii) return res.status(400).json({ ok: false, error: 'Non è ancora stata mandata in cucina' });
-  const testo = testoComandaCucina(c, { aggiunte: c.inviate || [], tolte: [], note: [] }, true)
-    .replace(/NUOVA COMANDA - ore/, 'RISTAMPA COMPLETA - ore');
-  stampaStaff(testo, `Ristampa ${etichettaComanda(c)}`);
+  stampaComandaCucina(c, { aggiunte: c.inviate || [], tolte: [], note: [] }, true, `Ristampa ${etichettaComanda(c)}`,
+    t => t.replace(/NUOVA COMANDA - ore/, 'RISTAMPA COMPLETA - ore'));
   res.json({ ok: true });
 });
 
