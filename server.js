@@ -1012,9 +1012,11 @@ function broadcastOrder(order) {
 
 // Un "battito" ogni 25 secondi: tiene viva la connessione attraverso eventuali proxy/timeout
 // di rete, ed evita che il pannello resti "appeso" senza accorgersi che la linea è caduta.
+// Al pannello di stampa il battito arriva come messaggio vero ({"evento":"ping"}): così si accorge se la linea
+// è morta anche quando il browser la crede aperta, e si ricollega da solo. A Jarvis resta il battito "muto".
 setInterval(() => {
   printClients = printClients.filter(res => {
-    try { res.write(': ping\n\n'); return true; }
+    try { res.write(res.soloAvvisi ? ': ping\n\n' : 'data: {"evento":"ping"}\n\n'); return true; }
     catch (e) { return false; }
   });
 }, 25000);
@@ -1307,10 +1309,10 @@ async function finalizeOrder(order, customerId){
   order.ricevutoAlle = new Date().toISOString();
   order.stato = 'da_preparare';
   order.metodoPagamento = order.pagatoOnline ? 'online' : null; // 'online' | 'contanti' | 'bancomat' | null (da registrare)
-  // se un pannello di stampa è collegato riceve l'ordine adesso e lo stampa subito: lo segniamo già come stampato,
-  // così non viene ristampato quando il pannello si ricollega e Jarvis non dà falsi allarmi.
-  // Se nessun pannello è collegato resta false e il pannello lo recupera appena si riapre.
-  order.stampato = pannelliStampa() > 0;
+  // l'ordine risulta stampato solo quando il pannello conferma che è uscito davvero (POST /api/orders/segna-stampato).
+  // Prima veniva segnato stampato appena c'era un pannello collegato: se la linea del tablet era caduta
+  // senza che il server se ne accorgesse, l'ordine non usciva e non veniva più recuperato.
+  order.stampato = false;
   // ordine "per le 21:00" fatto con largo anticipo: subito esce solo un avviso, la comanda completa 20 minuti prima
   {
     const quando = orarioProgrammato(order);
@@ -4948,6 +4950,28 @@ app.post('/api/backup/invia', soloTitolare, async (req, res) => {
 app.get('/api/backup/stato', soloTitolare, async (req, res) => {
   const doc = settingsCollection ? await settingsCollection.findOne({ _id: 'ultimoBackup' }).catch(() => null) : null;
   res.json({ ok: true, ultimo: doc ? doc.value : null, kb: doc ? doc.kb : null, email: ORDER_EMAIL, ogniGiorni: BACKUP_GIORNI });
+});
+
+// ---------- "Segnala un problema" dall'app Android ----------
+// L'app manda locale, tablet, versione, ultimi errori e stato delle stampanti: si salva e arriva per email.
+const segnalazioniPerIp = new Map();
+app.post('/api/segnalazioni', async (req, res) => {
+  const ip = req.ip || 'x', ora = Date.now();
+  const recenti = (segnalazioniPerIp.get(ip) || []).filter(t => ora - t < 10 * 60 * 1000);
+  if (recenti.length >= 5) return res.status(429).json({ ok: false, error: 'Troppe segnalazioni: riprova tra qualche minuto' });
+  recenti.push(ora); segnalazioniPerIp.set(ip, recenti);
+  const b = req.body || {};
+  const t = (v, n) => String(v == null ? '' : (typeof v === 'string' ? v : JSON.stringify(v))).slice(0, n);
+  const doc = { creata: new Date().toISOString(), locale: t(b.locale, 120), dispositivo: t(b.dispositivo, 200), versione: t(b.versione, 60),
+    nota: t(b.nota, 3000), stampanti: t(b.stampanti, 4000), errori: t(b.errori, 10000), registro: t(b.registro, 30000) };
+  try { if (db) await db.collection('segnalazioni').insertOne({ ...doc }); } catch (e) { console.error('Errore salvataggio segnalazione:', e.message); }
+  let stampanti = doc.stampanti;
+  try { const s = JSON.parse(doc.stampanti); stampanti = `Xprinter ${s.ipXprinter}: ${s.xprinterOk ? 'ok' : 'NON risponde ' + (s.xprinterErrore || '')}\nEpson ${s.ipEpson}: ${s.epsonOk ? 'ok' : 'NON risponde ' + (s.epsonErrore || '')}\nPonte di stampa: ${s.ponte ? 'attivo' : 'FERMO ' + (s.ponteErrore || '')}\nTablet nel Wi-Fi: ${s.ipTablet}`; } catch (e) {}
+  const testo = `Segnalazione dall'app\n\nLocale: ${doc.locale}\nTablet: ${doc.dispositivo}\nVersione: ${doc.versione}\nQuando: ${new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rome' })}\n\n` +
+    `COSA È SUCCESSO:\n${doc.nota || '(nessuna nota)'}\n\nSTAMPANTI:\n${stampanti}\n\nULTIMI ERRORI:\n${doc.errori || '(nessuno)'}\n\nULTIMI EVENTI:\n${doc.registro}`;
+  console.log(`Segnalazione da ${doc.locale} (${doc.dispositivo})`);
+  sendEmail(ORDER_EMAIL, `🛟 Segnalazione app — ${doc.locale || 'locale'} — ${doc.nota.slice(0, 60) || doc.dispositivo}`, testo);
+  res.json({ ok: true });
 });
 
 app.listen(PORT, () => {
