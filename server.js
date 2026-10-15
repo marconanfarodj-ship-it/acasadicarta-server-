@@ -630,7 +630,7 @@ const CONFIG_BASE = {
     intestazioneConto: 'PIZZERIA LA CASA DI CARTA\nVia XX Settembre 192 - Niscemi', piedeConto: 'Grazie e arrivederci!',
     // due stampanti: dove va ogni tipo di stampa (1 = prima, 2 = seconda, 3 = tutte e due)
     nome1: 'Cucina', nome2: 'Stampante 2', instrada: { sito: 1, noi: 1, banco: 1, conti: 1, cassa: 1, pizze: 1, panini: 2 }, stile: {},
-    // comanda con pizze e panini: due scontrini (pizze/focacce/fritture e panini/hamburger/bevande)
+    // comanda con pizze e panini: due scontrini (pizze/focacce e panini/hamburger/fritture/bevande)
     dividi: true }
 };
 let CONFIG = JSON.parse(JSON.stringify(CONFIG_BASE));
@@ -2639,7 +2639,7 @@ function diffComanda(inviate, righe){
 }
 
 // ===== Comande divise: pizze (con focacce e fritture) da una parte, panini (con hamburger e bevande) dall'altra =====
-const CAT_PANINI = new Set(['Panini', 'Hamburger', 'Bevande', 'Extra']);
+const CAT_PANINI = new Set(['Panini', 'Hamburger', 'Fritture', 'Bevande', 'Extra']);
 function gruppoRiga(r){ return CAT_PANINI.has(String((r && r.cat) || '').trim()) ? 'panini' : 'pizze'; }
 function stampaComandaCucina(c, diff, primaVolta, rif, ritocca){
   const fai = t => ritocca ? ritocca(t) : t;
