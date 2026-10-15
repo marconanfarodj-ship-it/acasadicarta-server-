@@ -1244,6 +1244,61 @@ async function assignDeliverySlotIfNeeded(order){
 // Prende un ordine già "pronto" (slot assegnato se serve) e lo finalizza:
 // numero ordine, storico, stampa in cucina, email. Usata sia dal checkout
 // diretto (pagamento a consegna) sia dal webhook Stripe (pagamento online).
+// ===== ORDINI PROGRAMMATI: la comanda completa esce 20 minuti prima dell'orario scelto =====
+function orarioProgrammato(order){
+  if (!order || order.timing !== 'orario' || !/^\d{1,2}:\d{2}$/.test(order.orarioRichiesto || '')) return null;
+  const giorno = /^\d{4}-\d{2}-\d{2}$/.test(order.dataRichiesta || '') ? order.dataRichiesta : dateKey(new Date());
+  const d = new Date(`${giorno}T${String(order.orarioRichiesto).padStart(5, '0')}:00`);
+  return isNaN(d) ? null : d;
+}
+function catDiNome(nome){
+  const n = String(nome || '').trim();
+  const g = MENU_CATALOG.find(x => !String(x.keyPrefix).startsWith('EXTRA_') && x.items.includes(n));
+  if (g) return g.cat;
+  const c = (customMenuItemsCache || []).find(x => x.nome === n);
+  return c ? c.cat : '';
+}
+function testoProgrammato(o, articoli, parte){
+  const L = ['================================', '*** DA PREPARARE ORA ***', `ORDINE ONLINE #${o.numeroOrdine}`,
+    o.modalita === 'consegna' ? 'CONSEGNA A DOMICILIO' : 'RITIRO IN SEDE',
+    `PER LE ORE: ${String(o.orarioRichiesto || '').padStart(5, '0')}`];
+  if (o.name || o.nome) L.push(`Cliente: ${o.name || [o.nome, o.cognome].filter(Boolean).join(' ')}`);
+  if (o.phone) L.push(`Tel: ${o.phone}`);
+  if (o.modalita === 'consegna' && o.address) L.push(`Indirizzo: ${o.address}`);
+  if (parte) L.push(`>>> ${parte} <<<`);
+  L.push('================================');
+  articoli.forEach((a, i) => {
+    if (i && CONFIG.stampa.spazioTraProdotti) L.push('');
+    L.push(CONFIG.stampa.prezziComanda ? rigaPrezzo(`${a.qty}x ${a.nome}`, Number(a.prezzo) || 0) : `${a.qty}x ${a.nome}`);
+    (a.dettagli || []).filter(d => !/panino\s+classico/i.test(d)).forEach(d => L.push(`   ${d}`));
+  });
+  if (o.note) { L.push(''); L.push(`NOTE: ${o.note}`); }
+  if (CONFIG.stampa.totaleComanda) { L.push('--------------------------------'); L.push(rigaPrezzo('TOTALE', Number(o.grandTotal) || 0)); }
+  L.push(o.pagatoOnline ? 'PAGATO ONLINE' : 'DA PAGARE');
+  L.push('================================');
+  return L.join('\n');
+}
+async function stampaProgrammati(){
+  const ora = Date.now();
+  let lista = [];
+  if (ordersCollection) {
+    try {
+      lista = await ordersCollection.find({ programmato: true, promemoriaFatto: { $ne: true },
+        programmatoPer: { $lte: new Date(ora + 20 * 60000).toISOString(), $gte: new Date(ora - 3 * 3600000).toISOString() } }).limit(30).toArray();
+    } catch (e) { console.error('Errore ordini programmati:', e); }
+  } else lista = orderHistory.filter(o => o.programmato && !o.promemoriaFatto && Date.parse(o.programmatoPer) <= ora + 20 * 60000 && Date.parse(o.programmatoPer) >= ora - 3 * 3600000);
+  for (const o of lista) {
+    const mem = orderHistory.find(x => x.numeroOrdine === o.numeroOrdine && x.ricevutoAlle === o.ricevutoAlle); if (mem) mem.promemoriaFatto = true;
+    if (ordersCollection) await ordersCollection.updateOne(filtroOrdine(o), { $set: { promemoriaFatto: true } }).catch(() => {});
+    const art = o.articoli || [];
+    const rif = `Ordine #${o.numeroOrdine} per le ${o.orarioRichiesto}`;
+    if (CONFIG.stampa.dividi === false) { stampaStaff(testoProgrammato(o, art), rif, 'sito'); continue; }
+    const parti = ['pizze', 'panini'].map(g => ({ g, a: art.filter(x => gruppoRiga({ cat: catDiNome(x.nome) }) === g) })).filter(p => p.a.length);
+    parti.forEach((p, i) => stampaStaff(testoProgrammato(o, p.a, (p.g === 'pizze' ? 'PIZZE' : 'PANINI') + (parti.length > 1 ? ` (${i + 1} di ${parti.length})` : '')), `${rif} · ${p.g}`, p.g));
+  }
+}
+setInterval(() => stampaProgrammati().catch(() => {}), 60 * 1000);
+
 async function finalizeOrder(order, customerId){
   await storicoPronto;   // il numero d'ordine si assegna solo dopo aver ripreso la numerazione
   order.numeroOrdine = ++orderCounter;
@@ -1254,6 +1309,13 @@ async function finalizeOrder(order, customerId){
   // così non viene ristampato quando il pannello si ricollega e Jarvis non dà falsi allarmi.
   // Se nessun pannello è collegato resta false e il pannello lo recupera appena si riapre.
   order.stampato = pannelliStampa() > 0;
+  // ordine "per le 21:00" fatto con largo anticipo: subito esce solo un avviso, la comanda completa 20 minuti prima
+  {
+    const quando = orarioProgrammato(order);
+    if (quando && quando.getTime() - Date.now() > 40 * 60 * 1000) {
+      order.programmato = true; order.programmatoPer = quando.toISOString(); order.promemoriaFatto = false;
+    }
+  }
   order.phoneNormalized = normalizePhone(order.phone);
   order.addressNormalized = normalizeAddress(order.address);
   if (CONFIG.fedelta.attiva && order.phoneNormalized) {
@@ -1675,7 +1737,11 @@ app.get('/api/orders/:numeroOrdine/pubblico', async (req, res) => {
     numeroOrdine: order.numeroOrdine,
     modalita: order.modalita,
     address: order.modalita === 'consegna' ? order.address : null,
-    stato: order.stato || 'da_preparare'
+    stato: order.stato || 'da_preparare',
+    orarioLabel: order.orarioLabel || '',
+    ricevutoAlle: order.ricevutoAlle || null,
+    prontoAlle: order.prontoAlle || null,
+    inConsegnaAlle: order.inConsegnaAlle || null
   });
 });
 
@@ -4461,12 +4527,13 @@ async function serataCompleta(giorno){
     ? await ordersCollection.find({ ricevutoAlle: { $gte: dal, $lt: al } }, { projection: { articoli: 1 } }).toArray()
     : orderHistory.filter(o => o.ricevutoAlle >= dal && o.ricevutoAlle < al);
   ordini.forEach(o => (o.articoli || []).forEach(a => conta(a.nome, a.qty, a.prezzo)));
-  const top = [...piatti.values()].sort((a, b) => b.qty - a.qty || b.tot - a.tot).slice(0, 10).map(v => ({ ...v, tot: round2(v.tot) }));
+  const tuttiPiatti = [...piatti.values()].sort((a, b) => b.qty - a.qty || b.tot - a.tot).map(v => ({ ...v, tot: round2(v.tot) }));
+  const top = tuttiPiatti.slice(0, 10);
   const pezzi = [...piatti.values()].reduce((t, v) => t + v.qty, 0);
   const gPrima = giornoAggiunto(giorno, -7);
   const prima = await riepilogoGiornata(gPrima);
   Object.values(tipi).forEach(v => { v.tot = round2(v.tot); });
-  return { ...r, tipi, top, pezzi, scontrinoMedio: (() => { const n = tipi.tavolo.n + tipi.asporto.n + tipi.consegna.n + tipi.online.n; return n ? round2(r.totale / n) : 0; })(),
+  return { ...r, tipi, top, piatti: tuttiPiatti, pezzi, scontrinoMedio: (() => { const n = tipi.tavolo.n + tipi.asporto.n + tipi.consegna.n + tipi.online.n; return n ? round2(r.totale / n) : 0; })(),
     settimanaPrima: { giorno: gPrima, totale: prima.totale, differenza: round2(r.totale - prima.totale), percento: prima.totale ? Math.round((r.totale - prima.totale) / prima.totale * 100) : null } };
 }
 function htmlSerata(s){
@@ -4521,6 +4588,97 @@ app.post('/api/titolare/serata/invia', soloTitolare, async (req, res) => {
   serateInviate.delete(giorno);
   const ok = await mandaRiepilogoSerata(giorno);
   res.json({ ok, email: ORDER_EMAIL ? ORDER_EMAIL.replace(/(.{2}).*(@.*)/, '$1…$2') : '' });
+});
+// ===== RIEPILOGO SETTIMANALE (mail il lunedì mattina) =====
+function lunediDi(giorno){ const d = new Date(giorno + 'T12:00:00'); const g = (d.getDay() + 6) % 7; d.setDate(d.getDate() - g); return dateKey(d); }
+async function settimanaCompleta(lunedi){
+  const giorni = Array.from({ length: 7 }, (_, i) => giornoAggiunto(lunedi, i));
+  const serate = [];
+  for (const g of giorni) serate.push(await serataCompleta(g));
+  const prima = [];
+  for (const g of giorni) prima.push((await riepilogoGiornata(giornoAggiunto(g, -7))).totale);
+  const totale = round2(serate.reduce((t, x) => t + x.totale, 0)), totalePrima = round2(prima.reduce((t, x) => t + x, 0));
+  const tipi = { tavolo: { n: 0, tot: 0 }, asporto: { n: 0, tot: 0 }, consegna: { n: 0, tot: 0 }, online: { n: 0, tot: 0 } };
+  const piatti = new Map();
+  serate.forEach(x => {
+    Object.keys(tipi).forEach(k => { tipi[k].n += x.tipi[k].n; tipi[k].tot += x.tipi[k].tot; });
+    (x.piatti || x.top).forEach(p => { const v = piatti.get(p.nome) || { nome: p.nome, qty: 0, tot: 0 }; v.qty += p.qty; v.tot += p.tot; piatti.set(p.nome, v); });
+  });
+  Object.values(tipi).forEach(v => { v.tot = round2(v.tot); });
+  // ore più piene: comande aperte e ordini online arrivati, per fascia oraria
+  const ore = {};
+  const dal = new Date(lunedi + 'T05:00:00').toISOString(), al = new Date(giornoAggiunto(lunedi, 7) + 'T05:00:00').toISOString();
+  const conta = iso => { if (!iso) return; const h = new Date(iso).getHours(); ore[h] = (ore[h] || 0) + 1; };
+  for (const g of giorni) (await comandeList({ stato: 'chiusa', giorno: g }, 20000)).forEach(c => conta(c.creataAlle));
+  const ordini = ordersCollection
+    ? await ordersCollection.find({ ricevutoAlle: { $gte: dal, $lt: al } }, { projection: { ricevutoAlle: 1 } }).toArray()
+    : orderHistory.filter(o => o.ricevutoAlle >= dal && o.ricevutoAlle < al);
+  ordini.forEach(o => conta(o.ricevutoAlle));
+  const oreTop = Object.entries(ore).map(([h, n]) => ({ ora: +h, n })).sort((a, b) => b.n - a.n).slice(0, 4);
+  const tutti = [...piatti.values()].map(v => ({ ...v, tot: round2(v.tot) })).sort((a, b) => b.qty - a.qty);
+  const nTot = tipi.tavolo.n + tipi.asporto.n + tipi.consegna.n + tipi.online.n;
+  const migliore = serate.reduce((m, x) => x.totale > (m ? m.totale : -1) ? x : m, null);
+  return { lunedi, domenica: giorni[6], totale, totalePrima, differenza: round2(totale - totalePrima), percento: totalePrima ? Math.round((totale - totalePrima) / totalePrima * 100) : null,
+    giorni: serate.map((x, i) => ({ giorno: x.giorno, totale: x.totale, prima: prima[i] })), tipi, scontrinoMedio: nTot ? round2(totale / nTot) : 0,
+    oreTop, top: tutti.slice(0, 10), menoVenduti: tutti.filter(v => v.qty > 0).slice(-5).reverse(), migliore: migliore && migliore.totale > 0 ? { giorno: migliore.giorno, totale: migliore.totale } : null };
+}
+function htmlSettimana(w){
+  const gg = d => new Date(d + 'T12:00:00').toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric', month: 'long' });
+  const riga = (a, b, forte) => `<tr><td style="padding:7px 0;border-bottom:1px solid #eee;color:#333;${forte ? 'font-weight:700;' : ''}">${a}</td><td style="padding:7px 0;border-bottom:1px solid #eee;text-align:right;${forte ? 'font-weight:800;' : ''}">${b}</td></tr>`;
+  const conf = w.totalePrima ? `${w.differenza >= 0 ? '▲' : '▼'} ${money(Math.abs(w.differenza))}${w.percento !== null ? ` (${w.percento >= 0 ? '+' : ''}${w.percento}%)` : ''} rispetto alla settimana prima (${money(w.totalePrima)})` : 'Nessun dato della settimana prima';
+  const max = Math.max(1, ...w.giorni.map(g => g.totale));
+  const barre = w.giorni.map(g => `<tr><td style="padding:4px 0;width:90px;color:#555;font-size:14px;text-transform:capitalize;">${new Date(g.giorno + 'T12:00:00').toLocaleDateString('it-IT', { weekday: 'short', day: 'numeric' })}</td><td style="padding:4px 6px;width:100%;"><div style="background:#c1382b;height:14px;border-radius:7px;width:${Math.max(2, Math.round(g.totale / max * 100))}%;"></div></td><td style="padding:4px 0;text-align:right;font-size:14px;white-space:nowrap;">${money(g.totale)}</td></tr>`).join('');
+  return `<!DOCTYPE html><html lang="it"><body style="margin:0;background:#f4f1ee;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="padding:20px 0;"><tr><td align="center">
+<table width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#fff;border-radius:18px;overflow:hidden;">
+<tr><td style="background:linear-gradient(135deg,#c1382b,#7a1f16);padding:24px;text-align:center;color:#fff;">
+<div style="font-size:14px;opacity:.85;">Settimana dal ${gg(w.lunedi)} a ${gg(w.domenica)}</div>
+<div style="font-size:34px;font-weight:800;margin-top:4px;">${money(w.totale)}</div>
+<div style="font-size:14px;margin-top:6px;">${conf}</div></td></tr>
+<tr><td style="padding:18px 22px;">
+<div style="font-weight:800;color:#7a1f16;margin-bottom:6px;">Giorno per giorno</div>
+<table width="100%" cellpadding="0" cellspacing="0">${barre}</table>
+${w.migliore ? `<p style="font-size:14px;color:#555;margin:8px 0 0;">Serata migliore: <b style="text-transform:capitalize;">${gg(w.migliore.giorno)}</b> con ${money(w.migliore.totale)}</p>` : ''}
+<div style="font-weight:800;color:#7a1f16;margin:16px 0 6px;">Da dove arrivano</div>
+<table width="100%" cellpadding="0" cellspacing="0" style="font-size:15px;">
+${riga(`🍽️ Tavoli (${w.tipi.tavolo.n})`, money(w.tipi.tavolo.tot))}${riga(`🏠 Asporto (${w.tipi.asporto.n})`, money(w.tipi.asporto.tot))}${riga(`🛵 Consegne (${w.tipi.consegna.n})`, money(w.tipi.consegna.tot))}${riga(`🌐 Online (${w.tipi.online.n})`, money(w.tipi.online.tot))}${riga('Scontrino medio', money(w.scontrinoMedio), true)}</table>
+${w.oreTop.length ? `<div style="font-weight:800;color:#7a1f16;margin:16px 0 6px;">Ore più piene</div><table width="100%" cellpadding="0" cellspacing="0" style="font-size:15px;">${w.oreTop.map(o => riga(`${String(o.ora).padStart(2, '0')}:00 – ${String((o.ora + 1) % 24).padStart(2, '0')}:00`, `${o.n} ordini e tavoli`)).join('')}</table>` : ''}
+<div style="font-weight:800;color:#7a1f16;margin:16px 0 6px;">Più venduti</div>
+<table width="100%" cellpadding="0" cellspacing="0" style="font-size:15px;">${w.top.map((p, i) => riga(`${i + 1}. ${p.nome}`, `${p.qty} pz · ${money(p.tot)}`)).join('') || riga('Nessuna vendita', '')}</table>
+${w.menoVenduti.length ? `<div style="font-weight:800;color:#7a1f16;margin:16px 0 6px;">Meno venduti (tra quelli usciti)</div><table width="100%" cellpadding="0" cellspacing="0" style="font-size:15px;">${w.menoVenduti.map(p => riga(p.nome, `${p.qty} pz`)).join('')}</table>` : ''}
+</td></tr></table></td></tr></table></body></html>`;
+}
+function testoSettimana(w){
+  return `SETTIMANA ${w.lunedi} - ${w.domenica}\nTotale: ${money(w.totale)} (settimana prima ${money(w.totalePrima)})\n` + w.giorni.map(g => `${g.giorno}: ${money(g.totale)}`).join('\n') + '\n\nPiù venduti:\n' + w.top.map((p, i) => `${i + 1}. ${p.nome} — ${p.qty}`).join('\n');
+}
+const settimaneArch = archivio('riepiloghiSettimana');
+async function mandaRiepilogoSettimana(lunedi, forza){
+  if (!forza && await settimaneArch.get(lunedi)) return false;
+  const w = await settimanaCompleta(lunedi);
+  await sendEmail(ORDER_EMAIL, `Settimana ${new Date(lunedi + 'T12:00:00').toLocaleDateString('it-IT', { day: 'numeric', month: 'long' })} – ${new Date(w.domenica + 'T12:00:00').toLocaleDateString('it-IT', { day: 'numeric', month: 'long' })}: ${money(w.totale)}`, testoSettimana(w), htmlSettimana(w));
+  await settimaneArch.save({ _id: lunedi, inviataAlle: new Date().toISOString() });
+  console.log('Riepilogo settimanale inviato:', lunedi);
+  return true;
+}
+// ogni lunedì alle 10: la settimana appena finita (lunedì–domenica)
+setInterval(() => {
+  const now = new Date();
+  if (now.getDay() !== 1 || now.getHours() !== 10) return;
+  mandaRiepilogoSettimana(giornoAggiunto(lunediDi(dateKey(now)), -7)).catch(e => console.error('Errore riepilogo settimanale:', e));
+}, 5 * 60 * 1000);
+app.get('/api/titolare/settimana', soloTitolare, async (req, res) => {
+  try {
+    const lunedi = /^\d{4}-\d{2}-\d{2}$/.test(req.query.lunedi || '') ? lunediDi(req.query.lunedi) : giornoAggiunto(lunediDi(giornoServizio()), -7);
+    res.json({ ok: true, settimana: await settimanaCompleta(lunedi) });
+  } catch (err) { console.error('Errore settimana:', err); res.status(500).json({ ok: false, error: 'Errore server' }); }
+});
+app.post('/api/titolare/settimana/invia', soloTitolare, async (req, res) => {
+  try {
+    const l = (req.body || {}).lunedi;
+    const lunedi = /^\d{4}-\d{2}-\d{2}$/.test(l || '') ? lunediDi(l) : giornoAggiunto(lunediDi(giornoServizio()), -7);
+    const ok = await mandaRiepilogoSettimana(lunedi, true);
+    res.json({ ok, lunedi });
+  } catch (err) { console.error('Errore invio settimana:', err); res.status(500).json({ ok: false, error: 'Errore server' }); }
 });
 app.get('/api/titolare/chiusure', soloTitolare, async (req, res) => {
   const lista = await chiusureArch.list({}, { giorno: -1 }, 60);
