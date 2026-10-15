@@ -68,6 +68,8 @@ const ROTTE_STAFF = [
   ['*',    /^\/api\/(prenotazioni|clienti|scorte)(\/|$)/],
   ['GET',  /^\/api\/tavolo\/richieste\/?$/],
   ['POST', /^\/api\/tavolo\/richieste\/[^/]+\/[^/]+\/?$/],
+  ['GET',  /^\/api\/tavolo\/chiamate\/?$/],
+  ['POST', /^\/api\/tavolo\/chiamate\/[^/]+\/presa\/?$/],
   ['GET',  /^\/api\/daily-report\/test\/?$/]
 ];
 function haAccessoStaff(req){
@@ -3908,6 +3910,74 @@ app.post('/api/tavolo/richieste/:id/:azione', async (req, res) => {
     broadcastOrder({ evento: 'richiesta_tavolo', tavolo: r.tavolo, id: q._id });
   }
   res.json({ ok: true, comanda: conTotali(c) });
+});
+
+// ===== DAL TAVOLO: stato dell'ordine per i clienti e "chiama il cameriere" =====
+// stato della comanda del tavolo, visto dal telefono del cliente (niente prezzi né dati personali)
+app.get('/api/tavolo/:tavolo/stato', async (req, res) => {
+  try {
+    let tavolo = String(req.params.tavolo || '').trim().slice(0, 10);
+    const gruppo = String(req.query.gruppo || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8);
+    if ((!tavolo || tavolo === '-') && gruppo) tavolo = await tavoloDelGruppo(gruppo);
+    const da = new Date(Date.now() - 4 * 3600 * 1000).toISOString();
+    const inAttesa = tavolo ? (await richiesteArch.list({ tavolo, stato: 'attesa', creataAlle: { $gte: da } }, null, 20)).length
+      : (gruppo ? (await richiesteArch.list({ gruppo, stato: 'attesa', creataAlle: { $gte: da } }, null, 20)).length : 0);
+    const c = tavolo ? (await comandeList({ stato: 'aperta' })).find(x => x.tipo === 'tavolo' && x.tavolo === tavolo) : null;
+    let stato = 'nessuno';
+    if (inAttesa) stato = 'da_confermare';
+    else if (c) {
+      const daMandare = diffComanda(c.inviate, c.righe);
+      const servito = c.servitoAlle && c.ultimoInvio && c.servitoAlle >= c.ultimoInvio;
+      if (daMandare.aggiunte.length && !servito && !c.invii) stato = 'confermato';
+      else if (c.invii && !servito) stato = 'in_preparazione';
+      else if (servito) stato = 'servito';
+      else stato = 'confermato';
+    }
+    // ultima chiamata di questo tavolo: aperta, oppure presa da un cameriere negli ultimi 5 minuti
+    const chiamata = [...chiamateTavolo].reverse().find(x => ((tavolo && x.tavolo === tavolo) || (gruppo && x.gruppo === gruppo))
+      && (!x.gestita || Date.now() - new Date(x.presaAlle).getTime() < 5 * 60 * 1000));
+    res.json({ ok: true, tavolo, stato, minuti: c && c.ultimoInvio ? Math.max(0, Math.round((Date.now() - new Date(c.ultimoInvio).getTime()) / 60000)) : null,
+      piatti: c ? (c.righe || []).map(r => ({ nome: r.nome, qty: r.qty })) : [], chiamata: chiamata ? { motivo: chiamata.motivo, presa: !!chiamata.gestita, presaDa: chiamata.presaDa || '' } : null });
+  } catch (e) { console.error(e); res.status(500).json({ ok: false, error: 'Errore' }); }
+});
+// chiamate dal tavolo: restano in memoria finché un cameriere non tocca "Vado io"
+const chiamateTavolo = [];
+const tentativiChiamata = new Map();
+const MOTIVI_CHIAMATA = { cameriere: 'chiama il cameriere', conto: 'chiede il conto', acqua: 'chiede da bere', aiuto: 'ha bisogno di aiuto' };
+app.post('/api/tavolo/chiama', async (req, res) => {
+  const b = req.body || {};
+  let tavolo = String(b.tavolo || '').trim().slice(0, 10);
+  const gruppo = String(b.gruppo || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8);
+  if (!tavolo && gruppo) tavolo = await tavoloDelGruppo(gruppo);
+  if (!tavolo && !gruppo) return res.status(400).json({ ok: false, error: 'Tavolo mancante' });
+  const motivo = MOTIVI_CHIAMATA[b.motivo] ? b.motivo : 'cameriere';
+  const ip = req.ip || 'x', ora = Date.now();
+  const t = tentativiChiamata.get(ip) || [];
+  const recenti = t.filter(x => ora - x < 10 * 60 * 1000);
+  if (recenti.length && ora - recenti[recenti.length - 1] < 45 * 1000) return res.json({ ok: true, gia: true }); // tocchi ripetuti: una sola chiamata
+  if (recenti.length >= 6) return res.status(429).json({ ok: false, error: 'Hai già chiamato: il cameriere sta arrivando.' });
+  recenti.push(ora); tentativiChiamata.set(ip, recenti);
+  // se c'è già una chiamata aperta per quel tavolo si aggiorna quella
+  let ch = chiamateTavolo.find(x => !x.gestita && ((tavolo && x.tavolo === tavolo) || (gruppo && x.gruppo === gruppo)));
+  if (ch) { ch.motivo = motivo; ch.ora = new Date().toISOString(); ch.volte = (ch.volte || 1) + 1; }
+  else {
+    ch = { id: crypto.randomBytes(6).toString('hex'), tavolo, gruppo, motivo, nome: String(b.nome || '').slice(0, 30), ora: new Date().toISOString(), volte: 1, gestita: false };
+    chiamateTavolo.push(ch);
+    while (chiamateTavolo.length > 200) chiamateTavolo.shift();
+  }
+  broadcastOrder({ evento: 'chiamata_tavolo', ...ch, testo: MOTIVI_CHIAMATA[motivo] });
+  res.json({ ok: true });
+});
+app.get('/api/tavolo/chiamate', (req, res) => {
+  const da = Date.now() - 2 * 3600 * 1000;
+  res.json({ ok: true, chiamate: chiamateTavolo.filter(x => !x.gestita && new Date(x.ora).getTime() > da).map(x => ({ ...x, testo: MOTIVI_CHIAMATA[x.motivo] })) });
+});
+app.post('/api/tavolo/chiamate/:id/presa', (req, res) => {
+  const ch = chiamateTavolo.find(x => x.id === req.params.id);
+  if (!ch) return res.status(404).json({ ok: false, error: 'Chiamata non trovata' });
+  ch.gestita = true; ch.presaDa = String((req.body || {}).cameriere || '').slice(0, 30); ch.presaAlle = new Date().toISOString();
+  broadcastOrder({ evento: 'chiamata_presa', id: ch.id, tavolo: ch.tavolo });
+  res.json({ ok: true });
 });
 
 // ===== OFFERTE: verifica di un codice sconto dal sito =====
