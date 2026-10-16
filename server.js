@@ -5120,7 +5120,16 @@ app.get('/api/coda', async (req, res) => {
       else if (c.ultimoInvio) prep.push(voce);
     });
     pronti.sort((a, b) => String(b.da).localeCompare(String(a.da)));
-    res.json({ ok: true, preparazione: prep.slice(0, 30), pronti: pronti.slice(0, 30) });
+    // tavoli della sala: in preparazione (mandati in cucina) e pronti da servire
+    const tPrep = [], tPronti = [];
+    (await comandeList({ stato: 'aperta' }, 300)).filter(c => c.tipo === 'tavolo' && c.ultimoInvio).forEach(c => {
+      if (c.servitoAlle && c.servitoAlle >= c.ultimoInvio) return;
+      if (c.prontoCucinaAlle && c.prontoCucinaAlle >= c.ultimoInvio) {
+        if (adesso - new Date(c.prontoCucinaAlle).getTime() < MIN30) tPronti.push({ n: String(c.tavolo), da: c.prontoCucinaAlle });
+      } else tPrep.push({ n: String(c.tavolo), da: c.ultimoInvio });
+    });
+    const perNum = (a, b) => (parseInt(a.n, 10) || 999) - (parseInt(b.n, 10) || 999) || a.n.localeCompare(b.n);
+    res.json({ ok: true, preparazione: prep.slice(0, 30), pronti: pronti.slice(0, 30), tavoli: { preparazione: tPrep.sort(perNum).slice(0, 40), pronti: tPronti.sort((a, b) => String(b.da).localeCompare(String(a.da))).slice(0, 40) } });
   } catch (e) { console.error(e); res.status(500).json({ ok: false, error: 'Errore server' }); }
 });
 
