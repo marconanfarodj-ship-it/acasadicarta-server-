@@ -635,7 +635,7 @@ let RAGGIO_MAX_KM = 8;
 // =====================================================================
 const CONFIG_BASE = {
   consegna: { speseBase: 1.50, raggioPaeseKm: 2.5, sovrapprezzoFuori: 3.00, raggioMaxKm: 8, ordineMinimo: 10 },
-  orari: { dalle: 19, alle: 23, giornoChiusura: 2, ordiniPerQuarto: 3, giorniAnticipo: 3, noSubitoConsegna: [0, 6] },
+  orari: { dalle: 19, alle: 23, alleSabDom: 24, giornoChiusura: 2, ordiniPerQuarto: 3, giorniAnticipo: 3, noSubitoConsegna: [0, 6] },
   sito: { avvisoAttivo: false, avvisoTesto: '', scontoPrimoOrdine: 10, pagamenti: { contanti: true, carta: true, online: true } },
   sala: { sale: [{ nome: 'Sala', tavoli: 40 }], qrAttivo: true },
   camerieri: [],   // [{ nome, pin }] — il pin non esce mai dal server
@@ -678,6 +678,9 @@ function pulisciConfig(inp, attuale){
     d.dalle = cfgNum(x.dalle, 0, 23, d.dalle, true);
     d.alle = cfgNum(x.alle, 1, 24, d.alle, true);
     if (d.alle <= d.dalle) d.alle = Math.min(24, d.dalle + 1);
+    // sabato e domenica si può chiudere più tardi (24 = mezzanotte)
+    d.alleSabDom = cfgNum(x.alleSabDom, 1, 24, d.alleSabDom ?? d.alle, true);
+    if (d.alleSabDom <= d.dalle) d.alleSabDom = Math.min(24, d.dalle + 1);
     d.giornoChiusura = cfgNum(x.giornoChiusura, -1, 6, d.giornoChiusura, true);
     d.ordiniPerQuarto = cfgNum(x.ordiniPerQuarto, 1, 50, d.ordiniPerQuarto, true);
     d.giorniAnticipo = cfgNum(x.giorniAnticipo, 0, 14, d.giorniAnticipo, true);
@@ -947,9 +950,16 @@ function slotLabel(d){
   return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
 }
 
-function allSlotsForDay(){
+// ora di chiusura di quel giorno: sabato e domenica può essere più tardi (24 = mezzanotte)
+function oraChiusuraGiorno(d){
+  const g = (d || new Date()).getDay();
+  const fine = (g === 0 || g === 6) ? Number(CONFIG.orari.alleSabDom) : NaN;
+  return Number.isInteger(fine) ? fine : OPEN_TO_HOUR;
+}
+function allSlotsForDay(dataStr){
   const slots = [];
-  for(let h = OPEN_FROM_HOUR; h < OPEN_TO_HOUR; h++){
+  const fine = oraChiusuraGiorno(dataStr ? new Date(dataStr + 'T12:00:00') : new Date());
+  for(let h = OPEN_FROM_HOUR; h < fine; h++){
     for(let m = 0; m < 60; m += SLOT_MINUTES){
       slots.push(`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`);
     }
@@ -961,7 +971,7 @@ function allSlotsForDay(){
 // che non sia ancora pieno, nello stesso giorno. Torna null se la giornata è piena.
 function findAvailableSlot(fromDate){
   const key = dateKey(fromDate);
-  const slots = allSlotsForDay();
+  const slots = allSlotsForDay(key);
   const requestedLabel = slotLabel(fromDate);
   const startIndex = Math.max(0, slots.indexOf(requestedLabel) === -1
     ? slots.findIndex(s => s >= requestedLabel)
@@ -1095,7 +1105,7 @@ app.get('/api/delivery-slots', (req, res) => {
   if (!isValidRequestDate(dateStr)) {
     return res.json({ date: dateStr, chiuso: true, slots: [] });
   }
-  const slots = allSlotsForDay();
+  const slots = allSlotsForDay(dateStr);
   const result = slots.map(s => ({
     slot: s,
     prenotati: slotCounts[`${dateStr}|${s}`] || 0,
