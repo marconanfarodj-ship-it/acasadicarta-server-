@@ -4973,7 +4973,7 @@ app.post('/api/push/prova', async (req, res) => {
 // =====================================================================
 //  CONSEGNE (più fattorini), DISPLAY CUCINA e SCHERMO "ORDINI PRONTI"
 // =====================================================================
-let fattorini = ['Fattorino 1', 'Fattorino 2'];
+let fattorini = ['Fattorino'];
 const posizioniFattorini = new Map(); // nome -> { lat, lng, aggiornataAlle }
 const daQuando = ore => new Date(Date.now() - ore * 3600 * 1000).toISOString();
 const nomeBreve = n => { const p = String(n || '').trim().split(/\s+/).filter(Boolean); return p.length ? p[0] + (p[1] ? ' ' + p[1][0].toUpperCase() + '.' : '') : ''; };
@@ -5010,7 +5010,10 @@ function consegnaDaComanda(c){
 async function elencoConsegne(){
   const da = daQuando(14);
   const lista = ordiniStasera().filter(o => o.modalita === 'consegna').map(consegnaDaOrdine);
-  (await comandeStasera()).filter(c => c.tipo === 'consegna' && c.creataAlle >= da).forEach(c => lista.push(consegnaDaComanda(c)));
+  // comande di consegna prese da voi: solo quelle con dei piatti (una comanda appena aperta e vuota non è ancora una consegna)
+  (await comandeStasera()).filter(c => c.tipo === 'consegna' && c.creataAlle >= da && (c.righe || []).some(r => r.qty > 0)).forEach(c => lista.push(consegnaDaComanda(c)));
+  // un solo fattorino: tutte le consegne sono sue, senza doverle assegnare
+  if (fattorini.length === 1) lista.forEach(x => { if (!x.fattorino) x.fattorino = fattorini[0]; });
   return lista.sort((a, b) => String(a.ricevuto).localeCompare(String(b.ricevuto)));
 }
 async function trovaConsegna(id){
@@ -5023,6 +5026,52 @@ async function aggiornaConsegna(k, campi){
   if (k.tipo === 'o') salvaOrdineCampi(k.o, campi);
   else { Object.assign(k.c, campi); await comandaSave(k.c); }
 }
+// ---------- consegne chiuse da sole: pronte da noi e passata 1 ora dall'orario di consegna ----------
+function istanteRoma(dataIso, hhmm){ // "2026-10-16" + "21:15" ora italiana -> Date
+  const [h, m] = String(hhmm).split(':').map(Number);
+  const guess = new Date(`${dataIso}T${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:00Z`);
+  const roma = new Date(guess.toLocaleString('en-US', { timeZone: 'Europe/Rome' }));
+  const utc = new Date(guess.toLocaleString('en-US', { timeZone: 'UTC' }));
+  return new Date(guess.getTime() - (roma - utc));
+}
+function orarioRiferimento(orario, ricevuto, pronto){
+  const m = String(orario || '').match(/(\d{1,2}):(\d{2})/);
+  if (m && ricevuto) {
+    const t = istanteRoma(dataRoma(new Date(ricevuto)), `${m[1]}:${m[2]}`);
+    if (t.getTime() < new Date(ricevuto).getTime() - 3 * 3600 * 1000) t.setTime(t.getTime() + 86400000); // orario dopo mezzanotte
+    return t.getTime();
+  }
+  return pronto ? new Date(pronto).getTime() : null;
+}
+async function chiudiConsegneScadute(){
+  const ora = Date.now(), ORA = 60 * 60 * 1000, adesso = new Date().toISOString();
+  let n = 0;
+  for (const o of ordiniStasera()) {
+    if (o.modalita !== 'consegna' || !['pronto', 'in_consegna'].includes(o.stato)) continue;
+    const rif = orarioRiferimento(o.orarioLabel, o.ricevutoAlle, o.prontoAlle);
+    if (rif && ora - rif > ORA) {
+      const campi = { stato: 'consegnato', consegnatoAlle: adesso, consegnatoAuto: true };
+      // anche l'incasso: col metodo scelto dal cliente (carta → bancomat, altrimenti contanti)
+      if (!o.pagatoOnline && !o.metodoPagamento) { campi.metodoPagamento = o.pagamento === 'carta' ? 'bancomat' : 'contanti'; campi.incassoAuto = true; }
+      salvaOrdineCampi(o, campi); n++;
+      if (campi.metodoPagamento) broadcastOrder({ evento: 'pagamento_registrato', numeroOrdine: o.numeroOrdine, metodoPagamento: campi.metodoPagamento });
+    }
+  }
+  for (const c of await comandeStasera()) {
+    if (c.tipo !== 'consegna' || c.statoConsegna === 'consegnato') continue;
+    const pronta = c.statoConsegna === 'in_consegna' || (c.prontoCucinaAlle && (!c.ultimoInvio || c.prontoCucinaAlle >= c.ultimoInvio));
+    if (!pronta) continue;
+    const rif = orarioRiferimento(c.orario, c.creataAlle, c.prontoCucinaAlle || c.inConsegnaAlle);
+    if (rif && ora - rif > ORA) {
+      c.statoConsegna = 'consegnato'; c.consegnatoAlle = adesso; c.consegnatoAuto = true;
+      if (c.stato !== 'chiusa' && !c.incassoFattorino) c.incassoFattorino = { metodo: 'contanti', importo: round2(residuoComanda(c)), fattorino: c.fattorino || '', alle: adesso, auto: true };
+      await comandaSave(c); n++;
+    }
+  }
+  if (n) broadcastOrder({ evento: 'consegne_aggiornate' });
+  return n;
+}
+setInterval(() => { chiudiConsegneScadute().catch(e => console.error('Consegne scadute:', e.message)); }, 5 * 60 * 1000);
 app.get('/api/consegne', async (req, res) => {
   try { res.json({ ok: true, fattorini, consegne: await elencoConsegne() }); }
   catch (e) { console.error(e); res.status(500).json({ ok: false, error: 'Errore server' }); }
