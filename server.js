@@ -72,6 +72,7 @@ const ROTTE_STAFF = [
   ['POST', /^\/api\/tavolo\/chiamate\/[^/]+\/presa\/?$/],
   ['GET',  /^\/api\/daily-report\/test\/?$/],
   ['POST', /^\/api\/push\/(iscrivi|prova)\/?$/],
+  ['GET',  /^\/api\/push\/recenti\/?$/],
   ['*',    /^\/api\/(consegne|cucina)(\/|$)/]
 ];
 function haAccessoStaff(req){
@@ -4895,7 +4896,11 @@ function mandaPushA(sub, dati, ttl){
   });
 }
 // dati: { titolo, testo, tag, url } — ruoli: ['staff','titolare']
+// le ultime notifiche restano anche in memoria: l'app Android del tablet (che non può ricevere le push web) le legge da qui
+const ultimeNotifiche = []; let numNotifica = 0;
 async function inviaPush(ruoli, dati, ttl, soloNome){
+  ultimeNotifiche.push({ id: ++numNotifica, t: Date.now(), ruoli, nome: soloNome || '', titolo: dati.titolo || '', testo: dati.testo || '', tag: dati.tag || '' });
+  while (ultimeNotifiche.length > 200) ultimeNotifiche.shift();
   const lista = [...pushIscritti.values()].filter(x => ruoli.includes(x.ruolo) && (!soloNome || x.cameriere === soloNome));
   await Promise.all(lista.map(async x => {
     const st = await mandaPushA(x.sub, dati, ttl);
@@ -4906,6 +4911,13 @@ async function inviaPush(ruoli, dati, ttl, soloNome){
   }));
 }
 function pushSicura(ruoli, dati, ttl, soloNome){ inviaPush(ruoli, dati, ttl, soloNome).catch(e => console.error('Push non inviata:', e.message)); }
+app.get('/api/push/recenti', (req, res) => {
+  const ruolo = ['titolare', 'fattorino'].includes(req.query.ruolo) ? req.query.ruolo : 'staff';
+  const nome = String(req.query.nome || ''), dopo = Number(req.query.dopo) || 0, da = Date.now() - 10 * 60 * 1000;
+  const lista = ultimeNotifiche.filter(n => n.id > dopo && n.t >= da && n.ruoli.includes(ruolo) && (!n.nome || n.nome === nome))
+    .map(n => ({ id: n.id, titolo: n.titolo, testo: n.testo, tag: n.tag }));
+  res.json({ ok: true, ultimo: numNotifica, notifiche: lista });
+});
 app.get('/api/push/chiave', (req, res) => res.json({ ok: true, chiave: chiaviVapid().pub }));
 app.post('/api/push/iscrivi', async (req, res) => {
   const b = req.body || {}, sub = b.sub || {};
