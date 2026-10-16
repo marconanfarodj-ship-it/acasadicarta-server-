@@ -3844,6 +3844,36 @@ async function tavoloDelGruppo(gruppo){
   const aperta = (await comandeList({ stato: 'aperta' })).some(x => x.tipo === 'tavolo' && x.tavolo === prima.tavolo);
   return aperta ? prima.tavolo : '';
 }
+// il tavolo ha già ordinato col QR e il cameriere ha accettato: i nuovi ordini dal QR vanno dritti in cucina
+async function comandaQrGiaAccettata(tavolo, gruppo){
+  if (!tavolo) return null;
+  const c = (await comandeList({ stato: 'aperta' })).find(x => x.tipo === 'tavolo' && x.tavolo === tavolo);
+  if (!c) return null;
+  const da = new Date(Date.now() - 8 * 3600 * 1000).toISOString();
+  const ok = (await richiesteArch.list({ stato: 'accettata', creataAlle: { $gte: da } }, null, 300)).some(x => x.comanda === c._id || (gruppo && x.gruppo === gruppo && x.tavolo === tavolo));
+  return ok ? c : null;
+}
+async function riordinoQrInCucina(c, richieste){
+  for (const q of richieste) {
+    q.righe.forEach(x => c.righe.push({ ...x, rid: crypto.randomUUID() }));
+    if (q.nota) c.noteComanda = [c.noteComanda, q.nota].filter(Boolean).join(' · ');
+  }
+  const diff = diffComanda(c.inviate, c.righe);
+  const primaVolta = (c.invii || 0) === 0;
+  c.invii = (c.invii || 0) + 1;
+  stampaComandaCucina(c, diff, primaVolta, `${etichettaComanda(c)} #${c.invii} (QR)`);
+  c.inviate = c.righe.map(r => ({ ...r }));
+  c.ultimoInvio = new Date().toISOString();
+  c.ultimoDiff = { aggiunte: diff.aggiunte.map(r => r.rid), tolte: diff.tolte.map(r => ({ qty: r.qty, nome: r.nome })), primaVolta };
+  await comandaSave(c);
+  for (const q of richieste) {
+    q.tavolo = c.tavolo; q.stato = 'accettata'; q.auto = true; q.gestitaAlle = new Date().toISOString(); q.comanda = c._id;
+    await richiesteArch.save(q);
+    broadcastOrder({ evento: 'richiesta_tavolo', tavolo: c.tavolo, id: q._id });
+  }
+  const pezzi = richieste.reduce((t, q) => t + q.righe.reduce((u, x) => u + x.qty, 0), 0);
+  pushSicura(['staff', 'titolare'], { titolo: `📱 Tavolo ${c.tavolo} ha riordinato dal QR`, testo: `${pezzi} ${pezzi === 1 ? 'piatto mandato' : 'piatti mandati'} in cucina`, tag: 'qr-' + c.tavolo, url: './' }, 600);
+}
 app.post('/api/tavolo/richiesta', async (req, res) => {
   if (!CONFIG.sala.qrAttivo) return res.status(403).json({ ok: false, error: 'Gli ordini dal tavolo sono spenti: chiama il cameriere.' });
   const b = req.body || {};
@@ -3869,6 +3899,8 @@ app.post('/api/tavolo/richiesta', async (req, res) => {
     stato: bozza ? 'bozza' : 'attesa', totale: round2(righe.reduce((x, y) => x + y.prezzo * y.qty, 0)), creataAlle: new Date().toISOString() };
   await richiesteArch.save(r);
   if (!bozza) {
+    const giaAccettata = await comandaQrGiaAccettata(tavolo, gruppo);
+    if (giaAccettata) { await riordinoQrInCucina(giaAccettata, [r]); return res.json({ ok: true, id: r._id, bozza: false, inCucina: true }); }
     broadcastOrder({ evento: 'richiesta_tavolo', tavolo, id: r._id });
     pushSicura(['staff', 'titolare'], { titolo: `📱 Tavolo ${tavolo}: ordine dal QR`, testo: 'Da controllare e accettare', tag: 'qr-' + tavolo, url: './' }, 600);
   }
@@ -3888,6 +3920,8 @@ app.get('/api/tavolo/:tavolo/bozza', async (req, res) => {
 async function inviaBozzeTavolo(tavolo){
   const lista = await bozzeTavolo(tavolo);
   if (!lista.length) return 0;
+  const giaAccettata = await comandaQrGiaAccettata(tavolo, lista[0].gruppo);
+  if (giaAccettata) { await riordinoQrInCucina(giaAccettata, lista); return lista.length; }
   for (const r of lista) { r.stato = 'attesa'; r.inviataAlle = new Date().toISOString(); await richiesteArch.save(r); }
   broadcastOrder({ evento: 'richiesta_tavolo', tavolo, id: lista[0]._id, persone: lista.length });
   pushSicura(['staff', 'titolare'], { titolo: `📱 Tavolo ${tavolo}: ordine dal QR`, testo: `${lista.length > 1 ? lista.length + ' persone hanno scelto' : 'Da controllare e accettare'}`, tag: 'qr-' + tavolo, url: './' }, 600);
