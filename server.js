@@ -5063,13 +5063,14 @@ async function elencoCucina(){
     const nuove = c.invii > 1 ? new Set(d.aggiunte || []) : null;
     out.push({ id: 'c' + c._id, fonte: 'staff', tipo: c.tipo, etichetta: c.tipo === 'tavolo' ? 'Tavolo ' + c.tavolo : (c.tipo === 'consegna' ? 'Consegna S' : 'Asporto S') + c.numero,
       nome: c.tipo === 'tavolo' ? '' : (c.nome || ''), orario: c.orario || '', da: c.ultimoInvio, primo: c.creataAlle, invio: c.invii || 1,
+      iniziata: !!(c.inPrepAlle && c.inPrepAlle >= c.ultimoInvio),
       righe: (c.inviate || []).filter(r => r.qty > 0).map(r => rigaCucina(r, nuove)), tolte: c.invii > 1 ? (d.tolte || []) : [], note: c.noteComanda || '' });
   });
   ordiniStasera().forEach(o => {
     const st = o.stato || 'da_preparare';
     if (st !== 'da_preparare' && st !== 'nuovo') return;
     out.push({ id: 'o' + o.numeroOrdine, fonte: 'online', tipo: o.modalita === 'consegna' ? 'consegna' : 'asporto', etichetta: '#' + o.numeroOrdine + (o.modalita === 'consegna' ? ' Consegna' : ' Ritiro'),
-      nome: o.name || '', orario: o.orarioLabel || '', da: o.ricevutoAlle, primo: o.ricevutoAlle, invio: 1,
+      nome: o.name || '', orario: o.orarioLabel || '', da: o.ricevutoAlle, primo: o.ricevutoAlle, invio: 1, iniziata: !!o.inPrepAlle,
       righe: (o.articoli || []).map(a => ({ qty: Number(a.qty) || 1, nome: a.nome, det: (a.dettagli || []).map(String), nuovo: false, glutine: /glutine/i.test((a.dettagli || []).join(' ')) })), tolte: [], note: o.note || '' });
   });
   return out.sort((a, b) => String(a.da).localeCompare(String(b.da)));
@@ -5094,6 +5095,16 @@ app.post('/api/cucina/:id/pronto', async (req, res) => {
     pushSicura(['staff', 'titolare'], { titolo: `🍕 ${chi}: pronto`, testo: c.tipo === 'tavolo' ? 'Da portare al tavolo' : 'Pronto da consegnare', tag: 'pronto-' + c._id, url: './' }, 900);
     if (c.tipo === 'consegna') pushSicura(['fattorino'], { titolo: `🛵 Consegna S${c.numero} pronta`, testo: `${c.nome || 'Cliente'} · ${c.indirizzo || ''}`, tag: 'cons-c' + c._id, url: './' }, 900, c.fattorino || undefined);
   } else return res.status(400).json({ ok: false, error: 'Comanda non valida' });
+  broadcastOrder({ evento: 'cucina_aggiornata' });
+  res.json({ ok: true });
+});
+// "In preparazione": la cucina ha iniziato questa comanda (sulla TV della sala il tavolo compare da qui)
+app.post('/api/cucina/:id/inizia', async (req, res) => {
+  const id = String(req.params.id || ''), ora = new Date().toISOString();
+  const via = (req.body || {}).annulla === true;
+  if (id[0] === 'o') { const o = await trovaOrdine(Number(id.slice(1))); if (!o) return res.status(404).json({ ok: false, error: 'Ordine non trovato' }); salvaOrdineCampi(o, { inPrepAlle: via ? null : ora }); }
+  else if (id[0] === 'c') { const c = await comandaGet(id.slice(1)); if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' }); c.inPrepAlle = via ? null : ora; await comandaSave(c); }
+  else return res.status(400).json({ ok: false, error: 'Comanda non valida' });
   broadcastOrder({ evento: 'cucina_aggiornata' });
   res.json({ ok: true });
 });
@@ -5126,7 +5137,7 @@ app.get('/api/coda', async (req, res) => {
       if (c.servitoAlle && c.servitoAlle >= c.ultimoInvio) return;
       if (c.prontoCucinaAlle && c.prontoCucinaAlle >= c.ultimoInvio) {
         if (adesso - new Date(c.prontoCucinaAlle).getTime() < MIN30) tPronti.push({ n: String(c.tavolo), da: c.prontoCucinaAlle });
-      } else tPrep.push({ n: String(c.tavolo), da: c.ultimoInvio });
+      } else if (c.inPrepAlle && c.inPrepAlle >= c.ultimoInvio) tPrep.push({ n: String(c.tavolo), da: c.inPrepAlle }); // solo quando la cucina l'ha messo in preparazione
     });
     const perNum = (a, b) => (parseInt(a.n, 10) || 999) - (parseInt(b.n, 10) || 999) || a.n.localeCompare(b.n);
     res.json({ ok: true, preparazione: prep.slice(0, 30), pronti: pronti.slice(0, 30), tavoli: { preparazione: tPrep.sort(perNum).slice(0, 40), pronti: tPronti.sort((a, b) => String(b.da).localeCompare(String(a.da))).slice(0, 40) } });
