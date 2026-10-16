@@ -70,7 +70,9 @@ const ROTTE_STAFF = [
   ['POST', /^\/api\/tavolo\/richieste\/[^/]+\/[^/]+\/?$/],
   ['GET',  /^\/api\/tavolo\/chiamate\/?$/],
   ['POST', /^\/api\/tavolo\/chiamate\/[^/]+\/presa\/?$/],
-  ['GET',  /^\/api\/daily-report\/test\/?$/]
+  ['GET',  /^\/api\/daily-report\/test\/?$/],
+  ['POST', /^\/api\/push\/(iscrivi|prova)\/?$/],
+  ['*',    /^\/api\/(consegne|cucina)(\/|$)/]
 ];
 function haAccessoStaff(req){
   const q = String(req.query.t || '');
@@ -223,6 +225,18 @@ async function connectDB(){
     if (pwDoc && pwDoc.hash) titolarePwHash = pwDoc.hash;
     const calDoc = await settingsCollection.findOne({ _id: 'calendario' });
     if (calDoc && calDoc.value) calendario = { chiusi: calDoc.value.chiusi || [], aperti: calDoc.value.aperti || [] };
+    try {
+      const vDoc = await settingsCollection.findOne({ _id: 'vapid' });
+      if (vDoc && vDoc.value && vDoc.value.pub) vapid = vDoc.value;
+      else { vapid = nuoveChiaviVapid(); await settingsCollection.updateOne({ _id: 'vapid' }, { $set: { value: vapid } }, { upsert: true }); }
+      pushCollection = db.collection('pushIscrizioni');
+      (await pushCollection.find({}).toArray()).forEach(d => pushIscritti.set(d._id, d));
+    } catch (e) { console.error('Notifiche push: avvio non riuscito', e.message); }
+    const faDoc = await settingsCollection.findOne({ _id: 'fattorini' });
+    if (faDoc && Array.isArray(faDoc.value) && faDoc.value.length) fattorini = faDoc.value;
+    const vieDoc = await settingsCollection.findOne({ _id: 'vieNiscemi' });
+    if (vieDoc && vieDoc.value && Array.isArray(vieDoc.value.vie)) vieNiscemi = vieDoc.value;
+    setTimeout(() => aggiornaVie().catch(() => {}), 15000);
     const piDoc = await settingsCollection.findOne({ _id: 'piantina' });
     if (piDoc && piDoc.value && Array.isArray(piDoc.value.oggetti)) piantinaSala = piDoc.value;
     const dimDoc = await settingsCollection.findOne({ _id: 'dimensioneStampa' });
@@ -1339,6 +1353,7 @@ async function finalizeOrder(order, customerId){
   }
 
   broadcastOrder(order);
+  if (!order.interno) pushSicura(['titolare'], { titolo: `🛵 Nuovo ordine online #${order.numeroOrdine || ''}`, testo: `${order.name || 'Cliente'} · ${order.modalita === 'consegna' ? 'consegna' : 'ritiro'} · ${money(Number(order.grandTotal) || 0)}${order.pagatoOnline ? ' · pagato online' : ''}`, tag: 'ordine-' + (order.numeroOrdine || ''), url: './' }, 1800);
   sendEmail(ORDER_EMAIL, order.oggettoEmail || 'Nuovo ordine — La Casa di Carta', order.testoStampa, buildOwnerOrderHtml(order));
   if (order.email) {
     sendEmail(order.email, 'Conferma ordine — La Casa di Carta', buildCustomerConfirmationText(order), buildCustomerConfirmationHtml(order));
@@ -1381,6 +1396,7 @@ app.post('/api/reservations', async (req, res) => {
   };
 
   broadcastOrder(reservation);
+  pushSicura(['titolare'], { titolo: '📅 Nuova prenotazione dal sito', testo: `${nome} · ${persone} persone · ${data} alle ${ora}`, tag: 'pren-' + reservationCounter, url: './' }, 3600);
   try {
     await prenotazioniArch.save({ _id: crypto.randomUUID(), numero: reservationCounter, fonte: 'sito', stato: 'nuova', tavolo: '',
       ...pulisciPrenotazione({ nome, telefono, data, ora, persone, note }), ricevutoAlle });
@@ -1723,10 +1739,20 @@ app.post('/api/driver-location', (req, res) => {
     return res.status(400).json({ ok: false, error: 'Coordinate non valide' });
   }
   driverLocation = { lat, lng, aggiornataAlle: new Date().toISOString() };
+  const chi = String((req.body || {}).fattorino || '').slice(0, 30);
+  if (chi) posizioniFattorini.set(chi, driverLocation);
   res.json({ ok: true });
 });
 
-app.get('/api/driver-location', (req, res) => {
+app.get('/api/driver-location', async (req, res) => {
+  // con più fattorini: la posizione di chi porta QUESTO ordine (?ordine=numero)
+  const n = Number(req.query.ordine);
+  if (n) {
+    const o = orderHistory.find(x => x.numeroOrdine === n);
+    const p = o && o.fattorino && posizioniFattorini.get(o.fattorino);
+    if (p && Date.now() - new Date(p.aggiornataAlle).getTime() < 5 * 60 * 1000) return res.json({ disponibile: true, ...p });
+    if (o && o.fattorino) return res.json({ disponibile: false });
+  }
   if (!driverLocation) return res.json({ disponibile: false });
   // se la posizione non si aggiorna da più di 5 minuti, consideriamola scaduta
   const eta = Date.now() - new Date(driverLocation.aggiornataAlle).getTime();
@@ -1758,7 +1784,11 @@ app.post('/api/orders/:numeroOrdine/pronto', async (req, res) => {
   const numeroOrdine = Number(req.params.numeroOrdine);
   const order = await trovaOrdine(numeroOrdine);
   if (!order) return res.status(404).json({ ok: false, error: 'Ordine non trovato' });
-
+  segnaOrdinePronto(order);
+  res.json({ ok: true });
+});
+function segnaOrdinePronto(order){
+  const numeroOrdine = order.numeroOrdine;
   order.stato = 'pronto';
   order.prontoAlle = new Date().toISOString();
 
@@ -1780,9 +1810,8 @@ app.post('/api/orders/:numeroOrdine/pronto', async (req, res) => {
       buildOrderReadyHtml(order)
     );
   }
-
-  res.json({ ok: true });
-});
+  if (order.modalita === 'consegna') pushSicura(['fattorino'], { titolo: `🛵 Ordine #${numeroOrdine} pronto`, testo: `${order.name || 'Cliente'} · ${order.address || ''}`, tag: 'cons-' + numeroOrdine, url: './' }, 900);
+}
 
 // ---------- Endpoint: il pannello di stampa registra qui come ha pagato il cliente (contanti/bancomat) ----------
 app.post('/api/orders/:numeroOrdine/pagamento', async (req, res) => {
@@ -2945,6 +2974,7 @@ app.post('/api/staff/comande/:id/invia', async (req, res) => {
   else c.salvateSenzaStampa = (c.salvateSenzaStampa || 0) + 1;
   c.inviate = c.righe.map(r => ({ ...r }));
   c.ultimoInvio = new Date().toISOString();
+  c.ultimoDiff = { aggiunte: diff.aggiunte.map(r => r.rid), tolte: diff.tolte.map(r => ({ qty: r.qty, nome: r.nome })), primaVolta };
   await comandaSave(c);
   res.json({ ok: true, comanda: conTotali(c) });
 });
@@ -3309,7 +3339,11 @@ app.post('/api/orders/:numeroOrdine/in-consegna', async (req, res) => {
   const numeroOrdine = Number(req.params.numeroOrdine);
   const order = await trovaOrdine(numeroOrdine);
   if (!order) return res.status(404).json({ ok: false, error: 'Ordine non trovato' });
-
+  segnaOrdineInConsegna(order);
+  res.json({ ok: true });
+});
+function segnaOrdineInConsegna(order){
+  const numeroOrdine = order.numeroOrdine;
   order.stato = 'in_consegna';
   order.inConsegnaAlle = new Date().toISOString();
 
@@ -3330,8 +3364,7 @@ app.post('/api/orders/:numeroOrdine/in-consegna', async (req, res) => {
     );
   }
 
-  res.json({ ok: true });
-});
+}
 
 // =====================================================================
 //  JARVIS / PERSONALE: ristampa comande e ordini presi a voce (telefono, banco, tavolo)
@@ -3834,7 +3867,10 @@ app.post('/api/tavolo/richiesta', async (req, res) => {
   const r = { _id: crypto.randomUUID(), tavolo, gruppo, righe, nome: String(b.nome || '').slice(0, 40), nota: String(b.nota || '').slice(0, 200),
     stato: bozza ? 'bozza' : 'attesa', totale: round2(righe.reduce((x, y) => x + y.prezzo * y.qty, 0)), creataAlle: new Date().toISOString() };
   await richiesteArch.save(r);
-  if (!bozza) broadcastOrder({ evento: 'richiesta_tavolo', tavolo, id: r._id });
+  if (!bozza) {
+    broadcastOrder({ evento: 'richiesta_tavolo', tavolo, id: r._id });
+    pushSicura(['staff', 'titolare'], { titolo: `📱 Tavolo ${tavolo}: ordine dal QR`, testo: 'Da controllare e accettare', tag: 'qr-' + tavolo, url: './' }, 600);
+  }
   res.json({ ok: true, id: r._id, bozza });
 });
 // ordine del tavolo in preparazione: cosa hanno già scelto gli altri (solo nomi e piatti)
@@ -3853,6 +3889,7 @@ async function inviaBozzeTavolo(tavolo){
   if (!lista.length) return 0;
   for (const r of lista) { r.stato = 'attesa'; r.inviataAlle = new Date().toISOString(); await richiesteArch.save(r); }
   broadcastOrder({ evento: 'richiesta_tavolo', tavolo, id: lista[0]._id, persone: lista.length });
+  pushSicura(['staff', 'titolare'], { titolo: `📱 Tavolo ${tavolo}: ordine dal QR`, testo: `${lista.length > 1 ? lista.length + ' persone hanno scelto' : 'Da controllare e accettare'}`, tag: 'qr-' + tavolo, url: './' }, 600);
   return lista.length;
 }
 app.post('/api/tavolo/:tavolo/invia', async (req, res) => {
@@ -3975,6 +4012,7 @@ app.post('/api/tavolo/chiama', async (req, res) => {
     while (chiamateTavolo.length > 200) chiamateTavolo.shift();
   }
   broadcastOrder({ evento: 'chiamata_tavolo', ...ch, testo: MOTIVI_CHIAMATA[motivo] });
+  pushSicura(['staff', 'titolare'], { titolo: `🙋 Tavolo ${tavolo || gruppo}`, testo: `Il tavolo ${MOTIVI_CHIAMATA[motivo]}${ch.volte > 1 ? ` (${ch.volte}ª volta)` : ''}`, tag: 'chiamata-' + (tavolo || gruppo), url: './' }, 300);
   res.json({ ok: true });
 });
 app.get('/api/tavolo/chiamate', (req, res) => {
@@ -4801,6 +4839,332 @@ function configPubblica(){
   return { ...CONFIG, sito, pagamentoOnlineCollegato: !!stripe, camerieri: (CONFIG.camerieri || []).map(x => ({ nome: x.nome, pin: !!x.pin })),
     offerte: (CONFIG.offerte || []).filter(o => o.attiva).map(o => ({ ...o, codice: undefined, conCodice: !!o.codice })) };
 }
+// =====================================================================
+//  NOTIFICHE PUSH (Web Push, senza librerie esterne)
+//  Arrivano sul telefono anche con l'app chiusa: Android (Chrome) e iPhone (app aggiunta alla schermata Home).
+//  Le chiavi VAPID si creano da sole la prima volta e restano salvate nel database.
+// =====================================================================
+const cryptoPush = require('crypto');
+const httpsPush = require('https');
+let vapid = null, pushCollection = null;
+const pushIscritti = new Map(); // id -> { _id, sub, ruolo, cameriere, creata }
+const b64u = buf => Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const ub64 = str => Buffer.from(String(str).replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+function nuoveChiaviVapid(){ const ec = cryptoPush.createECDH('prime256v1'); ec.generateKeys(); return { pub: b64u(ec.getPublicKey()), priv: b64u(ec.getPrivateKey()) }; }
+function chiaviVapid(){ if (!vapid) vapid = nuoveChiaviVapid(); return vapid; }
+let chiavePrivataCache = null;
+function jwtVapid(aud){
+  const v = chiaviVapid();
+  if (!chiavePrivataCache || chiavePrivataCache.pub !== v.pub) {
+    const pub = ub64(v.pub);
+    chiavePrivataCache = { pub: v.pub, key: cryptoPush.createPrivateKey({ key: { kty: 'EC', crv: 'P-256', d: v.priv, x: b64u(pub.subarray(1, 33)), y: b64u(pub.subarray(33, 65)) }, format: 'jwk' }) };
+  }
+  const h = b64u(JSON.stringify({ typ: 'JWT', alg: 'ES256' }));
+  const p = b64u(JSON.stringify({ aud, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: 'mailto:info@pizzerialacasadicarta.it' }));
+  const firma = cryptoPush.sign('sha256', Buffer.from(h + '.' + p), { key: chiavePrivataCache.key, dsaEncoding: 'ieee-p1363' });
+  return h + '.' + p + '.' + b64u(firma);
+}
+const hkdfPush = (salt, ikm, info, n) => Buffer.from(cryptoPush.hkdfSync('sha256', ikm, salt, info, n));
+// cifratura aes128gcm (RFC 8291 / 8188)
+function cifraPush(sub, testo){
+  const uaPub = ub64(sub.keys.p256dh), auth = ub64(sub.keys.auth);
+  const ec = cryptoPush.createECDH('prime256v1'); ec.generateKeys();
+  const asPub = ec.getPublicKey(), comune = ec.computeSecret(uaPub);
+  const ikm = hkdfPush(auth, comune, Buffer.concat([Buffer.from('WebPush: info\0'), uaPub, asPub]), 32);
+  const salt = cryptoPush.randomBytes(16);
+  const cek = hkdfPush(salt, ikm, Buffer.from('Content-Encoding: aes128gcm\0'), 16);
+  const nonce = hkdfPush(salt, ikm, Buffer.from('Content-Encoding: nonce\0'), 12);
+  const c = cryptoPush.createCipheriv('aes-128-gcm', cek, nonce);
+  const corpo = Buffer.concat([c.update(Buffer.concat([Buffer.from(testo, 'utf8'), Buffer.from([2])])), c.final(), c.getAuthTag()]);
+  const testa = Buffer.alloc(21); salt.copy(testa, 0); testa.writeUInt32BE(4096, 16); testa.writeUInt8(65, 20);
+  return Buffer.concat([testa, asPub, corpo]);
+}
+function mandaPushA(sub, dati, ttl){
+  return new Promise(resolve => {
+    try {
+      const u = new URL(sub.endpoint);
+      const corpo = cifraPush(sub, JSON.stringify(dati));
+      const req = httpsPush.request({ method: 'POST', hostname: u.hostname, port: u.port || 443, path: u.pathname + u.search, timeout: 10000,
+        headers: { 'Content-Type': 'application/octet-stream', 'Content-Encoding': 'aes128gcm', 'Content-Length': corpo.length, TTL: String(ttl || 600), Urgency: 'high',
+          Authorization: 'vapid t=' + jwtVapid(u.origin) + ', k=' + chiaviVapid().pub } },
+        res => { res.resume(); resolve(res.statusCode); });
+      req.on('error', () => resolve(0));
+      req.on('timeout', () => { req.destroy(); resolve(0); });
+      req.end(corpo);
+    } catch (e) { resolve(0); }
+  });
+}
+// dati: { titolo, testo, tag, url } — ruoli: ['staff','titolare']
+async function inviaPush(ruoli, dati, ttl, soloNome){
+  const lista = [...pushIscritti.values()].filter(x => ruoli.includes(x.ruolo) && (!soloNome || x.cameriere === soloNome));
+  await Promise.all(lista.map(async x => {
+    const st = await mandaPushA(x.sub, dati, ttl);
+    if (st === 404 || st === 410) { // iscrizione scaduta (app disinstallata o permesso tolto)
+      pushIscritti.delete(x._id);
+      if (pushCollection) pushCollection.deleteOne({ _id: x._id }).catch(() => {});
+    }
+  }));
+}
+function pushSicura(ruoli, dati, ttl, soloNome){ inviaPush(ruoli, dati, ttl, soloNome).catch(e => console.error('Push non inviata:', e.message)); }
+app.get('/api/push/chiave', (req, res) => res.json({ ok: true, chiave: chiaviVapid().pub }));
+app.post('/api/push/iscrivi', async (req, res) => {
+  const b = req.body || {}, sub = b.sub || {};
+  let u; try { u = new URL(String(sub.endpoint || '')); } catch (e) { return res.status(400).json({ ok: false, error: 'Iscrizione non valida' }); }
+  if (u.protocol !== 'https:' || !sub.keys || !sub.keys.p256dh || !sub.keys.auth) return res.status(400).json({ ok: false, error: 'Iscrizione non valida' });
+  const id = cryptoPush.createHash('sha256').update(u.href).digest('hex').slice(0, 32);
+  const doc = { _id: id, sub: { endpoint: u.href, keys: { p256dh: String(sub.keys.p256dh).slice(0, 200), auth: String(sub.keys.auth).slice(0, 60) } },
+    ruolo: ['titolare', 'fattorino'].includes(b.ruolo) ? b.ruolo : 'staff', cameriere: String(b.cameriere || '').slice(0, 30), creata: new Date().toISOString() };
+  pushIscritti.set(id, doc);
+  if (pushCollection) { try { await pushCollection.replaceOne({ _id: id }, doc, { upsert: true }); } catch (e) {} }
+  res.json({ ok: true });
+});
+app.post('/api/push/prova', async (req, res) => {
+  const ruolo = ['titolare', 'fattorino'].includes((req.body || {}).ruolo) ? req.body.ruolo : 'staff';
+  await inviaPush([ruolo], { titolo: '🔔 Notifiche attive', testo: 'Da ora gli avvisi arrivano qui anche con l\'app chiusa.', tag: 'prova' });
+  res.json({ ok: true, iscritti: [...pushIscritti.values()].filter(x => x.ruolo === ruolo).length });
+});
+
+// =====================================================================
+//  CONSEGNE (più fattorini), DISPLAY CUCINA e SCHERMO "ORDINI PRONTI"
+// =====================================================================
+let fattorini = ['Fattorino 1', 'Fattorino 2'];
+const posizioniFattorini = new Map(); // nome -> { lat, lng, aggiornataAlle }
+const daQuando = ore => new Date(Date.now() - ore * 3600 * 1000).toISOString();
+const nomeBreve = n => { const p = String(n || '').trim().split(/\s+/).filter(Boolean); return p.length ? p[0] + (p[1] ? ' ' + p[1][0].toUpperCase() + '.' : '') : ''; };
+function salvaOrdineCampi(order, campi){
+  Object.assign(order, campi);
+  if (ordersCollection) ordersCollection.updateOne(filtroOrdine(order), { $set: campi }).catch(e => console.error('Errore salvataggio ordine:', e.message));
+}
+// ordini online di stasera (in memoria) e comande dello staff di stasera
+function ordiniStasera(){ const da = daQuando(14); return orderHistory.filter(o => o && o.ricevutoAlle && o.ricevutoAlle >= da && o.tipo !== 'prenotazione'); }
+async function comandeStasera(){
+  const aperte = await comandeList({ stato: 'aperta' }, 300);
+  const chiuse = await comandeList({ stato: 'chiusa', giorno: giornoServizio() }, 300);
+  return aperte.concat(chiuse);
+}
+
+// ---------- CONSEGNE ----------
+function consegnaDaOrdine(o){
+  return { id: 'o' + o.numeroOrdine, fonte: 'online', numero: '#' + o.numeroOrdine, nome: o.name || [o.nome, o.cognome].filter(Boolean).join(' ') || 'Cliente',
+    telefono: o.phone || '', indirizzo: o.address || '', note: o.note || o.notes || '', orario: o.orarioLabel || '', ricevuto: o.ricevutoAlle,
+    totale: round2(Number(o.grandTotal) || 0), pagato: !!o.pagatoOnline || !!o.metodoPagamento,
+    pagamento: o.pagatoOnline ? 'online' : (o.metodoPagamento || ''), scelto: o.pagamento === 'carta' ? 'carta' : 'contanti',
+    stato: o.stato || 'da_preparare', fattorino: o.fattorino || '', giro: o.giro || 0,
+    pezzi: (o.articoli || []).reduce((t, a) => t + (Number(a.qty) || 1), 0) };
+}
+function consegnaDaComanda(c){
+  const pagato = c.stato === 'chiusa' || residuoComanda(c) <= 0;
+  return { id: 'c' + c._id, fonte: 'staff', numero: 'S' + c.numero, nome: c.nome || 'Cliente', telefono: c.telefono || '', indirizzo: c.indirizzo || '',
+    note: c.noteComanda || '', orario: c.orario || '', ricevuto: c.creataAlle,
+    totale: round2(totaleComanda(c) + (c.spese || 0)), pagato: pagato || !!c.incassoFattorino,
+    pagamento: c.incassoFattorino ? c.incassoFattorino.metodo : (pagato ? (c.pagamento || 'pagato') : ''), scelto: 'contanti',
+    stato: c.statoConsegna || (c.prontoCucinaAlle ? 'pronto' : 'da_preparare'), fattorino: c.fattorino || '', giro: c.giro || 0,
+    pezzi: (c.righe || []).reduce((t, r) => t + (r.qty || 0), 0) };
+}
+async function elencoConsegne(){
+  const da = daQuando(14);
+  const lista = ordiniStasera().filter(o => o.modalita === 'consegna').map(consegnaDaOrdine);
+  (await comandeStasera()).filter(c => c.tipo === 'consegna' && c.creataAlle >= da).forEach(c => lista.push(consegnaDaComanda(c)));
+  return lista.sort((a, b) => String(a.ricevuto).localeCompare(String(b.ricevuto)));
+}
+async function trovaConsegna(id){
+  id = String(id || '');
+  if (id[0] === 'o') { const o = await trovaOrdine(Number(id.slice(1))); return o ? { tipo: 'o', o } : null; }
+  if (id[0] === 'c') { const c = await comandaGet(id.slice(1)); return c && c.tipo === 'consegna' ? { tipo: 'c', c } : null; }
+  return null;
+}
+async function aggiornaConsegna(k, campi){
+  if (k.tipo === 'o') salvaOrdineCampi(k.o, campi);
+  else { Object.assign(k.c, campi); await comandaSave(k.c); }
+}
+app.get('/api/consegne', async (req, res) => {
+  try { res.json({ ok: true, fattorini, consegne: await elencoConsegne() }); }
+  catch (e) { console.error(e); res.status(500).json({ ok: false, error: 'Errore server' }); }
+});
+app.post('/api/consegne/fattorini', soloTitolare, async (req, res) => {
+  const nomi = (Array.isArray((req.body || {}).nomi) ? req.body.nomi : []).map(x => String(x || '').trim().slice(0, 30)).filter(Boolean).slice(0, 8);
+  if (!nomi.length) return res.status(400).json({ ok: false, error: 'Scrivi almeno un nome' });
+  fattorini = [...new Set(nomi)];
+  if (settingsCollection) await settingsCollection.updateOne({ _id: 'fattorini' }, { $set: { value: fattorini } }, { upsert: true }).catch(() => {});
+  broadcastOrder({ evento: 'consegne_aggiornate' });
+  res.json({ ok: true, fattorini });
+});
+app.post('/api/consegne/:id/assegna', async (req, res) => {
+  const k = await trovaConsegna(req.params.id);
+  if (!k) return res.status(404).json({ ok: false, error: 'Consegna non trovata' });
+  const chi = String((req.body || {}).fattorino || '').slice(0, 30);
+  if (chi && !fattorini.includes(chi)) return res.status(400).json({ ok: false, error: 'Fattorino sconosciuto' });
+  const prima = k.tipo === 'o' ? k.o.fattorino : k.c.fattorino;
+  await aggiornaConsegna(k, { fattorino: chi, giro: 0 });
+  broadcastOrder({ evento: 'consegne_aggiornate' });
+  if (chi && chi !== prima) {
+    const x = k.tipo === 'o' ? consegnaDaOrdine(k.o) : consegnaDaComanda(k.c);
+    pushSicura(['fattorino'], { titolo: `🛵 Nuova consegna ${x.numero}`, testo: `${x.nome} · ${x.indirizzo}${x.stato === 'pronto' ? ' · PRONTA' : ''}`, tag: 'cons-' + x.id, url: './' }, 1800, chi);
+  }
+  res.json({ ok: true });
+});
+// stato: in_consegna | consegnato | pronto (per tornare indietro) — pagamento: contanti | bancomat (se non era pagato)
+app.post('/api/consegne/:id/stato', async (req, res) => {
+  const k = await trovaConsegna(req.params.id);
+  if (!k) return res.status(404).json({ ok: false, error: 'Consegna non trovata' });
+  const b = req.body || {}, stato = String(b.stato || '');
+  if (!['in_consegna', 'consegnato', 'pronto'].includes(stato)) return res.status(400).json({ ok: false, error: 'Stato non valido' });
+  const metodo = ['contanti', 'bancomat'].includes(b.pagamento) ? b.pagamento : '';
+  const ora = new Date().toISOString();
+  if (k.tipo === 'o') {
+    if (stato === 'in_consegna' && k.o.stato !== 'in_consegna') segnaOrdineInConsegna(k.o);
+    else if (stato === 'pronto') { salvaOrdineCampi(k.o, { stato: 'pronto' }); broadcastOrder({ evento: 'stato_aggiornato', numeroOrdine: k.o.numeroOrdine, stato: 'pronto' }); }
+    else if (stato === 'consegnato') {
+      const campi = { stato: 'consegnato', consegnatoAlle: ora };
+      if (metodo && !k.o.pagatoOnline && !k.o.metodoPagamento) campi.metodoPagamento = metodo;
+      salvaOrdineCampi(k.o, campi);
+      broadcastOrder({ evento: 'stato_aggiornato', numeroOrdine: k.o.numeroOrdine, stato: 'consegnato' });
+      if (campi.metodoPagamento) broadcastOrder({ evento: 'pagamento_registrato', numeroOrdine: k.o.numeroOrdine, metodoPagamento: metodo });
+    }
+  } else {
+    const campi = { statoConsegna: stato === 'pronto' ? null : stato };
+    if (stato === 'in_consegna') campi.inConsegnaAlle = ora;
+    if (stato === 'consegnato') { campi.consegnatoAlle = ora; if (metodo && k.c.stato !== 'chiusa') campi.incassoFattorino = { metodo, importo: round2(residuoComanda(k.c)), fattorino: k.c.fattorino || '', alle: ora }; }
+    await aggiornaConsegna(k, campi);
+  }
+  broadcastOrder({ evento: 'consegne_aggiornate' });
+  res.json({ ok: true });
+});
+// "Avvia giro": il fattorino parte con queste consegne, in quest'ordine
+app.post('/api/consegne/giro', async (req, res) => {
+  const b = req.body || {}, chi = String(b.fattorino || '').slice(0, 30);
+  const ids = (Array.isArray(b.ids) ? b.ids : []).slice(0, 20);
+  if (!chi || !ids.length) return res.status(400).json({ ok: false, error: 'Niente da consegnare' });
+  let n = 0;
+  for (const id of ids) {
+    const k = await trovaConsegna(id); if (!k) continue;
+    n++;
+    await aggiornaConsegna(k, { fattorino: chi, giro: n });
+    if (k.tipo === 'o') { if (k.o.stato !== 'in_consegna' && k.o.stato !== 'consegnato') segnaOrdineInConsegna(k.o); }
+    else if (k.c.statoConsegna !== 'consegnato') await aggiornaConsegna(k, { statoConsegna: 'in_consegna', inConsegnaAlle: new Date().toISOString() });
+  }
+  broadcastOrder({ evento: 'consegne_aggiornate' });
+  res.json({ ok: true, partite: n });
+});
+
+// ---------- DISPLAY CUCINA ----------
+function rigaCucina(r, nuove){
+  const o = r.opzioni || {};
+  const det = righeStampa(r, '').slice(1).map(x => x.trim());
+  return { qty: r.qty, nome: r.nome + (o.max ? ' MAX' : o.mezzaMax ? ' MEZZA MAX' : ''), det, nuovo: !!(nuove && nuove.has(r.rid)), glutine: !!o.glutine };
+}
+async function elencoCucina(){
+  const out = [];
+  (await comandeStasera()).forEach(c => {
+    if (!c.ultimoInvio || !(c.inviate || []).length) return;
+    if (c.prontoCucinaAlle && c.prontoCucinaAlle >= c.ultimoInvio) return;
+    if (c.servitoAlle && c.servitoAlle >= c.ultimoInvio) return;
+    const d = c.ultimoDiff || {};
+    const nuove = c.invii > 1 ? new Set(d.aggiunte || []) : null;
+    out.push({ id: 'c' + c._id, fonte: 'staff', tipo: c.tipo, etichetta: c.tipo === 'tavolo' ? 'Tavolo ' + c.tavolo : (c.tipo === 'consegna' ? 'Consegna S' : 'Asporto S') + c.numero,
+      nome: c.tipo === 'tavolo' ? '' : (c.nome || ''), orario: c.orario || '', da: c.ultimoInvio, primo: c.creataAlle, invio: c.invii || 1,
+      righe: (c.inviate || []).filter(r => r.qty > 0).map(r => rigaCucina(r, nuove)), tolte: c.invii > 1 ? (d.tolte || []) : [], note: c.noteComanda || '' });
+  });
+  ordiniStasera().forEach(o => {
+    const st = o.stato || 'da_preparare';
+    if (st !== 'da_preparare' && st !== 'nuovo') return;
+    out.push({ id: 'o' + o.numeroOrdine, fonte: 'online', tipo: o.modalita === 'consegna' ? 'consegna' : 'asporto', etichetta: '#' + o.numeroOrdine + (o.modalita === 'consegna' ? ' Consegna' : ' Ritiro'),
+      nome: o.name || '', orario: o.orarioLabel || '', da: o.ricevutoAlle, primo: o.ricevutoAlle, invio: 1,
+      righe: (o.articoli || []).map(a => ({ qty: Number(a.qty) || 1, nome: a.nome, det: (a.dettagli || []).map(String), nuovo: false, glutine: /glutine/i.test((a.dettagli || []).join(' ')) })), tolte: [], note: o.note || '' });
+  });
+  return out.sort((a, b) => String(a.da).localeCompare(String(b.da)));
+}
+app.get('/api/cucina', async (req, res) => {
+  try { res.json({ ok: true, ora: new Date().toISOString(), comande: await elencoCucina() }); }
+  catch (e) { console.error(e); res.status(500).json({ ok: false, error: 'Errore server' }); }
+});
+app.post('/api/cucina/:id/pronto', async (req, res) => {
+  const id = String(req.params.id || '');
+  if (id[0] === 'o') {
+    const o = await trovaOrdine(Number(id.slice(1)));
+    if (!o) return res.status(404).json({ ok: false, error: 'Ordine non trovato' });
+    segnaOrdinePronto(o);
+    if (o.modalita !== 'consegna') pushSicura(['titolare'], { titolo: `✅ Ordine #${o.numeroOrdine} pronto`, testo: `${o.name || 'Cliente'} può ritirare`, tag: 'pronto-o' + o.numeroOrdine, url: './' }, 900);
+  } else if (id[0] === 'c') {
+    const c = await comandaGet(id.slice(1));
+    if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
+    c.prontoCucinaAlle = new Date().toISOString();
+    await comandaSave(c);
+    const chi = c.tipo === 'tavolo' ? `Tavolo ${c.tavolo}` : `${c.tipo === 'consegna' ? 'Consegna' : 'Asporto'} S${c.numero}${c.nome ? ' (' + c.nome + ')' : ''}`;
+    pushSicura(['staff', 'titolare'], { titolo: `🍕 ${chi}: pronto`, testo: c.tipo === 'tavolo' ? 'Da portare al tavolo' : 'Pronto da consegnare', tag: 'pronto-' + c._id, url: './' }, 900);
+    if (c.tipo === 'consegna') pushSicura(['fattorino'], { titolo: `🛵 Consegna S${c.numero} pronta`, testo: `${c.nome || 'Cliente'} · ${c.indirizzo || ''}`, tag: 'cons-c' + c._id, url: './' }, 900, c.fattorino || undefined);
+  } else return res.status(400).json({ ok: false, error: 'Comanda non valida' });
+  broadcastOrder({ evento: 'cucina_aggiornata' });
+  res.json({ ok: true });
+});
+app.post('/api/cucina/:id/riapri', async (req, res) => { // "annulla": era stato toccato per sbaglio
+  const id = String(req.params.id || '');
+  if (id[0] === 'o') { const o = await trovaOrdine(Number(id.slice(1))); if (o) { salvaOrdineCampi(o, { stato: 'da_preparare', prontoAlle: null }); broadcastOrder({ evento: 'stato_aggiornato', numeroOrdine: o.numeroOrdine, stato: 'da_preparare' }); } }
+  else if (id[0] === 'c') { const c = await comandaGet(id.slice(1)); if (c) { c.prontoCucinaAlle = null; await comandaSave(c); } }
+  broadcastOrder({ evento: 'cucina_aggiornata' });
+  res.json({ ok: true });
+});
+
+// ---------- SCHERMO "ORDINI PRONTI" (pubblico: solo numero e nome breve) ----------
+app.get('/api/coda', async (req, res) => {
+  try {
+    const prep = [], pronti = [], adesso = Date.now(), MIN30 = 30 * 60 * 1000;
+    ordiniStasera().filter(o => o.modalita !== 'consegna').forEach(o => {
+      const st = o.stato || 'da_preparare', voce = { n: String(o.numeroOrdine), nome: nomeBreve(o.name || o.nome) };
+      if (st === 'pronto') { if (o.prontoAlle && adesso - new Date(o.prontoAlle).getTime() < MIN30) pronti.push({ ...voce, da: o.prontoAlle }); }
+      else if (st === 'da_preparare' || st === 'nuovo') prep.push(voce);
+    });
+    (await comandeList({ stato: 'aperta' }, 300)).filter(c => c.tipo === 'asporto').forEach(c => {
+      const voce = { n: 'S' + c.numero, nome: nomeBreve(c.nome) };
+      if (c.prontoCucinaAlle && (!c.ultimoInvio || c.prontoCucinaAlle >= c.ultimoInvio)) { if (adesso - new Date(c.prontoCucinaAlle).getTime() < MIN30) pronti.push({ ...voce, da: c.prontoCucinaAlle }); }
+      else if (c.ultimoInvio) prep.push(voce);
+    });
+    pronti.sort((a, b) => String(b.da).localeCompare(String(a.da)));
+    res.json({ ok: true, preparazione: prep.slice(0, 30), pronti: pronti.slice(0, 30) });
+  } catch (e) { console.error(e); res.status(500).json({ ok: false, error: 'Errore server' }); }
+});
+
+// ---------- VIE DI NISCEMI (da OpenStreetMap, gratis): per suggerire e controllare gli indirizzi ----------
+let vieNiscemi = { vie: [], aggiornate: null };
+let vieInCarica = null;
+async function scaricaVie(){
+  const q = '[out:json][timeout:90];area["name"="Niscemi"]["boundary"="administrative"]->.a;(way["highway"]["name"](area.a);node["place"]["name"](area.a);way["place"]["name"](area.a););out tags;';
+  for (const host of ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter']) {
+    try {
+      const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 100000);
+      const r = await fetch(host, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'LaCasaDiCarta-Ordini/1.0' }, body: 'data=' + encodeURIComponent(q), signal: ctrl.signal });
+      clearTimeout(t);
+      if (!r.ok) continue;
+      const d = await r.json();
+      const nomi = new Set();
+      (d.elements || []).forEach(e => { const n = e.tags && String(e.tags.name || '').trim(); if (n && n.length <= 80) nomi.add(n); });
+      if (nomi.size < 20) continue; // risposta sospetta: meglio tenere la lista vecchia
+      return [...nomi].sort((a, b) => a.localeCompare(b, 'it'));
+    } catch (e) { console.error('Vie: scaricamento non riuscito da', host, e.message); }
+  }
+  return null;
+}
+async function aggiornaVie(forza){
+  const vecchie = vieNiscemi.aggiornate && Date.now() - new Date(vieNiscemi.aggiornate).getTime() > 30 * 86400000;
+  if (!forza && vieNiscemi.vie.length && !vecchie) return;
+  if (vieInCarica) return vieInCarica;
+  vieInCarica = (async () => {
+    const vie = await scaricaVie();
+    if (vie) {
+      vieNiscemi = { vie, aggiornate: new Date().toISOString() };
+      if (settingsCollection) await settingsCollection.updateOne({ _id: 'vieNiscemi' }, { $set: { value: vieNiscemi } }, { upsert: true }).catch(() => {});
+      console.log(`Vie di Niscemi aggiornate: ${vie.length}`);
+    }
+  })().finally(() => { vieInCarica = null; });
+  return vieInCarica;
+}
+app.get('/api/vie', async (req, res) => {
+  if (!vieNiscemi.vie.length) await Promise.race([aggiornaVie(), new Promise(r => setTimeout(r, 20000))]);
+  else aggiornaVie().catch(() => {});
+  res.set('Cache-Control', 'public, max-age=3600');
+  res.json({ ok: true, vie: vieNiscemi.vie, aggiornate: vieNiscemi.aggiornate });
+});
+
 // ---------- PIANTINA DELLA SALA (disegnata dal titolare, la leggono titolare e camerieri) ----------
 const PIANTINA_INIZIALE = {"zone":[{"id":"dentro","nome":"Dentro","w":800},{"id":"fuori","nome":"Fuori (estate)"}],"oggetti":[{"etichetta":"Fuori sala","fisso":"vuoto","h":242,"id":"vuoto01","tipo":"fisso","w":456,"x":344,"y":398,"zona":"dentro"},{"etichetta":"Vetrata","fisso":"vetrata","h":10,"id":"vetra01","tipo":"fisso","w":368,"x":376,"y":0,"zona":"dentro"},{"etichetta":"Panca","fisso":"panca","h":140,"id":"panca01","tipo":"fisso","w":22,"x":0,"y":120,"zona":"dentro"},{"etichetta":"Frigo","fisso":"frigo","h":40,"id":"frigo01","tipo":"fisso","w":60,"x":26,"y":590,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t01","num":"","posti":4,"tipo":"tavolo","w":62,"x":26,"y":125,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t02","num":"","posti":3,"tipo":"tavolo","w":62,"x":26,"y":187,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t08","num":"","posti":4,"tipo":"tavolo","w":62,"x":363,"y":258,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t09","num":"","posti":4,"tipo":"tavolo","w":62,"x":491,"y":258,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t11","num":"","posti":4,"tipo":"tavolo","w":62,"x":363,"y":320,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t12","num":"","posti":4,"tipo":"tavolo","w":62,"x":491,"y":320,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t14","num":"","posti":4,"tipo":"tavolo","w":62,"x":274,"y":380,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t15","num":"","posti":4,"tipo":"tavolo","w":62,"x":274,"y":442,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t16","num":"","posti":4,"tipo":"tavolo","w":62,"x":274,"y":504,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t17","num":"","posti":4,"tipo":"tavolo","w":62,"x":274,"y":566,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t18","num":"","posti":4,"tipo":"tavolo","w":62,"x":474,"y":26,"zona":"dentro"},{"etichetta":"Vetrata del locale","fisso":"vetrata","h":10,"id":"ammu53j","tipo":"fisso","w":800,"x":100,"y":0,"zona":"fuori"},{"forma":"quadrato","h":70,"id":"dvvlnro","num":"","posti":4,"tipo":"tavolo","w":70,"x":100,"y":180,"zona":"fuori"},{"forma":"quadrato","h":70,"id":"pk2m8ut","num":"","posti":4,"tipo":"tavolo","w":70,"x":270,"y":180,"zona":"fuori"},{"forma":"quadrato","h":70,"id":"99a6zcg","num":"","posti":4,"tipo":"tavolo","w":70,"x":440,"y":180,"zona":"fuori"},{"forma":"quadrato","h":70,"id":"o0rmuo2","num":"","posti":4,"tipo":"tavolo","w":70,"x":610,"y":180,"zona":"fuori"},{"forma":"quadrato","h":70,"id":"fpwb946","num":"","posti":4,"tipo":"tavolo","w":70,"x":780,"y":180,"zona":"fuori"},{"forma":"quadrato","h":70,"id":"1fg0hnp","num":"","posti":4,"tipo":"tavolo","w":70,"x":100,"y":380,"zona":"fuori"},{"forma":"quadrato","h":70,"id":"u6e3u9s","num":"","posti":4,"tipo":"tavolo","w":70,"x":270,"y":380,"zona":"fuori"},{"forma":"quadrato","h":70,"id":"y0oe9g7","num":"","posti":4,"tipo":"tavolo","w":70,"x":440,"y":380,"zona":"fuori"},{"forma":"quadrato","h":70,"id":"med00vq","num":"","posti":4,"tipo":"tavolo","w":70,"x":610,"y":380,"zona":"fuori"},{"forma":"quadrato","h":70,"id":"ozm0ejf","num":"","posti":4,"tipo":"tavolo","w":70,"x":780,"y":380,"zona":"fuori"},{"forma":"quadrato","h":62,"id":"otbgtac","num":"","posti":4,"tipo":"tavolo","w":62,"x":18,"y":370,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"fkrf1z4","num":"7","posti":4,"tipo":"tavolo","w":62,"x":18,"y":300,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"dz0jiaw","num":"","posti":2,"tipo":"tavolo","w":62,"x":730,"y":150,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t6cnf3t","num":"","posti":2,"tipo":"tavolo","w":62,"x":730,"y":30,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"3whh9cb","num":"","posti":2,"tipo":"tavolo","w":62,"x":660,"y":150,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"ml3mgwk","num":"","posti":2,"tipo":"tavolo","w":62,"x":590,"y":150,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"z9vtqlc","num":"","posti":2,"tipo":"tavolo","w":62,"x":530,"y":150,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"nykpgr6","num":"","posti":2,"tipo":"tavolo","w":62,"x":563,"y":30,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"r456wkl","num":"","posti":2,"tipo":"tavolo","w":62,"x":633,"y":30,"zona":"dentro"},{"etichetta":"Ingresso","fisso":"porta","h":12,"id":"ipk04tv","tipo":"fisso","w":115,"x":28,"y":20,"zona":"dentro"},{"etichetta":"Bancone","fisso":"bancone","h":40,"id":"34d9bvb","tipo":"fisso","w":140,"x":142,"y":20,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"oz98vxf","num":"","posti":4,"tipo":"tavolo","w":62,"x":323,"y":130,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"yptohs3","num":"","posti":4,"tipo":"tavolo","w":62,"x":186,"y":80,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"u8l5u29","num":"","posti":4,"tipo":"tavolo","w":62,"x":682,"y":260,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"zlfpmoi","num":"","posti":4,"tipo":"tavolo","w":62,"x":682,"y":330,"zona":"dentro"},{"fisso":"colonna","h":26,"id":"ex837u6","tipo":"fisso","w":26,"x":292,"y":20,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"186ga9i","num":"","posti":4,"tipo":"tavolo","w":62,"x":393,"y":130,"zona":"dentro"}],"aggiornato":"2026-10-16T01:35:22.644Z"};
 let piantinaSala = null;
