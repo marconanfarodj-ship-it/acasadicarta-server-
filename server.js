@@ -223,6 +223,8 @@ async function connectDB(){
     if (pwDoc && pwDoc.hash) titolarePwHash = pwDoc.hash;
     const calDoc = await settingsCollection.findOne({ _id: 'calendario' });
     if (calDoc && calDoc.value) calendario = { chiusi: calDoc.value.chiusi || [], aperti: calDoc.value.aperti || [] };
+    const piDoc = await settingsCollection.findOne({ _id: 'piantina' });
+    if (piDoc && piDoc.value && Array.isArray(piDoc.value.oggetti)) piantinaSala = piDoc.value;
     const dimDoc = await settingsCollection.findOne({ _id: 'dimensioneStampa' });
     if (dimDoc && DIMENSIONI_STAMPA.includes(dimDoc.value)) dimensioneStampa = dimDoc.value;
     productPhotosCollection = db.collection('productPhotos');
@@ -1313,8 +1315,10 @@ async function finalizeOrder(order, customerId){
   // Prima veniva segnato stampato appena c'era un pannello collegato: se la linea del tablet era caduta
   // senza che il server se ne accorgesse, l'ordine non usciva e non veniva più recuperato.
   order.stampato = false;
-  // ordine "per le 21:00" fatto con largo anticipo: subito esce solo un avviso, la comanda completa 20 minuti prima
-  {
+  // ordine "per le 21:00" fatto con largo anticipo: subito esce solo un avviso, la comanda completa 20 minuti prima.
+  // SPENTO su richiesta di Marco (16/10/2026): ogni ordine stampa subito la comanda completa con l'orario.
+  // Per riattivarlo: ORDINI_PROGRAMMATI=1 su Render.
+  if (process.env.ORDINI_PROGRAMMATI === '1') {
     const quando = orarioProgrammato(order);
     if (quando && quando.getTime() - Date.now() > 40 * 60 * 1000) {
       order.programmato = true; order.programmatoPer = quando.toISOString(); order.promemoriaFatto = false;
@@ -2711,8 +2715,10 @@ function diffComanda(inviate, righe){
 // ===== Comande divise: pizze (con focacce e fritture) da una parte, panini (con hamburger e bevande) dall'altra =====
 const CAT_PANINI = new Set(['Panini', 'Hamburger', 'Fritture', 'Bevande', 'Extra']);
 function gruppoRiga(r){ return CAT_PANINI.has(String((r && r.cat) || '').trim()) ? 'panini' : 'pizze'; }
-function stampaComandaCucina(c, diff, primaVolta, rif, ritocca){
+function stampaComandaCucina(c, diff, primaVolta, rif, ritocca, stampante){
   const fai = t => ritocca ? ritocca(t) : t;
+  // scelta a mano col tasto tenuto premuto: tutta la comanda su quella stampante, senza dividere
+  if (stampante === 1 || stampante === 2) return stampaStaff(fai(testoComandaCucina(c, diff, primaVolta)), `${rif} → ${stampante === 1 ? (CONFIG.stampa.nome1 || 'Stampante 1') : (CONFIG.stampa.nome2 || 'Stampante 2')}`, 'p' + stampante, c._id);
   if (CONFIG.stampa.dividi === false) return stampaStaff(fai(testoComandaCucina(c, diff, primaVolta)), rif, 'noi', c._id);
   const parti = ['pizze', 'panini'].map(g => ({ g, d: {
     aggiunte: (diff.aggiunte || []).filter(r => gruppoRiga(r) === g),
@@ -2934,7 +2940,8 @@ app.post('/api/staff/comande/:id/invia', async (req, res) => {
   c.invii += 1;
   if ((req.body || {}).cameriere) { c.ultimoCameriere = String(req.body.cameriere).slice(0, 30); if (!c.cameriere) c.cameriere = c.ultimoCameriere; }
   const senzaStampa = !!(req.body || {}).senzaStampa; // "salva senza stampare": segna come già in cucina, niente scontrino
-  if (!senzaStampa) stampaComandaCucina(c, diff, primaVolta, `${etichettaComanda(c)} #${c.invii}`);
+  const stampante = [1, 2].includes(Number((req.body || {}).stampante)) ? Number(req.body.stampante) : 0; // 0 = come da impostazioni
+  if (!senzaStampa) stampaComandaCucina(c, diff, primaVolta, `${etichettaComanda(c)} #${c.invii}`, null, stampante);
   else c.salvateSenzaStampa = (c.salvateSenzaStampa || 0) + 1;
   c.inviate = c.righe.map(r => ({ ...r }));
   c.ultimoInvio = new Date().toISOString();
@@ -4794,6 +4801,39 @@ function configPubblica(){
   return { ...CONFIG, sito, pagamentoOnlineCollegato: !!stripe, camerieri: (CONFIG.camerieri || []).map(x => ({ nome: x.nome, pin: !!x.pin })),
     offerte: (CONFIG.offerte || []).filter(o => o.attiva).map(o => ({ ...o, codice: undefined, conCodice: !!o.codice })) };
 }
+// ---------- PIANTINA DELLA SALA (disegnata dal titolare, la leggono titolare e camerieri) ----------
+const PIANTINA_INIZIALE = {"zone":[{"id":"dentro","nome":"Dentro","w":800},{"id":"fuori","nome":"Fuori (estate)"}],"oggetti":[{"etichetta":"Fuori sala","fisso":"vuoto","h":242,"id":"vuoto01","tipo":"fisso","w":456,"x":344,"y":398,"zona":"dentro"},{"etichetta":"Vetrata","fisso":"vetrata","h":10,"id":"vetra01","tipo":"fisso","w":368,"x":376,"y":0,"zona":"dentro"},{"etichetta":"Panca","fisso":"panca","h":140,"id":"panca01","tipo":"fisso","w":22,"x":0,"y":120,"zona":"dentro"},{"etichetta":"Frigo","fisso":"frigo","h":40,"id":"frigo01","tipo":"fisso","w":60,"x":26,"y":590,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t01","num":"","posti":4,"tipo":"tavolo","w":62,"x":26,"y":125,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t02","num":"","posti":3,"tipo":"tavolo","w":62,"x":26,"y":187,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t08","num":"","posti":4,"tipo":"tavolo","w":62,"x":363,"y":258,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t09","num":"","posti":4,"tipo":"tavolo","w":62,"x":491,"y":258,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t11","num":"","posti":4,"tipo":"tavolo","w":62,"x":363,"y":320,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t12","num":"","posti":4,"tipo":"tavolo","w":62,"x":491,"y":320,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t14","num":"","posti":4,"tipo":"tavolo","w":62,"x":274,"y":380,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t15","num":"","posti":4,"tipo":"tavolo","w":62,"x":274,"y":442,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t16","num":"","posti":4,"tipo":"tavolo","w":62,"x":274,"y":504,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t17","num":"","posti":4,"tipo":"tavolo","w":62,"x":274,"y":566,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t18","num":"","posti":4,"tipo":"tavolo","w":62,"x":474,"y":26,"zona":"dentro"},{"etichetta":"Vetrata del locale","fisso":"vetrata","h":10,"id":"ammu53j","tipo":"fisso","w":800,"x":100,"y":0,"zona":"fuori"},{"forma":"quadrato","h":70,"id":"dvvlnro","num":"","posti":4,"tipo":"tavolo","w":70,"x":100,"y":180,"zona":"fuori"},{"forma":"quadrato","h":70,"id":"pk2m8ut","num":"","posti":4,"tipo":"tavolo","w":70,"x":270,"y":180,"zona":"fuori"},{"forma":"quadrato","h":70,"id":"99a6zcg","num":"","posti":4,"tipo":"tavolo","w":70,"x":440,"y":180,"zona":"fuori"},{"forma":"quadrato","h":70,"id":"o0rmuo2","num":"","posti":4,"tipo":"tavolo","w":70,"x":610,"y":180,"zona":"fuori"},{"forma":"quadrato","h":70,"id":"fpwb946","num":"","posti":4,"tipo":"tavolo","w":70,"x":780,"y":180,"zona":"fuori"},{"forma":"quadrato","h":70,"id":"1fg0hnp","num":"","posti":4,"tipo":"tavolo","w":70,"x":100,"y":380,"zona":"fuori"},{"forma":"quadrato","h":70,"id":"u6e3u9s","num":"","posti":4,"tipo":"tavolo","w":70,"x":270,"y":380,"zona":"fuori"},{"forma":"quadrato","h":70,"id":"y0oe9g7","num":"","posti":4,"tipo":"tavolo","w":70,"x":440,"y":380,"zona":"fuori"},{"forma":"quadrato","h":70,"id":"med00vq","num":"","posti":4,"tipo":"tavolo","w":70,"x":610,"y":380,"zona":"fuori"},{"forma":"quadrato","h":70,"id":"ozm0ejf","num":"","posti":4,"tipo":"tavolo","w":70,"x":780,"y":380,"zona":"fuori"},{"forma":"quadrato","h":62,"id":"otbgtac","num":"","posti":4,"tipo":"tavolo","w":62,"x":18,"y":370,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"fkrf1z4","num":"7","posti":4,"tipo":"tavolo","w":62,"x":18,"y":300,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"dz0jiaw","num":"","posti":2,"tipo":"tavolo","w":62,"x":730,"y":150,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"t6cnf3t","num":"","posti":2,"tipo":"tavolo","w":62,"x":730,"y":30,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"3whh9cb","num":"","posti":2,"tipo":"tavolo","w":62,"x":660,"y":150,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"ml3mgwk","num":"","posti":2,"tipo":"tavolo","w":62,"x":590,"y":150,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"z9vtqlc","num":"","posti":2,"tipo":"tavolo","w":62,"x":530,"y":150,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"nykpgr6","num":"","posti":2,"tipo":"tavolo","w":62,"x":563,"y":30,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"r456wkl","num":"","posti":2,"tipo":"tavolo","w":62,"x":633,"y":30,"zona":"dentro"},{"etichetta":"Ingresso","fisso":"porta","h":12,"id":"ipk04tv","tipo":"fisso","w":115,"x":28,"y":20,"zona":"dentro"},{"etichetta":"Bancone","fisso":"bancone","h":40,"id":"34d9bvb","tipo":"fisso","w":140,"x":142,"y":20,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"oz98vxf","num":"","posti":4,"tipo":"tavolo","w":62,"x":323,"y":130,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"yptohs3","num":"","posti":4,"tipo":"tavolo","w":62,"x":186,"y":80,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"u8l5u29","num":"","posti":4,"tipo":"tavolo","w":62,"x":682,"y":260,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"zlfpmoi","num":"","posti":4,"tipo":"tavolo","w":62,"x":682,"y":330,"zona":"dentro"},{"fisso":"colonna","h":26,"id":"ex837u6","tipo":"fisso","w":26,"x":292,"y":20,"zona":"dentro"},{"forma":"quadrato","h":62,"id":"186ga9i","num":"","posti":4,"tipo":"tavolo","w":62,"x":393,"y":130,"zona":"dentro"}],"aggiornato":"2026-10-16T01:35:22.644Z"};
+let piantinaSala = null;
+function pulisciPiantina(p){
+  const num = (v, a, b, d) => { v = Math.round(Number(v)); return Number.isFinite(v) ? Math.max(a, Math.min(b, v)) : d; };
+  const testo = (v, n) => String(v == null ? '' : v).slice(0, n);
+  const zone = (Array.isArray(p.zone) ? p.zone : []).slice(0, 10).map(z => {
+    const o = { id: testo(z.id, 20) || 'sala', nome: testo(z.nome, 30) || 'Sala' };
+    if (z.w) o.w = num(z.w, 400, 1400, 1000);
+    return o;
+  });
+  if (!zone.length) zone.push({ id: 'dentro', nome: 'Dentro' });
+  const ids = new Set(zone.map(z => z.id));
+  const oggetti = (Array.isArray(p.oggetti) ? p.oggetti : []).slice(0, 400).filter(o => o && ids.has(o.zona)).map(o => {
+    const b = { id: testo(o.id, 20), zona: o.zona, tipo: o.tipo === 'tavolo' ? 'tavolo' : 'fisso', x: num(o.x, 0, 1400, 0), y: num(o.y, 0, 640, 0), w: num(o.w, 4, 1400, 60), h: num(o.h, 4, 640, 60) };
+    if (b.tipo === 'tavolo') { b.forma = ['quadrato', 'rettangolo', 'tondo', 'alto'].includes(o.forma) ? o.forma : 'quadrato'; b.posti = num(o.posti, 1, 30, 4); b.num = testo(o.num, 6).trim(); }
+    else { b.fisso = testo(o.fisso, 20); if (o.etichetta) b.etichetta = testo(o.etichetta, 24); }
+    return b;
+  });
+  return { zone, oggetti, aggiornato: new Date().toISOString() };
+}
+app.get('/api/piantina', (req, res) => res.json({ ok: true, piantina: piantinaSala || PIANTINA_INIZIALE }));
+app.post('/api/piantina', soloTitolare, async (req, res) => {
+  const p = (req.body || {}).piantina;
+  if (!p || typeof p !== 'object') return res.status(400).json({ ok: false, error: 'Piantina mancante' });
+  piantinaSala = pulisciPiantina(p);
+  if (settingsCollection) {
+    try { await settingsCollection.updateOne({ _id: 'piantina' }, { $set: { value: piantinaSala } }, { upsert: true }); }
+    catch (e) { return res.status(500).json({ ok: false, error: 'Non salvata: riprova' }); }
+  }
+  res.json({ ok: true, piantina: piantinaSala });
+});
+
 function configTitolare(){
   return { ...CONFIG, camerieri: (CONFIG.camerieri || []).map(x => ({ nome: x.nome, pin: x.pin ? '***' : '' })) };
 }
