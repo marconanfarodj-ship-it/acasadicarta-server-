@@ -2631,11 +2631,19 @@ function normalizzaRighe(righe){
     const max = cat === 'Pizza' && !!o.max;
     const mezzaMax = cat === 'Pizza' && !max && !!o.mezzaMax; // mezza Max = metà della Max: prezzo normale
     const glutine = cat === 'Pizza' && !!o.glutine;
+    // pizza metà e metà: la seconda metà deve essere una pizza del listino; prezzo = media dei due
+    let meta = null;
+    if (cat === 'Pizza' && listino != null && o.meta && typeof o.meta === 'object') {
+      const k2 = String(o.meta.chiave || ''), p2 = getCurrentPrice(k2);
+      if (k2 && k2 !== chiave && k2.startsWith('Pizza|') && p2 != null)
+        meta = { chiave: k2, nome: String(o.meta.nome || k2.split('|')[1] || '').slice(0, 60), prezzo: round2(p2), primo: String(o.meta.primo || chiave.split('|')[1] || '').slice(0, 60) };
+    }
     const opzioni = {
       senza: listaTesti(o.senza), cottura: String(o.cottura || '').slice(0, 30),
-      max, mezzaMax, glutine, formato, rifinitura: listaTesti(o.rifinitura, 5), salse: listaTesti(o.salse, 12)
+      max, mezzaMax, glutine, formato, rifinitura: listaTesti(o.rifinitura, 5), salse: listaTesti(o.salse, 12), meta
     };
     let base = listino != null ? listino : Math.max(0, Number(r.prezzoBase ?? r.prezzo) || 0); // voci libere: prezzo scritto dallo staff
+    if (meta) base = Math.ceil((listino + meta.prezzo) / 2 * 2 - 1e-9) / 2; // media dei due, arrotondata in su ai 50 centesimi (5,25 → 5,50)
     if (formato) base = formati[formato];
     if (max) base = base * 2;
     // ingredienti extra: prezzo sempre dal listino del server
@@ -2660,7 +2668,7 @@ function normalizzaRighe(righe){
     const prezzo = prezzoManuale !== null ? prezzoManuale : prezzoListino;
     return {
       rid: String(r.rid || crypto.randomUUID()),
-      chiave, nome, cat,
+      chiave, nome: meta ? `½ ${meta.primo} + ½ ${meta.nome}`.slice(0, 120) : nome, cat,
       qty: Math.max(0, Math.min(99, parseInt(r.qty, 10) || 0)),
       note: String(r.note || '').slice(0, 200),
       pane, extra, varianti, opzioni, prezzoManuale,
@@ -2702,7 +2710,7 @@ function totaleComanda(c){
 function firmaRiga(r){
   const o = r.opzioni || {};
   return JSON.stringify([r.note || '', r.pane || '', (r.extra || []).map(e => e.chiave).sort(),
-    [...(o.senza || [])].sort(), o.cottura || '', !!o.max, !!o.mezzaMax, !!o.glutine, o.formato || '',
+    [...(o.senza || [])].sort(), o.cottura || '', !!o.max, !!o.mezzaMax, !!o.glutine, o.formato || '', (o.meta && o.meta.chiave) || '',
     [...(o.rifinitura || [])].sort(), [...(o.salse || [])].sort(), (r.varianti || []).map(v => v.testo + '=' + v.prezzo)]);
 }
 // righe di stampa per un piatto: nome, pane, extra, nota
