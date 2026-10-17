@@ -2829,8 +2829,11 @@ function stampaComandaCucina(c, diff, primaVolta, rif, ritocca, stampante){
 }
 function testoComandaCucina(c, diff, primaVolta, parte){
   const L = [];
+  aggiornaCoperto(c); // coperto aggiornato ai piatti di adesso (prima del salvataggio)
+  const cop = (c.righe || []).find(r => r.cat === 'Coperto');
   L.push('================================');
   L.push(etichettaComanda(c));
+  if (cop) L.push(`Coperti: ${cop.qty}`);
   if (c.nome) L.push(`Cliente: ${c.nome}`);
   if (c.tipo === 'consegna' && c.indirizzo) L.push(`Indirizzo: ${c.indirizzo}`);
   if (c.telefono && c.tipo !== 'tavolo') L.push(`Tel: ${c.telefono}`);
@@ -2856,6 +2859,7 @@ function testoComandaCucina(c, diff, primaVolta, parte){
   if (CONFIG.stampa.totaleComanda) {
     L.push('--------------------------------');
     if (c.spese) L.push(rigaPrezzo('Consegna', c.spese));
+    if (cop) L.push(rigaPrezzo(`${cop.qty}x Coperto`, cop.prezzo * cop.qty));
     L.push(rigaPrezzo(primaVolta ? 'TOTALE' : 'TOTALE COMANDA', totaleComanda(c) + (c.spese || 0)));
   }
   L.push('================================');
