@@ -637,7 +637,7 @@ const CONFIG_BASE = {
   consegna: { speseBase: 1.50, raggioPaeseKm: 2.5, sovrapprezzoFuori: 3.00, raggioMaxKm: 8, ordineMinimo: 10 },
   orari: { dalle: 19, alle: 23, alleSabDom: 24, giornoChiusura: 2, ordiniPerQuarto: 3, giorniAnticipo: 3, noSubitoConsegna: [0, 6] },
   sito: { avvisoAttivo: false, avvisoTesto: '', scontoPrimoOrdine: 10, pagamenti: { contanti: true, carta: true, online: true } },
-  sala: { sale: [{ nome: 'Sala', tavoli: 40 }], qrAttivo: true },
+  sala: { sale: [{ nome: 'Sala', tavoli: 40 }], qrAttivo: true, coperto: { prezzo: 1.50, giorni: [6, 0] } }, // coperto: per ogni pizza/focaccia, solo nei giorni indicati (6 = sabato, 0 = domenica)
   camerieri: [],   // [{ nome, pin }] — il pin non esce mai dal server
   avvisi: { attivi: true, ritardoMinuti: 10, tavoloMinuti: 120, nonMandatiMinuti: 5, ordineGrande: 60 },
   offerte: [],     // [{ id, nome, attiva, tipo: 'percento'|'euro', valore, codice, giorni: [], minimo, scadenza }]
@@ -2582,8 +2582,40 @@ async function comandaGet(id){
   if (comandeCollection) return await comandeCollection.findOne({ _id: id });
   return comandeMemoria[id] || null;
 }
+// ===== COPERTO AUTOMATICO (tavoli in sala) =====
+// Nei giorni scelti (sabato e domenica) ogni pizza o focaccia del tavolo porta un coperto: è una riga "Coperto"
+// che il server tiene aggiornata da solo. Non va in cucina; compare nel preconto, nel conto e negli incassi.
+const COPERTO_RID = 'coperto';
+const CAT_COPERTO = new Set(['Pizza', 'Focacce']);
+function impostazioniCoperto(){
+  const k = (CONFIG.sala && CONFIG.sala.coperto) || {};
+  return { prezzo: Number.isFinite(Number(k.prezzo)) ? Number(k.prezzo) : 1.5, giorni: Array.isArray(k.giorni) ? k.giorni : [6, 0] };
+}
+function aggiornaCoperto(c){
+  if (!c || c.tipo !== 'tavolo' || c.stato !== 'aperta' || !Array.isArray(c.righe)) return;
+  const k = impostazioniCoperto();
+  const giorno = c.giorno ? new Date(c.giorno + 'T12:00:00') : new Date(Date.now() - 5 * 3600 * 1000);
+  const attivo = k.prezzo > 0 && k.giorni.includes(giorno.getDay());
+  const n = attivo ? c.righe.filter(r => r.rid !== COPERTO_RID && CAT_COPERTO.has(r.cat)).reduce((t, r) => t + (Number(r.qty) || 0), 0) : 0;
+  const i = c.righe.findIndex(r => r.rid === COPERTO_RID);
+  const r = i >= 0 ? c.righe[i] : null;
+  const pagate = r ? (r.pagate || 0) : 0;
+  const qty = Math.max(n, pagate);
+  if (!qty) { if (i >= 0) c.righe.splice(i, 1); return; }
+  const prezzo = r && r.prezzoManuale != null ? r.prezzoManuale : round2(k.prezzo); // prezzo cambiato a mano (es. 0 = coperto offerto) resta
+  const nuova = { rid: COPERTO_RID, chiave: '', nome: 'Coperto', cat: 'Coperto', qty, note: '', pane: '', extra: [], varianti: [], opzioni: {},
+    prezzoManuale: r ? r.prezzoManuale ?? null : null, prezzoBase: round2(k.prezzo), prezzo, auto: true };
+  if (pagate) nuova.pagate = pagate;
+  if (r && r.aggiuntaV) nuova.aggiuntaV = r.aggiuntaV;
+  if (i >= 0) c.righe[i] = nuova; else c.righe.push(nuova);
+}
 async function comandaSave(c){
   c.aggiornataAlle = new Date().toISOString();
+  aggiornaCoperto(c);
+  // versione della comanda: sale a ogni salvataggio; ogni piatto ricorda in quale versione è stato aggiunto.
+  // Serve a non perdere i piatti aggiunti da un altro dispositivo mentre questo aveva la comanda aperta.
+  c.versione = (Number(c.versione) || 0) + 1;
+  (c.righe || []).forEach(r => { if (!r.aggiuntaV) r.aggiuntaV = c.versione; });
   if (comandeCollection) await comandeCollection.replaceOne({ _id: c._id }, c, { upsert: true });
   else comandeMemoria[c._id] = c;
   return c;
@@ -2690,6 +2722,21 @@ function conTotali(c){
   return { ...c, totale: totaleComanda(c), pagato: pagatoComanda(c), residuo: residuoComanda(c) };
 }
 // quando l'app salva le righe, i pezzi già pagati non si possono perdere né togliere
+// righe mandate da un'app: se l'app partiva da una versione vecchia della comanda (base), i piatti aggiunti
+// nel frattempo da un altro dispositivo (che quell'app non poteva conoscere) restano, invece di sparire.
+function righeDaApp(c, righe, base){
+  const prima = c.righe || [];
+  let nuove = normalizzaRighe(righe);
+  const vecchie = new Map(prima.map(r => [r.rid, r]));
+  nuove.forEach(r => { const p = vecchie.get(r.rid); if (p && p.aggiuntaV) r.aggiuntaV = p.aggiuntaV; });
+  const b = Number(base);
+  if (Number.isInteger(b) && b > 0 && b < (Number(c.versione) || 0)) {
+    const viste = new Set(nuove.map(r => r.rid));
+    const altrui = prima.filter(r => !viste.has(r.rid) && (Number(r.aggiuntaV) || 0) > b);
+    if (altrui.length) nuove = nuove.concat(altrui.map(r => ({ ...r })));
+  }
+  return mantieniPagate(prima, nuove);
+}
 function mantieniPagate(vecchie, nuove){
   const prima = new Map((vecchie || []).map(r => [r.rid, r]));
   nuove.forEach(r => {
@@ -2744,8 +2791,9 @@ function righeStampa(r, prefisso){
 
 // differenze tra quanto già mandato in cucina e la comanda attuale
 function diffComanda(inviate, righe){
-  const prima = new Map((inviate || []).map(r => [r.rid, r]));
-  const dopo = new Map((righe || []).map(r => [r.rid, r]));
+  const perCucina = r => r && r.rid !== COPERTO_RID && r.cat !== 'Coperto'; // il coperto non va in cucina
+  const prima = new Map((inviate || []).filter(perCucina).map(r => [r.rid, r]));
+  const dopo = new Map((righe || []).filter(perCucina).map(r => [r.rid, r]));
   const aggiunte = [], tolte = [], note = [];
   dopo.forEach((r, rid) => {
     const p = prima.get(rid);
@@ -2962,7 +3010,7 @@ app.put('/api/staff/comande/:id', async (req, res) => {
   const c = await comandaGet(req.params.id);
   if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
   const b = req.body || {};
-  if (Array.isArray(b.righe)) c.righe = mantieniPagate(c.righe, normalizzaRighe(b.righe));
+  if (Array.isArray(b.righe)) c.righe = righeDaApp(c, b.righe, b.versione);
   if (b.info) {
     const info = infoComandaDaBody(b.info, c);
     if (info.tipo === 'tavolo' && info.tavolo !== c.tavolo) {
@@ -2979,7 +3027,7 @@ app.put('/api/staff/comande/:id', async (req, res) => {
 app.post('/api/staff/comande/:id/invia', async (req, res) => {
   const c = await comandaGet(req.params.id);
   if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
-  if (Array.isArray((req.body || {}).righe)) c.righe = mantieniPagate(c.righe, normalizzaRighe(req.body.righe));
+  if (Array.isArray((req.body || {}).righe)) c.righe = righeDaApp(c, req.body.righe, req.body.versione);
   const diff = diffComanda(c.inviate, c.righe);
   if (!diff.aggiunte.length && !diff.tolte.length && !diff.note.length) {
     return res.json({ ok: true, nienteDaInviare: true, comanda: conTotali(c) });
@@ -3036,7 +3084,7 @@ app.post('/api/staff/comande/:id/paga-parte', async (req, res) => {
   if (!c) return res.status(404).json({ ok: false, error: 'Comanda non trovata' });
   if (c.stato !== 'aperta') return res.status(400).json({ ok: false, error: 'La comanda non è aperta' });
   const b = req.body || {};
-  if (Array.isArray(b.righe)) c.righe = mantieniPagate(c.righe, normalizzaRighe(b.righe)); // ultime modifiche non ancora salvate
+  if (Array.isArray(b.righe)) c.righe = righeDaApp(c, b.righe, b.versione); // ultime modifiche non ancora salvate
   const sel = selezioneValida(c, b.voci);
   if (sel.errore) return res.status(400).json({ ok: false, error: sel.errore });
   const metodo = b.pagamento === 'carta' ? 'carta' : 'contanti';
@@ -5177,7 +5225,7 @@ async function elencoCucina(){
     out.push({ id: 'c' + c._id, fonte: 'staff', tipo: c.tipo, etichetta: c.tipo === 'tavolo' ? 'Tavolo ' + c.tavolo : (c.tipo === 'consegna' ? 'Consegna S' : 'Asporto S') + c.numero,
       nome: c.tipo === 'tavolo' ? '' : (c.nome || ''), orario: c.orario || '', da: c.ultimoInvio, primo: c.creataAlle, invio: c.invii || 1,
       iniziata: !!(c.inPrepAlle && c.inPrepAlle >= c.ultimoInvio),
-      righe: (c.inviate || []).filter(r => r.qty > 0).map(r => rigaCucina(r, nuove)), tolte: c.invii > 1 ? (d.tolte || []) : [], note: c.noteComanda || '' });
+      righe: (c.inviate || []).filter(r => r.qty > 0 && r.cat !== 'Coperto').map(r => rigaCucina(r, nuove)), tolte: c.invii > 1 ? (d.tolte || []) : [], note: c.noteComanda || '' });
   });
   ordiniStasera().forEach(o => {
     const st = o.stato || 'da_preparare';
