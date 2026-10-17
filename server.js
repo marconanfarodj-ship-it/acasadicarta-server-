@@ -2281,7 +2281,7 @@ function accumula(agg, o){
   const importo = Number(o.grandTotal != null ? o.grandTotal : o.subtotale) || 0;
   agg.incasso += importo; agg.ordini++;
 
-  const metodo = o.metodoPagamento && agg.pagamenti[o.metodoPagamento] !== undefined ? o.metodoPagamento : 'nonRegistrato';
+  const metodo = metodoOrdineOnline(o);
   agg.pagamenti[metodo]++; agg.pagamentiIncasso[metodo] += importo;
 
   const modo = o.modalita === 'consegna' ? 'consegna' : 'ritiro';
@@ -2370,20 +2370,22 @@ app.get('/api/dashboard-stats', soloTitolare, async (req, res) => {
     return res.json({ today: vuoto, week: vuoto, month: vuoto, daily: [], periods: {}, peakHours: [] });
   }
   try {
-    const now = new Date(); // ora italiana, grazie a TZ=Europe/Rome impostato a inizio file
-    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+    // la giornata della pizzeria va dalle 5 del mattino alle 5 del giorno dopo (come la sala e la serata):
+    // prima "oggi" degli ordini online ripartiva da mezzanotte, e dopo le 00:00 risultavano 0 ordini online
+    const now = new Date(Date.now() - 5 * 60 * 60 * 1000); // ora italiana (TZ=Europe/Rome), spostata di 5 ore
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 5, 0, 0, 0);
     const dayOfWeek = now.getDay(); // 0=domenica, 1=lunedì, ...
     const diffToMonday = (dayOfWeek === 0 ? 6 : dayOfWeek - 1);
-    const startOfWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() - diffToMonday, 0, 0, 0, 0);
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+    const startOfWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() - diffToMonday, 5, 0, 0, 0);
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1, 5, 0, 0, 0);
     const startOfPrevWeek = new Date(startOfWeek.getTime() - 7 * 24 * 60 * 60 * 1000);
-    const startOfPrevMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1, 0, 0, 0, 0);
+    const startOfPrevMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1, 5, 0, 0, 0);
     // margine di sicurezza: partiamo da qui per essere certi di avere anche settimana/mese precedenti
     const queryStart = new Date(Math.min(startOfPrevMonth.getTime(), startOfPrevWeek.getTime()) - 24 * 60 * 60 * 1000);
 
     const orders = await ordersCollection.find(
       { ricevutoAlle: { $gte: queryStart.toISOString() } },
-      { projection: { ricevutoAlle: 1, grandTotal: 1, subtotale: 1, articoli: 1, metodoPagamento: 1, modalita: 1, scontoPrimoOrdine: 1, phoneNormalized: 1 } }
+      { projection: { ricevutoAlle: 1, grandTotal: 1, subtotale: 1, articoli: 1, metodoPagamento: 1, pagatoOnline: 1, pagamento: 1, modalita: 1, scontoPrimoOrdine: 1, phoneNormalized: 1 } }
     ).toArray();
 
     // per "clienti nuovi vs abituali": chi aveva già un numero di telefono visto PRIMA dell'inizio di ciascun periodo
@@ -2406,7 +2408,7 @@ app.get('/api/dashboard-stats', soloTitolare, async (req, res) => {
     orders.forEach(o => {
       const importo = Number(o.grandTotal != null ? o.grandTotal : o.subtotale) || 0;
       const t = new Date(o.ricevutoAlle);
-      const key = dateKey(t);
+      const key = giornoServizio(t);
 
       if (t >= startOfMonth) {
         accumula(monthAgg, o);
@@ -2596,7 +2598,9 @@ function aggiornaCoperto(c){
   const k = impostazioniCoperto();
   const giorno = c.giorno ? new Date(c.giorno + 'T12:00:00') : new Date(Date.now() - 5 * 3600 * 1000);
   const attivo = k.prezzo > 0 && k.giorni.includes(giorno.getDay());
-  const n = attivo ? c.righe.filter(r => r.rid !== COPERTO_RID && CAT_COPERTO.has(r.cat)).reduce((t, r) => t + (Number(r.qty) || 0), 0) : 0;
+  // coperti già messi a mano (es. la voce "Coperto Pizza" del menu): non si contano due volte
+  const aMano = c.righe.filter(r => r.rid !== COPERTO_RID && /coperto/i.test(r.nome || '')).reduce((t, r) => t + (Number(r.qty) || 0), 0);
+  const n = attivo ? Math.max(0, c.righe.filter(r => r.rid !== COPERTO_RID && CAT_COPERTO.has(r.cat)).reduce((t, r) => t + (Number(r.qty) || 0), 0) - aMano) : 0;
   const i = c.righe.findIndex(r => r.rid === COPERTO_RID);
   const r = i >= 0 ? c.righe[i] : null;
   const pagate = r ? (r.pagate || 0) : 0;
@@ -3447,7 +3451,8 @@ function staffOk(req){ return !STAFF_KEY || req.get('x-staff-key') === STAFF_KEY
 
 // Ristampa: il pannello di stampa riceve l'ordine e lo ristampa (non lo aggiunge di nuovo alla lista)
 app.post('/api/orders/:numeroOrdine/ristampa', async (req, res) => {
-  if (!staffOk(req)) return res.status(403).json({ ok: false, error: 'non autorizzato' });
+  // Jarvis (chiave), oppure un telefono/tablet dello staff (stesso accesso delle altre rotte dello staff)
+  if (!(staffOk(req) || !STAFF_CODE || haAccessoStaff(req))) return res.status(403).json({ ok: false, error: 'non autorizzato' });
   const numeroOrdine = Number(req.params.numeroOrdine);
   const order = await trovaOrdine(numeroOrdine);
   if (!order) return res.status(404).json({ ok: false, error: 'Ordine non trovato' });
@@ -3620,7 +3625,7 @@ async function buildDailyReport(){
     const importo = Number(o.grandTotal || o.subtotale || 0);
     totaleGiorno += importo;
 
-    const metodo = o.pagatoOnline ? 'online' : ((o.metodoPagamento && perMetodo[o.metodoPagamento]) ? o.metodoPagamento : 'daRegistrare');
+    const metodo = metodoOrdineOnline(o);
     perMetodo[metodo].count++;
     perMetodo[metodo].tot += importo;
 
@@ -4618,6 +4623,13 @@ async function inviaRichiesteRecensione(){
 setInterval(inviaRichiesteRecensione, 30 * 60 * 1000);
 setTimeout(inviaRichiesteRecensione, 3 * 60 * 1000);
 
+// come è stato pagato un ordine online. Se nessuno l'ha segnato (Contanti/Bancomat) conta comunque negli incassi,
+// col metodo scelto dal cliente: carta → bancomat, altrimenti contanti (le carte si ritrovano comunque su SumUp)
+function metodoOrdineOnline(o){
+  if (o.pagatoOnline || o.metodoPagamento === 'online') return 'online';
+  if (o.metodoPagamento === 'contanti' || o.metodoPagamento === 'bancomat') return o.metodoPagamento;
+  return o.pagamento === 'carta' ? 'bancomat' : 'contanti';
+}
 // ===== CHIUSURA CASSA DI FINE SERATA =====
 const chiusureArch = archivio('chiusureCassa');
 async function riepilogoGiornata(giorno){
@@ -4632,12 +4644,12 @@ async function riepilogoGiornata(giorno){
   // la serata va dalle 5 del mattino alle 5 del giorno dopo
   const dal = new Date(giorno + 'T05:00:00').toISOString(), al = new Date(giornoAggiunto(giorno, 1) + 'T05:00:00').toISOString();
   const ordini = ordersCollection
-    ? await ordersCollection.find({ ricevutoAlle: { $gte: dal, $lt: al } }, { projection: { grandTotal: 1, subtotale: 1, metodoPagamento: 1, scontoPrimoOrdine: 1 } }).toArray()
+    ? await ordersCollection.find({ ricevutoAlle: { $gte: dal, $lt: al } }, { projection: { grandTotal: 1, subtotale: 1, metodoPagamento: 1, scontoPrimoOrdine: 1, pagatoOnline: 1, pagamento: 1 } }).toArray()
     : orderHistory.filter(o => o.ricevutoAlle >= dal && o.ricevutoAlle < al);
   ordini.forEach(o => {
     const imp = Number(o.grandTotal != null ? o.grandTotal : o.subtotale) || 0;
     online.incasso += imp; online.ordini++;
-    online[['online', 'contanti', 'bancomat'].includes(o.metodoPagamento) ? o.metodoPagamento : 'nonRegistrato'] += imp;
+    online[metodoOrdineOnline(o)] += imp;
     online.sconti += Number(o.scontoPrimoOrdine) || 0;
   });
   const aperte = await comandeList({ stato: 'aperta' }, 2000);
@@ -5439,11 +5451,11 @@ app.get('/api/titolare/storico', soloTitolare, async (req, res) => {
     });
     if (ordersCollection) {
       const dal = new Date(da + 'T00:00:00').toISOString(), al = new Date(a + 'T23:59:59.999').toISOString();
-      const ordini = await ordersCollection.find({ ricevutoAlle: { $gte: dal, $lte: al } }, { projection: { ricevutoAlle: 1, grandTotal: 1, subtotale: 1, metodoPagamento: 1 } }).toArray();
+      const ordini = await ordersCollection.find({ ricevutoAlle: { $gte: dal, $lte: al } }, { projection: { ricevutoAlle: 1, grandTotal: 1, subtotale: 1, metodoPagamento: 1, pagatoOnline: 1, pagamento: 1 } }).toArray();
       ordini.forEach(o => {
         const x = g(dateKey(new Date(o.ricevutoAlle))).online, imp = Number(o.grandTotal != null ? o.grandTotal : o.subtotale) || 0;
         x.incasso += imp; x.ordini++;
-        const m = ['online', 'contanti', 'bancomat'].includes(o.metodoPagamento) ? o.metodoPagamento : 'nonRegistrato';
+        const m = metodoOrdineOnline(o);
         x[m] += imp;
       });
     }
